@@ -151,7 +151,6 @@ async function checkHordeKey(env) {
 
 async function hordeSubmit(prompt, config, env) {
   const apiKey = getApiKey(env);
-  const blacklist = await getBlacklist(env);
 
   const params = {
     sampler_name: config.sampler,
@@ -165,6 +164,119 @@ async function hordeSubmit(prompt, config, env) {
     post_processing: [],
     n: 1,
   };
+
+  if (config.hiresFix) {
+    params.hires_fix = true;
+    params.hires_fix_denoising_strength = config.hiresFixDenoising || 0.65;
+  }
+
+  if (config.loras?.length > 0) {
+    params.loras = config.loras.map(l => ({
+      name: String(l.name),
+      model: l.strength ?? 1,
+      clip: l.clip ?? 1,
+      inject_trigger: "any",
+      is_version: true,
+    }));
+  }
+
+  const body = {
+    prompt: config.negativePrompt
+      ? `${prompt} ### ${config.negativePrompt}`
+      : prompt,
+    params,
+    nsfw: true,
+    censor_nsfw: false,
+    trusted_workers: config.nsfw,
+    models: [config.model],
+    r2: true,
+    replacement_filter: false,
+    shared: false,
+    slow_workers: true,
+    allow_downgrade: true,
+    dry_run: false,
+  };
+
+  console.log("[HORDE] Key:", apiKey === "0000000000" ? "ANON!" : apiKey.substring(0, 6) + "...");
+  console.log("[HORDE] trusted_workers:", body.trusted_workers);
+  console.log("[HORDE] Body:", JSON.stringify(body));
+
+  const resp = await fetch(`${HORDE}/generate/async`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: apiKey,
+      ...HORDE_HEADERS,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const result = await resp.json();
+  console.log("[HORDE] Response:", JSON.stringify(result));
+  return result;
+}
+
+  const params = {
+    sampler_name: config.sampler,
+    cfg_scale: config.cfgScale,
+    width: config.width,
+    height: config.height,
+    steps: config.steps,
+    karras: config.karras !== false,
+    clip_skip: config.clipSkip || 2,
+    tiling: false,
+    post_processing: [],
+    n: 1,
+  };
+
+async function hordeSubmit(prompt, config, env) {
+  const apiKey = getApiKey(env);
+
+  const params = {
+    sampler_name: config.sampler,
+    cfg_scale: config.cfgScale,
+    width: config.width,
+    height: config.height,
+    steps: config.steps,
+    karras: config.karras !== false,
+    clip_skip: config.clipSkip || 2,
+    tiling: false,
+    post_processing: [],
+    n: 1,
+  };
+
+  if (config.hiresFix) {
+    params.hires_fix = true;
+    params.hires_fix_denoising_strength = config.hiresFixDenoising || 0.65;
+  }
+
+  if (config.loras?.length > 0) {
+    params.loras = config.loras.map(l => ({
+      name: String(l.name),
+      model: l.strength ?? 1,
+      clip: l.clip ?? 1,
+      inject_trigger: "any",
+      is_version: true,
+    }));
+  }
+
+  const body = {
+    prompt: config.negativePrompt
+      ? `${prompt} ### ${config.negativePrompt}`
+      : prompt,
+    params,
+    nsfw: true,
+    censor_nsfw: false,
+    trusted_workers: config.nsfw,
+    models: [config.model],
+    r2: true,
+    replacement_filter: false,
+    shared: false,
+    slow_workers: true,
+    allow_downgrade: true,
+    dry_run: false,
+  };
+
 
   if (config.hiresFix) {
     params.hires_fix = true;
