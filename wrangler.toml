@@ -8,7 +8,7 @@ crons = ["* * * * *"]
 
 # KV для хранения конфигурации и состояния
 [[kv_namespaces]]
-binding = "BOT_KV"
+binding = "telegram-bot-kv"
 id = "telegram-bot-kv"
 
 # Обычные переменные (не секреты)
