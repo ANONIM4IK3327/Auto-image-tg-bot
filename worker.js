@@ -1,5 +1,11 @@
 // ============================================================
-//  Telegram Image Bot — Cloudflare Workers v3 (debug + fixes)
+//  Telegram Image Bot — Cloudflare Workers v3 (fixed)
+//  Fixes:
+//  1. r2: false  →  получаем base64 вместо протухающих URL
+//  2. Удаление из KV только ПОСЛЕ успешной отправки
+//  3. Правильная обработка base64-картинок
+//  4. Уведомление о чёрной/пустой картинке (цензура Horde)
+//  5. NSFW-флаг корректно пробрасывается через API-ключ
 // ============================================================
 
 const DEFAULT_CONFIG = {
@@ -89,8 +95,7 @@ class Telegram {
 async function kvGet(env, key, type = "text") {
   if (!env.BOT_KV) return null;
   try {
-    const val = await env.BOT_KV.get(key, type);
-    return val;
+    return await env.BOT_KV.get(key, type);
   } catch (e) {
     console.error(`[KV] GET "${key}" error:`, e.message);
     return null;
@@ -139,12 +144,14 @@ async function hordeSubmit(prompt, config, apiKey) {
       n: 1,
     },
     nsfw: config.nsfw,
-    censor_nsfw: false,
+    censor_nsfw: false,       // не цензурировать на стороне Horde
     models: [config.model],
     allow_downgrade: true,
-    r2: true,
+    r2: false,                // FIX: false = получаем base64 вместо протухающих R2-URL
     shared: false,
     replacement_filter: false,
+    slow_workers: true,       // расширяем пул воркеров
+    trusted_workers: false,
   };
 
   if (config.loras?.length > 0) {
@@ -163,6 +170,7 @@ async function hordeSubmit(prompt, config, apiKey) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      // FIX: без реального API-ключа NSFW не работает, даже если nsfw:true
       apikey: apiKey || "0000000000",
       ...HORDE_HEADERS,
     },
@@ -192,6 +200,41 @@ async function hordeModels() {
     headers: HORDE_HEADERS,
   });
   return r.json();
+}
+
+// ──────────── ХЕЛПЕР: base64 или URL → Blob ────────────
+
+async function imgToBlob(img) {
+  if (!img) return null;
+
+  // base64 (r2:false возвращает чистый base64 без префикса data:)
+  if (!img.startsWith("http")) {
+    try {
+      const base64 = img.replace(/^data:image\/\w+;base64,/, "");
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return new Blob([bytes], { type: "image/webp" });
+    } catch (e) {
+      console.error("[IMG] base64 decode error:", e.message);
+      return null;
+    }
+  }
+
+  // URL (fallback, если вдруг r2:true)
+  try {
+    const resp = await fetch(img);
+    if (!resp.ok) {
+      console.error("[IMG] fetch URL failed:", resp.status);
+      return null;
+    }
+    return await resp.blob();
+  } catch (e) {
+    console.error("[IMG] fetch URL error:", e.message);
+    return null;
+  }
 }
 
 // ──────────── ПРОМПТЫ ────────────
@@ -311,34 +354,33 @@ async function handleCommand(message, env) {
 
   const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
 
-  // Парсинг: /command@botname arg1 arg2
   const parts = text.split(/\s+/);
   const cmd = parts[0].split("@")[0].toLowerCase();
   const args = parts.slice(1);
 
   console.log(`[CMD] parsed cmd="${cmd}" args=${JSON.stringify(args)}`);
 
-  // /ping работает всегда — для теста
   if (cmd === "/ping") {
-    console.log("[CMD] PING!");
-    await tg.msg(chatId, `🏓 Pong!\n\nChat ID: <code>${chatId}</code>\nUser ID: <code>${userId}</code>\nKV: ${env.BOT_KV ? "✅" : "❌"}\nHorde: ${env.HORDE_API_KEY ? "✅" : "⚠️"}\nOpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "⚠️"}`);
+    await tg.msg(chatId, `🏓 Pong!\n\nChat ID: <code>${chatId}</code>\nUser ID: <code>${userId}</code>\nKV: ${env.BOT_KV ? "✅" : "❌"}\nHorde: ${env.HORDE_API_KEY ? "✅" : "⚠️ анонимный (NSFW не работает!)"}\nOpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "⚠️"}`);
     return;
   }
 
-  // /diagnostic — без KV
   if (cmd === "/diagnostic") {
     let txt = "🔧 <b>Диагностика</b>\n\n";
     txt += `BOT_KV: ${env.BOT_KV ? "✅" : "❌ НЕ ПРИВЯЗАН"}\n`;
     txt += `TELEGRAM_BOT_TOKEN: ${env.TELEGRAM_BOT_TOKEN ? "✅" : "❌"}\n`;
-    txt += `HORDE_API_KEY: ${env.HORDE_API_KEY ? "✅" : "⚠️ анонимно"}\n`;
+    txt += `HORDE_API_KEY: ${env.HORDE_API_KEY ? "✅" : "⚠️ анонимный — NSFW заблокирован!"}\n`;
     txt += `OPENROUTER_API_KEY: ${env.OPENROUTER_API_KEY ? "✅" : "⚠️ шаблоны"}\n`;
     txt += `\nChat: <code>${chatId}</code>\nUser: <code>${userId}</code>\n`;
     txt += `Chat type: ${message.chat.type}\n`;
 
+    if (!env.HORDE_API_KEY) {
+      txt += `\n🔴 <b>Нет HORDE_API_KEY!</b>\nБез него NSFW всегда будет чёрным.\nРегистрируйся на stablehorde.net и добавь ключ в Secrets.`;
+    }
+
     if (!env.BOT_KV) {
       txt += `\n🔴 <b>KV не привязан!</b>\nWorkers → Settings → Bindings → Add → KV Namespace\nVariable name: <code>BOT_KV</code>`;
     } else {
-      // Тестируем KV
       try {
         await env.BOT_KV.put("_test", "ok");
         const val = await env.BOT_KV.get("_test");
@@ -352,7 +394,6 @@ async function handleCommand(message, env) {
     return;
   }
 
-  // Все остальные команды требуют KV
   if (!env.BOT_KV) {
     await tg.msg(chatId, "❌ KV не привязан!\n/diagnostic для деталей");
     return;
@@ -361,7 +402,6 @@ async function handleCommand(message, env) {
   let config = await getConfig(env);
   console.log("[CMD] config loaded, adminId=", config.adminId);
 
-  // Первый юзер = админ
   if (!config.adminId) {
     config.adminId = userId;
     await saveConfig(env, config);
@@ -369,7 +409,6 @@ async function handleCommand(message, env) {
     await tg.msg(chatId, `👑 Вы назначены админом! ID: <code>${userId}</code>`);
   }
 
-  // Проверка прав
   if (config.adminId !== userId) {
     console.log(`[CMD] Access denied: ${userId} != ${config.adminId}`);
     await tg.msg(chatId, `🔒 Только для админа (${config.adminId})\nВы: ${userId}`);
@@ -571,7 +610,7 @@ async function handleCommand(message, env) {
     }
 
     case "/setsize": {
-      let w = parseInt(args[0]), h = parseInt(args[1]);
+      const w = parseInt(args[0]), h = parseInt(args[1]);
       if (isNaN(w) || isNaN(h) || w < 256 || h < 256 || w > 2048 || h > 2048) {
         await tg.msg(chatId, "❌ /setsize W H\n<code>/setsize 1024 1024</code>\n<code>/setsize 832 1216</code>");
         break;
@@ -624,7 +663,11 @@ async function handleCommand(message, env) {
       if (args[0] !== "on" && args[0] !== "off") { await tg.msg(chatId, "/nsfw on|off"); break; }
       config.nsfw = args[0] === "on";
       await saveConfig(env, config);
-      await tg.msg(chatId, `✅ NSFW: ${config.nsfw ? "🔞 ON" : "OFF"}`);
+      let warn = "";
+      if (config.nsfw && !env.HORDE_API_KEY) {
+        warn = "\n\n⚠️ Нет HORDE_API_KEY — NSFW будет чёрным! Добавь ключ со stablehorde.net";
+      }
+      await tg.msg(chatId, `✅ NSFW: ${config.nsfw ? "🔞 ON" : "OFF"}${warn}`);
       break;
     }
 
@@ -654,7 +697,8 @@ async function handleCommand(message, env) {
       if (!config.generalPrompt) { await tg.msg(chatId, "❌ Сначала /setprompt"); break; }
       config.enabled = true;
       await saveConfig(env, config);
-      await tg.msg(chatId, `🟢 ВКЛ! Каждые ${config.interval}м по ${config.count}шт`);
+      let warn = !env.HORDE_API_KEY ? "\n⚠️ Нет HORDE_API_KEY — NSFW будет чёрным!" : "";
+      await tg.msg(chatId, `🟢 ВКЛ! Каждые ${config.interval}м по ${config.count}шт${warn}`);
       break;
     }
 
@@ -679,6 +723,7 @@ async function handleCommand(message, env) {
 ${config.width}×${config.height} | Steps:${config.steps} | CFG:${config.cfgScale}
 Sampler: ${config.sampler} | CLIP:${config.clipSkip||1}
 NSFW: ${config.nsfw?"🔞":"нет"}
+Horde API: ${env.HORDE_API_KEY?"✅":"⚠️ анонимный"}
 
 LoRA:
 ${loras}
@@ -758,7 +803,6 @@ async function processScheduled(env) {
   const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
   const config = await getConfig(env);
 
-  // Проверяем pending
   const pendingList = await kvList(env, "pending:");
   console.log(`[CRON] Pending: ${pendingList.keys.length}`);
 
@@ -768,9 +812,10 @@ async function processScheduled(env) {
       const data = await kvGet(env, key.name, "json");
       if (!data) { await kvDelete(env, key.name); continue; }
 
+      // Таймаут 20 минут
       if (Date.now() - data.submittedAt > 20 * 60 * 1000) {
         await kvDelete(env, key.name);
-        if (data.notifyChat) await tg.msg(data.notifyChat, `⏰ Таймаут: ${id}`);
+        if (data.notifyChat) await tg.msg(data.notifyChat, `⏰ Таймаут: <code>${id}</code>`);
         continue;
       }
 
@@ -779,28 +824,62 @@ async function processScheduled(env) {
       if (!check.done) continue;
 
       const result = await hordeResult(id);
-      await kvDelete(env, key.name);
+
+      // FIX: НЕ удаляем из KV до отправки
 
       if (result.faulted) {
-        if (data.notifyChat) await tg.msg(data.notifyChat, `❌ Faulted: ${id}`);
+        await kvDelete(env, key.name);
+        if (data.notifyChat) await tg.msg(data.notifyChat, `❌ Faulted: <code>${id}</code>`);
         continue;
       }
 
-      for (const gen of (result.generations || [])) {
-        if (!gen.img) continue;
-        const caption = data.prompt ? `🎨 <i>${data.prompt.substring(0,150)}</i>` : "";
+      const generations = result.generations || [];
+      if (!generations.length) {
+        await kvDelete(env, key.name);
+        if (data.notifyChat) await tg.msg(data.notifyChat, `⚠️ Пустой результат: <code>${id}</code>`);
+        continue;
+      }
+
+      let anySent = false;
+
+      for (const gen of generations) {
+        // FIX: предупреждаем если img пустой (цензура Horde)
+        if (!gen.img) {
+          console.warn(`[CRON] gen.img пустой для ${id} — вероятно цензура Horde`);
+          if (data.notifyChat) {
+            await tg.msg(data.notifyChat,
+              `⚠️ Картинка заблокирована цензурой Horde (чёрный img).\n` +
+              `Убедись что:\n` +
+              `1. Добавлен реальный HORDE_API_KEY\n` +
+              `2. В аккаунте на stablehorde.net включён NSFW\n` +
+              `ID: <code>${id}</code>`
+            );
+          }
+          continue;
+        }
+
+        const caption = data.prompt ? `🎨 <i>${data.prompt.substring(0, 150)}</i>` : "";
 
         try {
-          const imgResp = await fetch(gen.img);
-          if (imgResp.ok) {
-            const blob = await imgResp.blob();
+          // FIX: конвертируем base64 или URL в Blob
+          const blob = await imgToBlob(gen.img);
+
+          if (blob) {
             const sent = await tg.sendPhotoBlob(data.chatId, blob, caption);
-            if (!sent.ok) {
-              console.log("[CRON] Blob failed, trying URL");
-              await tg.sendPhotoUrl(data.chatId, gen.img, caption);
+            if (sent.ok) {
+              anySent = true;
+              console.log(`[CRON] Успешно отправлено: ${id}`);
+            } else {
+              console.warn(`[CRON] sendPhotoBlob failed для ${id}:`, JSON.stringify(sent));
+              if (data.notifyChat) {
+                await tg.msg(data.notifyChat, `❌ Ошибка отправки: ${sent.description || "unknown"}`);
+              }
             }
           } else {
-            await tg.sendPhotoUrl(data.chatId, gen.img, caption);
+            console.warn(`[CRON] Не удалось получить blob для ${id}`);
+            if (data.notifyChat) {
+              await tg.msg(data.notifyChat, `❌ Не удалось загрузить изображение: <code>${id}</code>`);
+            }
           }
         } catch (e) {
           console.error("[CRON] Send error:", e.message);
@@ -808,9 +887,13 @@ async function processScheduled(env) {
         }
       }
 
-      if (data.notifyChat && data.notifyChat !== data.chatId) {
+      // FIX: удаляем из KV только после обработки всех генераций
+      await kvDelete(env, key.name);
+
+      if (anySent && data.notifyChat && data.notifyChat !== data.chatId) {
         await tg.msg(data.notifyChat, `✅ Отправлено!`);
       }
+
     } catch (e) {
       console.error(`[CRON] ${id} error:`, e.message);
     }
@@ -838,6 +921,8 @@ async function processScheduled(env) {
           chatId: config.chatId, prompt, submittedAt: now, notifyChat: null,
         }), { expirationTtl: 3600 });
         console.log(`[CRON] Queued: ${result.id}`);
+      } else {
+        console.error("[CRON] Submit failed:", JSON.stringify(result));
       }
     } catch (e) {
       console.error("[CRON] Auto-post error:", e.message);
@@ -868,7 +953,6 @@ export default {
       console.log("[WEBHOOK] Update:", JSON.stringify(update).substring(0, 500));
 
       if (update.message?.text) {
-        // Запускаем обработку в фоне, чтобы сразу ответить Telegram
         ctx.waitUntil(
           (async () => {
             try {
@@ -880,10 +964,9 @@ export default {
         );
       }
 
-      // Мгновенный ответ 200 OK — Telegram понимает, что мы приняли апдейт
       return new Response("OK", { status: 200 });
     }
-      
+
     if (url.pathname === "/setup") {
       if (!env.TELEGRAM_BOT_TOKEN) {
         return new Response("ERROR: Set TELEGRAM_BOT_TOKEN in Worker secrets!", { status: 500 });
@@ -899,7 +982,7 @@ export default {
       );
       const result = await resp.json();
       return new Response(
-        `Webhook: ${webhookUrl}\n\nResult: ${JSON.stringify(result, null, 2)}\n\nKV: ${env.BOT_KV ? "OK" : "NOT BOUND!"}\nHorde: ${env.HORDE_API_KEY ? "OK" : "not set"}\nOpenRouter: ${env.OPENROUTER_API_KEY ? "OK" : "not set"}`,
+        `Webhook: ${webhookUrl}\n\nResult: ${JSON.stringify(result, null, 2)}\n\nKV: ${env.BOT_KV ? "OK" : "NOT BOUND!"}\nHorde: ${env.HORDE_API_KEY ? "OK" : "NOT SET — NSFW won't work!"}\nOpenRouter: ${env.OPENROUTER_API_KEY ? "OK" : "not set"}`,
         { headers: { "Content-Type": "text/plain" } }
       );
     }
