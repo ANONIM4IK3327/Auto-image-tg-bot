@@ -16,7 +16,7 @@ const DEFAULT_CONFIG = {
   loras: [],
   width: 1024,
   height: 1024,
-  steps: 25,
+  steps: 8,
   cfgScale: 2,
   sampler: "k_dpmpp_2m",
   nsfw: true,
