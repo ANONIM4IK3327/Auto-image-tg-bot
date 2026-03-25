@@ -1,0 +1,16 @@
+name = "Auto-image-tg-bot"
+main = "worker.js"
+compatibility_date = "2024-12-01"
+
+# Cron: каждую минуту проверяет pending и отправляет новые
+[triggers]
+crons = ["* * * * *"]
+
+# KV для хранения конфигурации и состояния
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "telegram-bot-kv"
+
+# Обычные переменные (не секреты)
+[vars]
+LLM_MODEL = "meta-llama/llama-3.1-8b-instruct:free"
