@@ -7,9 +7,10 @@ compatibility_date = "2024-12-01"
 crons = ["* * * * *"]
 
 # KV для хранения конфигурации и состояния
-[[kv_namespaces]]
-binding = "telegram-bot-kv"
-id = "telegram-bot-kv"
+kv_namespaces = [
+  { binding = "telegram-bot-kv", id = "28ef3b49c8814b289ce90df1e53a7d57" }
+]
+
 
 # Обычные переменные (не секреты)
 [vars]
