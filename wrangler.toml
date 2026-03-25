@@ -1,7 +1,7 @@
-name = "autoimgtg"
 main = "worker.js"
 compatibility_date = "2024-12-01"
-
+# wrangler.toml
+name = 'autoimgtg'
 # Cron: каждую минуту проверяет pending и отправляет новые
 [triggers]
 crons = ["* * * * *"]
@@ -10,7 +10,20 @@ crons = ["* * * * *"]
 kv_namespaces = [
   { binding = "telegram-bot-kv", id = "28ef3b49c8814b289ce90df1e53a7d57" }
 ]
+[observability]
+enabled = false
+head_sampling_rate = 1
 
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
 
 # Обычные переменные (не секреты)
 [vars]
