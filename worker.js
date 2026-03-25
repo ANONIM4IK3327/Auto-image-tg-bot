@@ -865,25 +865,23 @@ export default {
 
       console.log("[WEBHOOK] Update:", JSON.stringify(update).substring(0, 500));
 
-      // Обрабатываем СИНХРОННО — не waitUntil!
       if (update.message?.text) {
-        try {
-          await handleCommand(update.message, env);
-        } catch (e) {
-          console.error("[WEBHOOK] handleCommand CRASHED:", e.message, e.stack);
-          // Попробуем сообщить об ошибке
-          try {
-            const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
-            await tg.msg(update.message.chat.id, `💥 Ошибка: <code>${e.message}</code>`);
-          } catch (e2) {
-            console.error("[WEBHOOK] Even error reporting failed:", e2.message);
-          }
-        }
+        // Запускаем обработку в фоне, чтобы сразу ответить Telegram
+        ctx.waitUntil(
+          (async () => {
+            try {
+              await handleCommand(update.message, env);
+            } catch (e) {
+              console.error("[WEBHOOK] handleCommand CRASHED:", e.message);
+            }
+          })()
+        );
       }
 
+      // Мгновенный ответ 200 OK — Telegram понимает, что мы приняли апдейт
       return new Response("OK", { status: 200 });
     }
-
+      
     if (url.pathname === "/setup") {
       if (!env.TELEGRAM_BOT_TOKEN) {
         return new Response("ERROR: Set TELEGRAM_BOT_TOKEN in Worker secrets!", { status: 500 });
