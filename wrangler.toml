@@ -8,7 +8,7 @@ crons = ["* * * * *"]
 
 # KV для хранения конфигурации и состояния
 kv_namespaces = [
-  { binding = "telegram-bot-kv", id = "28ef3b49c8814b289ce90df1e53a7d57" }
+  { binding = "BOT_KV", id = "28ef3b49c8814b289ce90df1e53a7d57" }
 ]
 [observability]
 enabled = false
