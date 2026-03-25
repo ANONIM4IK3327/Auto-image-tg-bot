@@ -134,15 +134,17 @@ async function hordeSubmit(prompt, config, apiKey) {
       width: config.width,
       height: config.height,
       steps: config.steps,
+      karras: true,
       clip_skip: config.clipSkip || 1,
       n: 1,
     },
     nsfw: config.nsfw,
     censor_nsfw: false,
     models: [config.model],
+    allow_downgrade: true,
     r2: true,
     shared: false,
-    replacement_filter: true,
+    replacement_filter: false,
   };
 
   if (config.loras?.length > 0) {
