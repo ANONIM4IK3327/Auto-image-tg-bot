@@ -1,4 +1,4 @@
-name = "Auto-image-tg-bot"
+name = "auto-image-tg-bot"
 main = "worker.js"
 compatibility_date = "2024-12-01"
 
