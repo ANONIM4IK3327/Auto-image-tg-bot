@@ -1,13 +1,16 @@
 // ============================================================
-//  Telegram Image Bot v12
-//  Fixes:
-//  - r2:false по умолчанию (base64 напрямую, без риска истечения URL)
-//  - Диагностика малых файлов: показывает реальное содержимое 1KB-ответа
-//  - Блэклист воркеров-цензоров при повторах (авто + глобальный)
-//  - trusted_workers настраивается (по умолчанию false — больше воркеров)
-//  - slow_workers: true по умолчанию — ещё больше воркеров
-//  - Content-Type проверка при скачивании R2 URL
-//  - Команды: /setr2, /settrusted, /setslow, /workerblacklist
+//  Telegram Image Bot v13 — Cloudflare Workers
+//  AI Horde (NSFW, LoRA из CivitAI) + OpenRouter (промпты)
+//
+//  Исправления относительно v12:
+//  ✅ slow_workers убран → API default = true (больше воркеров)
+//  ✅ allow_downgrade убран → API default = false (без даунгрейда)
+//  ✅ Цензура детектируется через gen_metadata[].type=="censorship"
+//     (официальный способ по swagger, а не только размер файла)
+//  ✅ gen.state === "censored" как дополнительная проверка
+//  ✅ Блэклист воркеров через API: workers[] + worker_blacklist:true
+//  ✅ nsfw:true явно везде = "пропускать воркеров с цензурой"
+//  ✅ Структура из старого рабочего кода + фичи v12
 // ============================================================
 
 const DEFAULT_CONFIG = {
@@ -17,13 +20,13 @@ const DEFAULT_CONFIG = {
   interval: 60,
   count: 1,
   generalPrompt: "",
-  model: "CyberRealistic Pony",
+  model: "AlbedoBase XL (SDXL)",
   loras: [],
-  width: 704,
+  width: 1024,
   height: 1024,
-  steps: 8,
+  steps: 25,
   cfgScale: 2,
-  sampler: "k_euler_a",
+  sampler: "k_dpmpp_2m",
   nsfw: true,
   negativePrompt:
     "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
@@ -32,17 +35,15 @@ const DEFAULT_CONFIG = {
   hiresFix: false,
   hiresFixDenoising: 0.65,
   karras: true,
-  // v12: новые настройки
-  useR2: false,          // false = base64 (надёжнее), true = URL (быстрее, но может истекать)
-  trustedWorkers: false, // false = больше воркеров
-  slowWorkers: true,     // true = ещё больше воркеров
-  workerBlacklist: [],   // список заблокированных воркеров-цензоров
 };
 
 const HORDE_API = "https://stablehorde.net/api/v2";
-const HORDE_AGENT = { "Client-Agent": "TgImageBot:12.0:tg" };
+// Идентификатор клиента для AI Horde (формат: name:version:contact)
+const HORDE_AGENT = { "Client-Agent": "TgImageBot:13.0:tg" };
 const MAX_RETRIES = 3;
-const MIN_IMAGE_KB = 20;
+// Минимальный размер нормальной картинки в KB
+// Censorship placeholder от Horde ~2KB WebP
+const MIN_IMAGE_KB = 10;
 
 function escapeHtml(text) {
   if (!text) return "";
@@ -76,30 +77,34 @@ class Telegram {
     return this.api("sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
   }
 
-  async sendPhoto(chatId, arrayBuffer, filename = "image.jpeg", caption = "") {
+  // Отправка картинки из буфера памяти (Buffer → FormData)
+  async sendPhoto(chatId, arrayBuffer, caption = "") {
     const form = new FormData();
     form.append("chat_id", String(chatId));
-    form.append("photo", new File([arrayBuffer], filename, { type: "image/jpeg" }));
+    // Всегда jpeg для Telegram (он конвертирует WebP в jpeg на лету)
+    form.append("photo", new File([arrayBuffer], "image.jpeg", { type: "image/jpeg" }));
     if (caption) {
       form.append("caption", caption.substring(0, 1024));
       form.append("parse_mode", "HTML");
     }
     const r = await fetch(`${this.base}/sendPhoto`, { method: "POST", body: form });
-    return await r.json();
+    return r.json();
   }
 
-  async sendDocument(chatId, arrayBuffer, filename = "image.webp", caption = "") {
+  // Документ для форматов, которые sendPhoto не принимает
+  async sendDocument(chatId, arrayBuffer, caption = "") {
     const form = new FormData();
     form.append("chat_id", String(chatId));
-    form.append("document", new File([arrayBuffer], filename, { type: "image/webp" }));
+    form.append("document", new File([arrayBuffer], "image.webp", { type: "image/webp" }));
     if (caption) {
       form.append("caption", caption.substring(0, 1024));
       form.append("parse_mode", "HTML");
     }
     const r = await fetch(`${this.base}/sendDocument`, { method: "POST", body: form });
-    return await r.json();
+    return r.json();
   }
 
+  // Отправка по URL (R2-ссылки часто принимаются напрямую)
   sendPhotoUrl(chatId, url, caption = "") {
     return this.api("sendPhoto", {
       chat_id: chatId,
@@ -136,29 +141,55 @@ async function getConfig(env) {
   const s = await KV.get(env, "config", "json");
   return { ...DEFAULT_CONFIG, ...(s || {}) };
 }
+
 async function saveConfig(env, c) {
   await KV.put(env, "config", JSON.stringify(c));
 }
 
 // ══════════════════════════════════════
-//  CENSOR LOG
+//  WORKER BLACKLIST
+//  Хранит ID воркеров, вернувших заглушки
+//  Передаётся в Horde API как workers[] + worker_blacklist:true
 // ══════════════════════════════════════
 
-async function getCensorLog(env) {
-  return (await KV.get(env, "censor_log", "json")) || [];
+async function getWorkerBlacklist(env) {
+  return (await KV.get(env, "worker_blacklist", "json")) || [];
 }
-async function addCensorLog(env, worker, reason) {
-  const log = await getCensorLog(env);
-  log.push({ w: worker, r: reason, t: Date.now() });
-  while (log.length > 50) log.shift();
-  await KV.put(env, "censor_log", JSON.stringify(log));
+
+async function addWorkerToBlacklist(env, workerId, workerName) {
+  if (!workerId || workerId === "?" || workerId.length < 10) return;
+  const list = await getWorkerBlacklist(env);
+  if (!list.find(w => w.id === workerId)) {
+    list.push({ id: workerId, name: workerName, t: Date.now() });
+    while (list.length > 30) list.shift();
+    await KV.put(env, "worker_blacklist", JSON.stringify(list));
+    console.log(`[BL] Добавлен воркер: ${workerName} (${workerId})`);
+  }
 }
-async function clearCensorLog(env) {
-  await KV.put(env, "censor_log", "[]");
+
+async function clearWorkerBlacklist(env) {
+  await KV.put(env, "worker_blacklist", "[]");
 }
 
 // ══════════════════════════════════════
-//  AI HORDE
+//  CENSORSHIP DETECTION
+//
+//  По swagger gen_metadata[].type === "censorship" — официальный
+//  способ. gen.censored и gen.state === "censored" тоже проверяем.
+// ══════════════════════════════════════
+
+function isCensored(gen) {
+  // 1. Официальный способ (swagger: gen_metadata)
+  if (gen.gen_metadata?.some(m => m.type === "censorship")) return true;
+  // 2. Флаг censored
+  if (gen.censored === true) return true;
+  // 3. Устаревшее поле state (swagger помечает как OBSOLETE)
+  if (gen.state === "censored") return true;
+  return false;
+}
+
+// ══════════════════════════════════════
+//  AI HORDE API
 // ══════════════════════════════════════
 
 function getApiKey(env) {
@@ -190,6 +221,49 @@ async function hordeCheckKey(env) {
 async function hordeSubmit(prompt, config, env, opts = {}) {
   const key = getApiKey(env);
 
+  // ─────────────────────────────────────────────────────────
+  //  ПАРАМЕТРЫ ЗАПРОСА — объяснение каждого флага:
+  //
+  //  nsfw: true
+  //    Swagger: "Set to true if this request is NSFW.
+  //    This will SKIP workers which censor images."
+  //    → Самый важный флаг. Horde сам фильтрует воркеров с цензурой.
+  //
+  //  censor_nsfw: false
+  //    Swagger: "If the request is SFW, and the worker accidentally
+  //    generates NSFW, it will send back a censored image."
+  //    → Нам не нужна эта цензура, ставим false.
+  //
+  //  trusted_workers: false  (API default: false)
+  //    Swagger: "When true, only trusted workers will serve this
+  //    request. When False, Evaluating workers will also be used
+  //    which can increase speed but adds more risk!"
+  //    → Оставляем false для широкого пула воркеров.
+  //
+  //  slow_workers: НЕ УКАЗЫВАЕМ  (API default: true)
+  //    Swagger: "When True, allows slower workers to pick up this
+  //    request. Disabling this incurs an extra kudos cost."
+  //    → В v12 мы ставили false — это СРЕЗАЛО большинство воркеров
+  //      и стоило лишние кудосы! Теперь используем дефолт (true).
+  //
+  //  replacement_filter: true  (API default: true)
+  //    Swagger: "If enabled, suspicious prompts are sanitized
+  //    through a string replacement filter instead."
+  //    → Безопаснее true — слово не блокирует весь запрос.
+  //
+  //  allow_downgrade: НЕ УКАЗЫВАЕМ  (API default: false)
+  //    В v12 мы ставили true — это могло подменять модель на
+  //    другую с цензурой. Теперь используем дефолт (false).
+  //
+  //  r2: true  (API default: true)
+  //    Изображение отдаётся как URL к R2-бакету. Если воркер
+  //    не смог залить в R2 — придёт base64 WebP.
+  //
+  //  workers[] + worker_blacklist: true
+  //    Передаём накопленный список ID воркеров-цензоров.
+  //    Horde не выдаёт задание этим воркерам.
+  // ─────────────────────────────────────────────────────────
+
   const params = {
     sampler_name: config.sampler,
     cfg_scale: config.cfgScale,
@@ -218,32 +292,24 @@ async function hordeSubmit(prompt, config, env, opts = {}) {
     }));
   }
 
-  // v12: Блэклист воркеров (для повторов и глобальный)
-  const blacklistedWorkers = opts.blacklistedWorkers || config.workerBlacklist || [];
-
   const body = {
     prompt: config.negativePrompt
       ? `${prompt} ### ${config.negativePrompt}`
       : prompt,
     params,
-    nsfw: true,
-    censor_nsfw: false,
-    // v12: trusted_workers из конфига (false по умолчанию = больше воркеров)
-    trusted_workers: opts.forceTrusted !== undefined ? opts.forceTrusted : (config.trustedWorkers ?? false),
+    nsfw: true,                  // Пропускать воркеров с цензурой
+    censor_nsfw: false,          // Не цензурить NSFW-контент
+    trusted_workers: false,      // Широкий пул воркеров
+    replacement_filter: true,    // Замена слов вместо блока запроса
     models: [config.model],
-    // v12: r2 из конфига (false по умолчанию = base64, надёжнее)
-    r2: opts.forceR2 !== undefined ? opts.forceR2 : (config.useR2 ?? false),
-    replacement_filter: false,
+    r2: true,                    // Получаем URL, а не base64
     shared: false,
-    // v12: slow_workers из конфига (true по умолчанию = больше воркеров)
-    slow_workers: opts.forceSlow !== undefined ? opts.forceSlow : (config.slowWorkers ?? true),
-    allow_downgrade: true,
-    dry_run: false,
   };
 
-  // v12: Добавляем блэклист если есть
-  if (blacklistedWorkers.length > 0) {
-    body.blacklist_workers = blacklistedWorkers;
+  // Блэклист воркеров (max 5 по API)
+  if (opts.workerBlacklist?.length > 0) {
+    body.workers = opts.workerBlacklist.slice(0, 5);
+    body.worker_blacklist = true;
   }
 
   const resp = await fetch(`${HORDE_API}/generate/async`, {
@@ -251,7 +317,7 @@ async function hordeSubmit(prompt, config, env, opts = {}) {
     headers: { "Content-Type": "application/json", apikey: key, ...HORDE_AGENT },
     body: JSON.stringify(body),
   });
-  return await resp.json();
+  return resp.json();
 }
 
 async function hordeCheck(id) {
@@ -273,122 +339,87 @@ async function hordeGetModels() {
 //  IMAGE DELIVERY
 // ══════════════════════════════════════
 
-// v12: Скачивает изображение с проверкой Content-Type
 async function downloadImage(url) {
   try {
     const resp = await fetch(url);
-    if (!resp.ok) {
-      console.error(`[IMG] HTTP ${resp.status}`);
-      return { buf: null, contentType: null, textPreview: `HTTP ${resp.status}` };
-    }
-    const contentType = resp.headers.get("content-type") || "";
-    const buf = await resp.arrayBuffer();
-
-    // Если Content-Type не image/* — это XML/HTML ошибка (истёкший R2 URL и т.п.)
-    if (!contentType.includes("image/") && !contentType.includes("octet-stream")) {
-      const text = new TextDecoder().decode(buf.slice(0, 400));
-      console.error(`[IMG] Non-image: ${contentType}, body: ${text}`);
-      return { buf: null, contentType, textPreview: text };
-    }
-
-    return { buf, contentType, textPreview: null };
+    if (!resp.ok) return null;
+    return await resp.arrayBuffer();
   } catch (e) {
-    console.error("[IMG] Fetch err:", e.message);
+    console.error("[IMG] Fetch error:", e.message);
     return null;
   }
 }
 
+// Декодируем base64 в ArrayBuffer
+function base64ToBuffer(b64) {
+  try {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+  } catch (e) {
+    console.error("[IMG] Base64 decode error:", e.message);
+    return null;
+  }
+}
+
+// Отдаёт { sent: bool, tooSmall: bool, sizeKB: number }
 async function deliverImage(tg, chatId, imgData, caption, notifyChat) {
   if (!imgData) {
-    if (notifyChat) await tg.send(notifyChat, "❌ Нет данных картинки (gen.img пустой)");
-    return { sent: false, tooSmall: false };
+    if (notifyChat) await tg.send(notifyChat, "❌ Нет данных картинки от воркера");
+    return { sent: false, tooSmall: false, sizeKB: 0 };
   }
 
-  let buf;
   const isUrl = imgData.startsWith("http");
+  let buf;
 
   if (isUrl) {
-    const result = await downloadImage(imgData);
-
-    if (!result) {
-      if (notifyChat) await tg.send(notifyChat, "❌ Не удалось скачать картинку по R2 URL");
-      return { sent: false, tooSmall: false };
+    buf = await downloadImage(imgData);
+    if (!buf) {
+      if (notifyChat) await tg.send(notifyChat, "❌ Не удалось скачать с R2. Пробуем URL напрямую...");
+      // Попробуем отправить URL напрямую в Telegram
+      const urlRes = await tg.sendPhotoUrl(chatId, imgData, caption);
+      if (urlRes.ok) return { sent: true, tooSmall: false, sizeKB: 0 };
+      return { sent: false, tooSmall: false, sizeKB: 0 };
     }
-
-    // v12: Если вернулся не-image контент — показываем что именно пришло
-    if (!result.buf) {
-      if (notifyChat) {
-        await tg.send(notifyChat,
-          `❌ <b>R2 URL вернул не-картинку!</b>\n` +
-          `Content-Type: <code>${escapeHtml(result.contentType || "?")}</code>\n` +
-          `Содержимое:\n<pre>${escapeHtml((result.textPreview || "").substring(0, 300))}</pre>\n\n` +
-          `💡 <i>URL истёк или недоступен. Выполни /setr2 off для режима base64.</i>`
-        );
-      }
-      return { sent: false, tooSmall: false };
-    }
-
-    buf = result.buf;
   } else {
-    // Воркер вернул Base64 (режим r2:false)
-    try {
-      let b64 = imgData;
-      // v12: поддержка data URL ("data:image/...;base64,...")
-      if (b64.includes(",")) b64 = b64.split(",")[1];
-      const binary = atob(b64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      buf = bytes.buffer;
-    } catch (e) {
-      console.error("[IMG] Base64 decode error", e);
-      if (notifyChat) await tg.send(notifyChat, `❌ Base64 decode ошибка: ${escapeHtml(e.message)}`);
-      return { sent: false, tooSmall: false };
-    }
+    buf = base64ToBuffer(imgData);
+    if (!buf) return { sent: false, tooSmall: false, sizeKB: 0 };
   }
 
   const sizeKB = Math.round(buf.byteLength / 1024);
 
+  // Censorship placeholder от Horde — маленький WebP (~2KB)
   if (sizeKB < MIN_IMAGE_KB) {
-    // v12: Диагностика малого изображения — определяем тип по заголовкам байт
-    const bytes = new Uint8Array(buf.slice(0, 16));
-    const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join(" ");
-    const isJpeg = bytes[0] === 0xFF && bytes[1] === 0xD8;
-    const isPng  = bytes[0] === 0x89 && bytes[1] === 0x50;
-    const typeGuess = isJpeg ? "JPEG" : isPng ? "PNG" : "неизвестный";
-
     if (notifyChat) {
       await tg.send(notifyChat,
-        `🚫 <b>Мелкая картинка!</b> ${sizeKB}KB (нужно >${MIN_IMAGE_KB}KB)\n` +
-        `Формат: ${typeGuess} | Байты: <code>${hex}</code>\n\n` +
-        (isJpeg || isPng
-          ? `⚠️ Это настоящее изображение — вероятно <b>чёрный квадрат цензуры</b> от воркера.\n` +
-            `Воркер имеет свой censor list. При повторе этот воркер будет исключён.`
-          : `⚠️ Это не изображение — сбой воркера или ошибка данных.`)
+        `🚫 <b>Цензурная заглушка!</b> Размер: ${sizeKB}KB (норма >${MIN_IMAGE_KB}KB)\n` +
+        `Воркер добавляется в блэклист, запрос повторяется...`
       );
     }
-    return { sent: false, tooSmall: true };
+    return { sent: false, tooSmall: true, sizeKB };
   }
 
-  // 1. Пытаемся отправить как фото
-  let res = await tg.sendPhoto(chatId, buf, "image.jpeg", caption);
-  if (res.ok) return { sent: true, tooSmall: false };
+  // 1. Отправляем как фото (Telegram конвертирует WebP → jpeg)
+  let res = await tg.sendPhoto(chatId, buf, caption);
+  if (res.ok) return { sent: true, tooSmall: false, sizeKB };
 
-  // 2. Отправляем как документ (WebP и другие форматы)
-  console.log("[IMG] sendPhoto failed, trying sendDocument...", res.description);
-  res = await tg.sendDocument(chatId, buf, "image.webp", caption);
-  if (res.ok) return { sent: true, tooSmall: false };
+  // 2. Фолбэк — как документ (сохраняет оригинальный WebP)
+  console.log("[IMG] sendPhoto failed, trying sendDocument:", res.description);
+  res = await tg.sendDocument(chatId, buf, caption);
+  if (res.ok) return { sent: true, tooSmall: false, sizeKB };
 
-  // 3. Фолбэк по URL если это была R2 ссылка
+  // 3. Для R2 URL — последний шанс, отправляем ссылку напрямую
   if (isUrl) {
     console.log("[IMG] sendDocument failed, trying URL fallback...");
-    const resUrl = await tg.sendPhotoUrl(chatId, imgData, caption);
-    if (resUrl.ok) return { sent: true, tooSmall: false };
+    const urlRes = await tg.sendPhotoUrl(chatId, imgData, caption);
+    if (urlRes.ok) return { sent: true, tooSmall: false, sizeKB };
   }
 
   if (notifyChat) {
-    await tg.send(notifyChat, `❌ Отправка не удалась: ${escapeHtml(res.description || "?")}`);
+    await tg.send(notifyChat, `❌ Не удалось отправить: ${escapeHtml(res.description || "?")}`);
   }
-  return { sent: false, tooSmall: false };
+  return { sent: false, tooSmall: false, sizeKB };
 }
 
 // ══════════════════════════════════════
@@ -404,27 +435,21 @@ const P = {
 };
 
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function pickN(arr, n) { return [...arr].sort(() => Math.random() - 0.5).slice(0, n); }
 
 function templatePrompt(base) {
-  return [base, pick(P.angle), pick(P.light), pick(P.style), pick(P.mood), pick(P.detail), pick(P.detail), "masterpiece", "best quality", "highly detailed"].join(", ");
+  return [base, pick(P.angle), pick(P.light), pick(P.style), pick(P.mood), ...pickN(P.detail, 2), "masterpiece", "best quality", "highly detailed"].join(", ");
 }
 
 async function llmPrompt(instruction, apiKey, model) {
   const directions = [
-    "Focus on unusual creative perspective",
-    "Emphasize dramatic lighting and deep shadows",
-    "Place subject in unexpected environment",
-    "Focus on intricate textures and micro-details",
-    "Use bold unconventional color palette",
-    "Capture dynamic motion and energy",
-    "Create contemplative atmospheric scene",
-    "Use extreme framing — very close or very wide",
-    "Create cinematic movie composition",
-    "Add weather effects — rain, snow, fog",
-    "Focus on reflections and mirror surfaces",
-    "Give it futuristic sci-fi aesthetic",
+    "Focus on unusual creative perspective", "Emphasize dramatic lighting and deep shadows",
+    "Place subject in unexpected environment", "Focus on intricate textures and micro-details",
+    "Use bold unconventional color palette", "Capture dynamic motion and energy",
+    "Create contemplative atmospheric scene", "Use extreme framing — very close or very wide",
+    "Create cinematic movie composition", "Add weather effects — rain, snow, fog",
+    "Focus on reflections and mirror surfaces", "Give it futuristic sci-fi aesthetic",
   ];
-
   try {
     const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
@@ -439,33 +464,25 @@ async function llmPrompt(instruction, apiKey, model) {
         messages: [
           {
             role: "system",
-            content: `You are a Stable Diffusion prompt engineer. Output ONLY comma-separated descriptive phrases. No explanations, no quotes, no markdown, no numbering. Under 100 words. Be creative and unique. Direction: ${pick(directions)}`,
+            content: `You are a Stable Diffusion prompt engineer. Output ONLY comma-separated descriptive phrases. No explanations, no quotes, no markdown. Under 100 words. Be creative and unique. Direction: ${pick(directions)}`,
           },
-          {
-            role: "user",
-            content: `Create a unique detailed image generation prompt for: ${instruction}`,
-          },
+          { role: "user", content: `Create a unique detailed image generation prompt for: ${instruction}` },
         ],
         temperature: 1.3,
         max_tokens: 200,
       }),
     });
     const data = await resp.json();
-    if (data.choices?.[0]?.message?.content) {
-      let p = data.choices[0].message.content.trim().replace(/^["'`*]+|["'`*]+$/g, "");
-      if (p.length > 10) return p;
-    }
-  } catch (e) {
-    console.error("[LLM]", e.message);
-  }
+    const p = data.choices?.[0]?.message?.content?.trim().replace(/^["'`*]+|["'`*]+$/g, "");
+    if (p?.length > 10) return p;
+  } catch (e) { console.error("[LLM]", e.message); }
   return templatePrompt(instruction);
 }
 
 async function generatePrompt(instruction, env) {
   if (env.OPENROUTER_API_KEY) {
     const config = await getConfig(env);
-    const model = config.llmModel || env.LLM_MODEL || "meta-llama/llama-3.1-8b-instruct:free";
-    return llmPrompt(instruction, env.OPENROUTER_API_KEY, model);
+    return llmPrompt(instruction, env.OPENROUTER_API_KEY, config.llmModel || env.LLM_MODEL || "meta-llama/llama-3.1-8b-instruct:free");
   }
   return templatePrompt(instruction);
 }
@@ -486,15 +503,14 @@ async function handleCommand(msg, env) {
   const args = parts.slice(1);
 
   // ── Команды без KV ──
-
   if (cmd === "/ping") {
     const k = getApiKey(env);
     await tg.send(chatId,
-      `🏓 <b>Pong! v12</b>\n\n` +
+      `🏓 <b>Pong! v13</b>\n\n` +
       `📍 Chat: <code>${chatId}</code>\n` +
       `👤 User: <code>${userId}</code>\n` +
-      `💾 KV: ${env.BOT_KV ? "✅ привязан" : "❌ не привязан"}\n` +
-      `🎨 Horde: ${k === "0000000000" ? "❌ анонимный" : "✅ " + k.substring(0, 8) + "..."}\n` +
+      `💾 KV: ${env.BOT_KV ? "✅" : "❌"}\n` +
+      `🎨 Horde: ${k === "0000000000" ? "🔴 анонимный (NSFW не работает!)" : "✅ " + k.substring(0, 8) + "..."}\n` +
       `🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "⚠️ шаблоны"}`
     );
     return;
@@ -502,90 +518,95 @@ async function handleCommand(msg, env) {
 
   if (cmd === "/diagnostic") {
     const k = getApiKey(env);
-    let config = {};
-    try { config = await getConfig(env); } catch {}
-    let t = `🔧 <b>Диагностика v12</b>\n\n`;
-    t += `💾 KV: ${env.BOT_KV ? "✅" : "❌ НЕ ПРИВЯЗАН"}\n`;
-    t += `🔑 Horde: ${k === "0000000000" ? "❌ анонимный" : "✅ " + k.substring(0, 8) + "..."}\n`;
-    t += `🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "⚠️"}\n\n`;
-    t += `⚙️ r2: ${config.useR2 ? "true (URL ⚠️ может истекать)" : "false (base64 ✅ надёжно)"}\n`;
-    t += `⚙️ trusted_workers: ${config.trustedWorkers ?? false}\n`;
-    t += `⚙️ slow_workers: ${config.slowWorkers ?? true}\n`;
-    t += `⚙️ Блэклист воркеров: ${(config.workerBlacklist || []).length} шт.\n`;
-    t += `⚙️ Мин. размер: ${MIN_IMAGE_KB}KB\n`;
-    await tg.send(chatId, t);
+    const bl = await getWorkerBlacklist(env);
+    await tg.send(chatId,
+      `🔧 <b>Диагностика v13</b>\n\n` +
+      `💾 KV: ${env.BOT_KV ? "✅" : "❌ НЕ ПРИВЯЗАН"}\n` +
+      `🔑 Horde key: ${k === "0000000000" ? "🔴 анонимный" : "✅ " + k.substring(0, 8) + "..."}\n` +
+      `🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "⚠️"}\n\n` +
+      `<b>Параметры запроса:</b>\n` +
+      `  nsfw: true (пропускает воркеров с цензурой)\n` +
+      `  censor_nsfw: false\n` +
+      `  trusted_workers: false (широкий пул)\n` +
+      `  slow_workers: <i>default true</i> (не отключаем!)\n` +
+      `  replacement_filter: true\n` +
+      `  r2: true\n\n` +
+      `🚫 Воркеров в блэклисте: <b>${bl.length}</b>\n` +
+      `📏 Мин. размер картинки: ${MIN_IMAGE_KB}KB\n\n` +
+      `<b>Детект цензуры (v13):</b>\n` +
+      `  1. gen_metadata[].type=="censorship" (swagger)\n` +
+      `  2. gen.censored === true\n` +
+      `  3. gen.state === "censored"\n` +
+      `  4. Размер файла < ${MIN_IMAGE_KB}KB`
+    );
     return;
   }
 
   if (cmd === "/checkkey") {
-    await tg.send(chatId, "🔑 Проверяю ключ...");
+    await tg.send(chatId, "🔑 Проверяю ключ Horde...");
     const info = await hordeCheckKey(env);
     if (!info.ok) {
-      await tg.send(chatId, `❌ <b>Ключ невалидный!</b>\n\n${escapeHtml(info.err || "")}`);
+      await tg.send(chatId, `❌ <b>Ключ невалидный!</b>\n${escapeHtml(info.err || "")}`);
     } else {
+      let status = "";
+      if (info.anon) status = "🔴 <b>Анонимный ключ!</b>\nNSFW работать НЕ БУДЕТ.\nЗарегистрируйся: https://stablehorde.net";
+      else if (info.flagged) status = "⚠️ Аккаунт помечен — возможна цензура";
+      else status = "✅ Всё в порядке, NSFW должен работать";
+
       await tg.send(chatId,
-        `${info.anon ? "🔴" : "✅"} <b>${escapeHtml(info.user)}</b>\n\n` +
-        `💎 Kudos: ${info.kudos}\n` +
+        `${info.anon ? "🔴" : "✅"} <b>${escapeHtml(info.user || "anonymous")}</b>\n\n` +
+        `💎 Kudos: ${info.kudos || 0}\n` +
         `🛡 Trusted: ${info.trusted ? "да" : "нет"}\n` +
         `🚩 Flagged: ${info.flagged ? "⚠️ ДА" : "нет"}\n\n` +
-        (info.anon ? "🔴 <b>Анонимный ключ — NSFW будет цензуриться!</b>" :
-         info.flagged ? "⚠️ Аккаунт помечен — возможна цензура" :
-         "✅ Всё в порядке")
+        status
       );
     }
     return;
   }
 
   if (cmd === "/testimg") {
-    await tg.send(chatId, "🧪 <b>Тест отправки картинок</b>\n\n1️⃣ URL метод...");
-    const r1 = await tg.sendPhotoUrl(chatId, "https://picsum.photos/512/512", "✅ URL метод работает");
-    await tg.send(chatId, r1.ok ? "✅ URL ОК!\n\n2️⃣ Buffer метод..." : `❌ URL: ${escapeHtml(r1.description)}\n\n2️⃣ Buffer метод...`);
+    await tg.send(chatId, "🧪 <b>Тест отправки изображений</b>\n\n1. URL метод...");
+    const r1 = await tg.sendPhotoUrl(chatId, "https://picsum.photos/512/512", "URL метод");
+    await tg.send(chatId, r1.ok ? "✅ URL работает!\n\n2. Buffer метод..." : `❌ URL: ${escapeHtml(r1.description)}\n\n2. Buffer метод...`);
     try {
       const resp = await fetch("https://picsum.photos/256/256");
       const buf = await resp.arrayBuffer();
-      const r2 = await tg.sendPhoto(chatId, buf, "image.jpeg", "✅ Buffer метод работает");
+      const r2 = await tg.sendPhoto(chatId, buf, "Buffer метод");
       await tg.send(chatId, r2.ok ? "✅ <b>Оба метода работают!</b>" : `❌ Buffer: ${escapeHtml(r2.description)}`);
-    } catch (e) {
-      await tg.send(chatId, `❌ ${escapeHtml(e.message)}`);
-    }
+    } catch (e) { await tg.send(chatId, `❌ ${escapeHtml(e.message)}`); }
     return;
   }
 
   if (cmd === "/testsfw") {
-    if (!env.BOT_KV) { await tg.send(chatId, "❌ KV!"); return; }
+    if (!env.BOT_KV) { await tg.send(chatId, "❌ KV не привязан!"); return; }
     const config = await getConfig(env);
-    await tg.send(chatId,
-      `🧪 <b>SFW тест генерации</b>\n\n` +
-      `⚙️ r2: ${config.useR2 ? "true (URL)" : "false (base64 ✅)"}\n` +
-      `⚙️ trusted: ${config.trustedWorkers ?? false}\n` +
-      `⚙️ slow: ${config.slowWorkers ?? true}\n\n` +
-      `Отправляю запрос на AI Horde...`
-    );
-    const sfwPrompt = "beautiful mountain landscape, crystal clear lake, sunset sky with orange and pink clouds, pine trees, snow capped peaks, nature photography, national geographic, 4k, masterpiece, best quality, highly detailed, sharp focus";
+    await tg.send(chatId, "🧪 <b>SFW тест генерации (горы, пейзаж)</b>\nОтправляю в Horde...");
+    const sfwPrompt = "beautiful mountain landscape, crystal clear lake, sunset sky, orange and pink clouds, pine trees, snow capped peaks, nature photography, 4k, masterpiece, best quality, highly detailed, sharp focus";
     try {
       const result = await hordeSubmit(sfwPrompt, config, env, { skipLoras: true });
       if (result.id) {
         await KV.put(env, `pending:${result.id}`, JSON.stringify({
           chatId, prompt: sfwPrompt, at: Date.now(), notify: chatId, debug: true, retries: 99, sfwTest: true,
         }), { expirationTtl: 3600 });
-        await tg.send(chatId, `📤 ID: <code>${result.id}</code>\n⏳ Ожидай результат...`);
+        await tg.send(chatId, `📤 ID: <code>${result.id}</code>\n⏳ Жди результат (следующий cron-тик)...`);
       } else {
-        await tg.send(chatId, `❌ ${escapeHtml(JSON.stringify(result).substring(0, 400))}`);
+        await tg.send(chatId, `❌ Horde ответил: <code>${escapeHtml(JSON.stringify(result).substring(0, 400))}</code>`);
       }
     } catch (e) { await tg.send(chatId, `❌ ${escapeHtml(e.message)}`); }
     return;
   }
 
-  if (!env.BOT_KV) { await tg.send(chatId, "❌ KV не привязан! /diagnostic"); return; }
+  if (!env.BOT_KV) { await tg.send(chatId, "❌ KV не привязан! Используй /diagnostic"); return; }
   let config = await getConfig(env);
 
+  // Первый пользователь = admin
   if (!config.adminId) {
     config.adminId = userId;
     await saveConfig(env, config);
-    await tg.send(chatId, `👑 Вы назначены админом! ID: <code>${userId}</code>`);
+    await tg.send(chatId, `👑 Ты назначен админом. ID: <code>${userId}</code>`);
   }
   if (config.adminId !== userId) {
-    await tg.send(chatId, `🔒 Доступ только для админа (ID: ${config.adminId})`);
+    await tg.send(chatId, `🔒 Только для админа (ID: ${config.adminId})`);
     return;
   }
 
@@ -593,27 +614,31 @@ async function handleCommand(msg, env) {
     case "/start":
     case "/help": {
       await tg.send(chatId,
-        `🤖 <b>Image Generator Bot v12</b>\n\n` +
+        `🤖 <b>Image Bot v13</b>\n\n` +
         `<b>Основные:</b>\n` +
-        `/status — текущие настройки\n` +
-        `/generate — генерировать сейчас\n` +
-        `/pending — очередь\n` +
-        `/cancel — очистить очередь\n\n` +
-        `<b>Настройки генерации:</b>\n` +
-        `/setr2 [on|off] — URL vs base64 (рек. off)\n` +
-        `/settrusted [on|off] — только trusted воркеры\n` +
-        `/setslow [on|off] — медленные воркеры (рек. on)\n` +
-        `/setmodel &lt;название&gt; — модель\n` +
-        `/setprompt &lt;тема&gt; — промпт\n` +
-        `/setchat — установить чат для постинга\n\n` +
-        `<b>Диагностика:</b>\n` +
-        `/checkkey — проверить API ключ\n` +
-        `/testimg — тест отправки\n` +
-        `/testsfw — тест генерации\n` +
-        `/diagnostic — диагностика\n` +
-        `/censorlog — лог цензуры\n` +
-        `/workerblacklist — блэклист воркеров\n` +
-        `/listmodels — список моделей`
+        `/setchat — чат для постинга\n` +
+        `/setprompt &lt;текст&gt; — тема\n` +
+        `/setinterval &lt;мин&gt; — интервал\n` +
+        `/setcount &lt;1-10&gt; — кол-во\n` +
+        `/enable | /disable — авторежим\n` +
+        `/generate — сгенерировать сейчас\n\n` +
+        `<b>Модель и LoRA:</b>\n` +
+        `/setmodel &lt;название&gt;\n` +
+        `/listmodels — топ-40 моделей\n` +
+        `/searchlora &lt;запрос&gt; — CivitAI\n` +
+        `/addlora &lt;version_id&gt; [сила] [clip]\n` +
+        `/removelora &lt;id&gt; | /listloras\n\n` +
+        `<b>Параметры:</b>\n` +
+        `/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt;\n` +
+        `/setcfg &lt;N&gt; | /setsampler &lt;имя&gt;\n` +
+        `/setneg &lt;текст&gt; | /setclipskip &lt;1-4&gt;\n` +
+        `/setllm &lt;model_id&gt;\n\n` +
+        `<b>Управление:</b>\n` +
+        `/status | /pending | /cancel\n` +
+        `/workerbl — блэклист воркеров\n` +
+        `/clearworkerbl — очистить блэклист\n` +
+        `/checkkey — проверить ключ Horde\n` +
+        `/diagnostic | /testsfw | /testimg`
       );
       break;
     }
@@ -627,118 +652,190 @@ async function handleCommand(msg, env) {
 
     case "/setprompt": {
       const p = args.join(" ");
-      if (!p) { await tg.send(chatId, "❌ /setprompt &lt;ваша тема&gt;"); break; }
+      if (!p) { await tg.send(chatId, "❌ /setprompt &lt;тема&gt;"); break; }
       config.generalPrompt = p;
       await saveConfig(env, config);
       await tg.send(chatId, `✅ Промпт:\n<code>${escapeHtml(p)}</code>`);
       break;
     }
 
+    case "/setinterval": {
+      const n = parseInt(args[0]);
+      if (isNaN(n) || n < 1) { await tg.send(chatId, "❌ /setinterval &lt;минуты&gt; (мин. 1)"); break; }
+      config.interval = n;
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ Интервал: ${n} мин.`);
+      break;
+    }
+
+    case "/setcount": {
+      const n = parseInt(args[0]);
+      if (isNaN(n) || n < 1 || n > 10) { await tg.send(chatId, "❌ /setcount &lt;1-10&gt;"); break; }
+      config.count = n;
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ Кол-во: ${n}`);
+      break;
+    }
+
     case "/setmodel": {
       const name = args.join(" ");
-      if (!name) { await tg.send(chatId, "❌ /setmodel &lt;название&gt;"); break; }
+      if (!name) { await tg.send(chatId, "❌ /setmodel &lt;название&gt;\nСм. /listmodels"); break; }
       config.model = name;
       await saveConfig(env, config);
       await tg.send(chatId, `✅ Модель: <code>${escapeHtml(name)}</code>`);
       break;
     }
 
-    // v12: Управление режимом r2
-    case "/setr2": {
-      const val = args[0]?.toLowerCase();
-      if (val === "on" || val === "true") {
-        config.useR2 = true;
-        await saveConfig(env, config);
-        await tg.send(chatId,
-          `⚠️ <b>R2 URL режим включён.</b>\n\n` +
-          `Картинки скачиваются по URL. Если снова 1KB — попробуй /setr2 off\n` +
-          `(Presigned URL от AI Horde может истечь пока cron ждёт готовности)`
-        );
-      } else if (val === "off" || val === "false") {
-        config.useR2 = false;
-        await saveConfig(env, config);
-        await tg.send(chatId,
-          `✅ <b>Base64 режим включён (рекомендуется).</b>\n\n` +
-          `Картинки приходят прямо в JSON-ответе API. Никаких истечений URL.`
-        );
-      } else {
-        const current = config.useR2 ? "on (URL ⚠️)" : "off (base64 ✅)";
-        await tg.send(chatId,
-          `📡 <b>Текущий режим r2: ${current}</b>\n\n` +
-          `/setr2 off — base64 (надёжно, рекомендуется)\n` +
-          `/setr2 on — URL (чуть быстрее, может давать 1KB)`
-        );
-      }
-      break;
-    }
-
-    // v12: Управление trusted_workers
-    case "/settrusted": {
-      const val = args[0]?.toLowerCase();
-      if (val === "on" || val === "true") {
-        config.trustedWorkers = true;
-        await saveConfig(env, config);
-        await tg.send(chatId, `✅ trusted_workers: true\n⚠️ Меньше воркеров доступно.`);
-      } else if (val === "off" || val === "false") {
-        config.trustedWorkers = false;
-        await saveConfig(env, config);
-        await tg.send(chatId, `✅ trusted_workers: false\n✅ Максимум доступных воркеров.`);
-      } else {
-        await tg.send(chatId,
-          `🛡 <b>trusted_workers: ${config.trustedWorkers ?? false}</b>\n\n` +
-          `/settrusted on — только доверенные\n` +
-          `/settrusted off — все воркеры (рекомендуется)`
-        );
-      }
-      break;
-    }
-
-    // v12: Управление slow_workers
-    case "/setslow": {
-      const val = args[0]?.toLowerCase();
-      if (val === "on" || val === "true") {
-        config.slowWorkers = true;
-        await saveConfig(env, config);
-        await tg.send(chatId, `✅ slow_workers: true\n✅ Больше воркеров доступно.`);
-      } else if (val === "off" || val === "false") {
-        config.slowWorkers = false;
-        await saveConfig(env, config);
-        await tg.send(chatId, `✅ slow_workers: false\n⚠️ Только быстрые воркеры.`);
-      } else {
-        await tg.send(chatId,
-          `🐢 <b>slow_workers: ${config.slowWorkers ?? true}</b>\n\n` +
-          `/setslow on — включить медленные (рекомендуется)\n` +
-          `/setslow off — только быстрые`
-        );
-      }
-      break;
-    }
-
-    // v12: Управление блэклистом воркеров
-    case "/workerblacklist": {
-      const bl = config.workerBlacklist || [];
-      if (!bl.length) {
-        await tg.send(chatId, "📋 Блэклист воркеров пуст\n\nВоркеры добавляются автоматически после 3 неудачных попыток.\n/censorlog — история цензуры");
-      } else {
-        let txt = `🚫 <b>Блэклист воркеров: ${bl.length}</b>\n\n`;
-        bl.forEach((w, i) => { txt += `${i + 1}. <code>${escapeHtml(w)}</code>\n`; });
-        txt += "\n/clearworkerblacklist — очистить";
+    case "/listmodels": {
+      await tg.send(chatId, "⏳ Загружаю список...");
+      try {
+        const models = await hordeGetModels();
+        const sorted = models.filter(m => m.count > 0).sort((a, b) => b.count - a.count).slice(0, 40);
+        let txt = "📋 <b>Модели (топ-40):</b>\n\n";
+        for (const m of sorted) {
+          const tag = (m.name.includes("XL") || m.name.includes("SDXL")) ? "🟢" : "⚪";
+          txt += `${tag} <code>${escapeHtml(m.name)}</code> (${m.count}w)\n`;
+        }
+        txt += "\n🟢 = SDXL  ⚪ = SD1.5\n/setmodel &lt;название&gt;";
         await tg.send(chatId, txt);
-      }
+      } catch (e) { await tg.send(chatId, `❌ ${escapeHtml(e.message)}`); }
       break;
     }
 
-    case "/clearworkerblacklist": {
-      config.workerBlacklist = [];
+    case "/searchlora": {
+      const query = args.join(" ");
+      if (!query) { await tg.send(chatId, "❌ /searchlora &lt;запрос на английском&gt;"); break; }
+      await tg.send(chatId, "🔍 Ищу на CivitAI...");
+      try {
+        const url = `https://civitai.com/api/v1/models?types=LORA&query=${encodeURIComponent(query)}&limit=10&sort=Highest%20Rated&nsfw=true`;
+        const data = await (await fetch(url)).json();
+        if (!data.items?.length) { await tg.send(chatId, "😕 Ничего не найдено"); break; }
+        let txt = `🔍 <b>LoRA: "${escapeHtml(query)}"</b>\n\n`;
+        for (const item of data.items.slice(0, 10)) {
+          const ver = item.modelVersions?.[0];
+          const vid = ver?.id || "?";
+          txt += `${item.nsfw ? "🔞" : "✅"} <b>${escapeHtml(item.name)}</b> [${ver?.baseModel || "?"}]\n`;
+          txt += `   ➕ <code>/addlora ${vid} 0.8</code>\n\n`;
+        }
+        await tg.send(chatId, txt);
+      } catch (e) { await tg.send(chatId, `❌ ${escapeHtml(e.message)}`); }
+      break;
+    }
+
+    case "/addlora": {
+      const id = args[0]; const str = parseFloat(args[1]) || 0.8; const clip = parseFloat(args[2]) || 1;
+      if (!id) { await tg.send(chatId, "❌ /addlora &lt;civitai_version_id&gt; [strength=0.8] [clip=1]"); break; }
+      config.loras = (config.loras || []).filter(l => String(l.name) !== String(id));
+      config.loras.push({ name: id, strength: str, clip });
       await saveConfig(env, config);
-      await tg.send(chatId, "✅ Блэклист воркеров очищен");
+      await tg.send(chatId, `✅ LoRA <code>${id}</code> (strength: ${str}, clip: ${clip})`);
+      break;
+    }
+
+    case "/removelora": {
+      const id = args[0];
+      if (!id) { await tg.send(chatId, "❌ /removelora &lt;id&gt;"); break; }
+      config.loras = (config.loras || []).filter(l => String(l.name) !== String(id));
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ LoRA <code>${id}</code> удалена`);
+      break;
+    }
+
+    case "/listloras": {
+      const loras = config.loras || [];
+      if (!loras.length) { await tg.send(chatId, "📋 LoRA нет. /searchlora для поиска"); break; }
+      let txt = "📋 <b>Ваши LoRA:</b>\n\n";
+      loras.forEach((l, i) => {
+        txt += `${i + 1}. <code>${escapeHtml(l.name)}</code> (str: ${l.strength}, clip: ${l.clip})\n   ❌ /removelora ${l.name}\n\n`;
+      });
+      await tg.send(chatId, txt);
+      break;
+    }
+
+    case "/setsize": {
+      let w = parseInt(args[0]), h = parseInt(args[1]);
+      if (isNaN(w) || isNaN(h) || w < 256 || h < 256 || w > 2048 || h > 2048) {
+        await tg.send(chatId, "❌ /setsize &lt;W&gt; &lt;H&gt; (256-2048, кратно 64)\n\n<code>/setsize 1024 1024</code> — квадрат\n<code>/setsize 832 1216</code> — портрет\n<code>/setsize 1216 832</code> — ландшафт");
+        break;
+      }
+      config.width = Math.round(w / 64) * 64;
+      config.height = Math.round(h / 64) * 64;
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ Размер: ${config.width}×${config.height}`);
+      break;
+    }
+
+    case "/setsteps": {
+      const s = parseInt(args[0]);
+      if (isNaN(s) || s < 1 || s > 150) { await tg.send(chatId, "❌ /setsteps &lt;1-150&gt;"); break; }
+      config.steps = s;
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ Steps: ${s}`);
+      break;
+    }
+
+    case "/setcfg": {
+      const c = parseFloat(args[0]);
+      if (isNaN(c) || c < 1 || c > 30) { await tg.send(chatId, "❌ /setcfg &lt;1-30&gt;"); break; }
+      config.cfgScale = c;
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ CFG: ${c}`);
+      break;
+    }
+
+    case "/setsampler": {
+      const samplers = ["k_euler","k_euler_a","k_lms","k_heun","k_dpm_2","k_dpm_2_a","k_dpmpp_2s_a","k_dpmpp_2m","k_dpmpp_sde","DDIM"];
+      const s = args[0];
+      if (!s || !samplers.includes(s)) {
+        await tg.send(chatId, `❌ Доступные сэмплеры:\n${samplers.map(x => `<code>${x}</code>`).join("\n")}`);
+        break;
+      }
+      config.sampler = s;
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ Сэмплер: ${s}`);
+      break;
+    }
+
+    case "/setneg": {
+      config.negativePrompt = args.join(" ") || DEFAULT_CONFIG.negativePrompt;
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ Негативный промпт:\n<code>${escapeHtml(config.negativePrompt)}</code>`);
+      break;
+    }
+
+    case "/setclipskip": {
+      const cs = parseInt(args[0]);
+      if (isNaN(cs) || cs < 1 || cs > 4) { await tg.send(chatId, "❌ /setclipskip &lt;1-4&gt;"); break; }
+      config.clipSkip = cs;
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ CLIP Skip: ${cs}`);
+      break;
+    }
+
+    case "/setllm": {
+      const llm = args.join(" ");
+      if (!llm) {
+        await tg.send(chatId,
+          `❌ /setllm &lt;model_id&gt;\n\n<b>Бесплатные на OpenRouter:</b>\n` +
+          `<code>meta-llama/llama-3.1-8b-instruct:free</code>\n` +
+          `<code>google/gemma-2-9b-it:free</code>\n` +
+          `<code>mistralai/mistral-7b-instruct:free</code>\n` +
+          `<code>qwen/qwen-2-7b-instruct:free</code>`
+        );
+        break;
+      }
+      config.llmModel = llm;
+      await saveConfig(env, config);
+      await tg.send(chatId, `✅ LLM: <code>${escapeHtml(llm)}</code>`);
       break;
     }
 
     case "/enable": {
+      if (!config.chatId) { await tg.send(chatId, "❌ Сначала /setchat"); break; }
+      if (!config.generalPrompt) { await tg.send(chatId, "❌ Сначала /setprompt"); break; }
       config.enabled = true;
       await saveConfig(env, config);
-      await tg.send(chatId, "🟢 Автопостинг включён");
+      await tg.send(chatId, `🟢 Автопостинг включён!\nИнтервал: ${config.interval} мин. × ${config.count} шт.`);
       break;
     }
 
@@ -749,53 +846,23 @@ async function handleCommand(msg, env) {
       break;
     }
 
-    case "/listmodels": {
-      await tg.send(chatId, "⏳ Загружаю список моделей...");
-      try {
-        const models = await hordeGetModels();
-        const sorted = models.filter(m => m.count > 0).sort((a, b) => b.count - a.count).slice(0, 30);
-        let txt = "📋 <b>Модели (топ-30 по числу воркеров):</b>\n\n";
-        for (const m of sorted) {
-          txt += `<code>${escapeHtml(m.name)}</code> (${m.count})\n`;
-        }
-        await tg.send(chatId, txt);
-      } catch (e) { await tg.send(chatId, `❌ ${escapeHtml(e.message)}`); }
-      break;
-    }
-
     case "/status": {
       let pendingCount = 0;
-      try { const pending = await KV.list(env, "pending:"); pendingCount = pending.keys.length; } catch {}
-      const clog = await getCensorLog(env);
+      try { pendingCount = (await KV.list(env, "pending:")).keys.length; } catch {}
+      const bl = await getWorkerBlacklist(env);
       const lorasTxt = (config.loras || []).map(l => `  • <code>${escapeHtml(l.name)}</code> (${l.strength})`).join("\n") || "  нет";
-      const bl = config.workerBlacklist || [];
-
       await tg.send(chatId,
-`📊 <b>Статус v12</b>
-
-<b>Автопост:</b> ${config.enabled ? "🟢 ВКЛ" : "🔴 ВЫКЛ"}
-<b>Чат:</b> <code>${config.chatId || "не задан"}</code>
-<b>Интервал:</b> ${config.interval} мин. × ${config.count} шт.
-
-<b>Промпт:</b>
-<code>${escapeHtml(config.generalPrompt || "не задан")}</code>
-
-<b>Модель:</b> <code>${escapeHtml(config.model)}</code>
-<b>Размер:</b> ${config.width}×${config.height}
-<b>NSFW:</b> ${config.nsfw ? "🔞 да" : "нет"}
-
-<b>LoRA:</b>
-${lorasTxt}
-
-<b>🔧 Режим генерации:</b>
-  r2: ${config.useR2 ? "URL ⚠️" : "base64 ✅"}
-  trusted_workers: ${config.trustedWorkers ?? false}
-  slow_workers: ${config.slowWorkers ?? true}
-  Блэклист: ${bl.length} воркеров
-
-<b>LLM:</b> <code>${escapeHtml(config.llmModel || env.LLM_MODEL || "auto")}</code>
-<b>Цензура (лог):</b> ${clog.length} случаев
-<b>В очереди:</b> ${pendingCount}`
+        `📊 <b>Статус v13</b>\n\n` +
+        `<b>Автопост:</b> ${config.enabled ? "🟢 ВКЛ" : "🔴 ВЫКЛ"}\n` +
+        `<b>Чат:</b> <code>${config.chatId || "не задан"}</code>\n` +
+        `<b>Интервал:</b> ${config.interval} мин. × ${config.count} шт.\n\n` +
+        `<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt || "не задан")}</code>\n\n` +
+        `<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n` +
+        `<b>Размер:</b> ${config.width}×${config.height} | <b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n` +
+        `<b>Сэмплер:</b> ${config.sampler} | <b>CLIP:</b> ${config.clipSkip}\n\n` +
+        `<b>LoRA:</b>\n${lorasTxt}\n\n` +
+        `<b>LLM:</b> <code>${escapeHtml(config.llmModel || env.LLM_MODEL || "auto")}</code>\n` +
+        `<b>В очереди:</b> ${pendingCount} | <b>Блэклист:</b> ${bl.length} воркеров`
       );
       break;
     }
@@ -803,18 +870,22 @@ ${lorasTxt}
     case "/generate": {
       if (!config.generalPrompt) { await tg.send(chatId, "❌ Сначала /setprompt"); break; }
       const target = config.chatId || chatId;
-      await tg.send(chatId, `⏳ Генерирую ${config.count} изображений...\n⚙️ r2: ${config.useR2 ? "URL" : "base64 ✅"}`);
+      await tg.send(chatId, `⏳ Генерирую ${config.count} изображений...`);
+      const bl = await getWorkerBlacklist(env);
+      const blIds = bl.map(w => w.id).filter(Boolean);
       for (let i = 0; i < config.count; i++) {
         try {
           const prompt = await generatePrompt(config.generalPrompt, env);
-          await tg.send(chatId, `🎨 #${i + 1}: <code>${escapeHtml(prompt.substring(0, 200))}</code>`);
-          const result = await hordeSubmit(prompt, config, env);
+          await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(prompt.substring(0, 300))}</code>`);
+          const result = await hordeSubmit(prompt, config, env, { workerBlacklist: blIds });
           if (result.id) {
             await KV.put(env, `pending:${result.id}`, JSON.stringify({
               chatId: target, prompt, at: Date.now(), notify: chatId, retries: 0,
             }), { expirationTtl: 3600 });
             await tg.send(chatId, `📤 ID: <code>${result.id}</code>`);
-          } else { await tg.send(chatId, `❌ ${escapeHtml(JSON.stringify(result).substring(0, 300))}`); }
+          } else {
+            await tg.send(chatId, `❌ Horde: <code>${escapeHtml(JSON.stringify(result).substring(0, 300))}</code>`);
+          }
         } catch (e) { await tg.send(chatId, `❌ ${escapeHtml(e.message)}`); }
       }
       break;
@@ -824,67 +895,66 @@ ${lorasTxt}
       const list = await KV.list(env, "pending:");
       if (!list.keys.length) { await tg.send(chatId, "📋 Очередь пуста"); break; }
       let txt = `📋 <b>В очереди: ${list.keys.length}</b>\n\n`;
-      const promises = list.keys.slice(0, 10).map(async (key) => {
-        const id = key.name.replace("pending:", "");
+      const checks = await Promise.all(list.keys.slice(0, 10).map(async k => {
+        const id = k.name.replace("pending:", "");
         try {
-          const check = await hordeCheck(id);
-          const status = check.done ? "✅ Готово" : check.processing ? "⚙️ Генерируется" : `⏳ Очередь #${check.queue_position}`;
-          return `🔸 <code>${id}</code>\n   ${status} | ~${check.wait_time || 0}с\n`;
-        } catch {
-          return `🔸 <code>${id}</code> — не удалось проверить\n`;
-        }
-      });
-      const results = await Promise.all(promises);
-      txt += results.join("\n");
-      await tg.send(chatId, txt);
+          const c = await hordeCheck(id);
+          const s = c.done ? "✅ Готово" : c.processing ? "⚙️ Генерируется" : `⏳ #${c.queue_position}`;
+          return `🔸 <code>${id}</code>\n   ${s} | ~${c.wait_time || 0}с\n`;
+        } catch { return `🔸 <code>${id}</code> — не удалось проверить\n`; }
+      }));
+      await tg.send(chatId, txt + checks.join("\n"));
       break;
     }
 
     case "/cancel": {
       const list = await KV.list(env, "pending:");
       await Promise.all(list.keys.map(k => KV.del(env, k.name)));
-      await tg.send(chatId, `🗑 Удалено из очереди: ${list.keys.length}`);
+      await tg.send(chatId, `🗑 Удалено: ${list.keys.length}`);
       break;
     }
 
-    case "/censorlog": {
-      const log = await getCensorLog(env);
-      if (!log.length) { await tg.send(chatId, "📋 Лог цензуры пуст"); break; }
-      let txt = `🚫 <b>Лог цензуры: ${log.length}</b>\n\n`;
-      log.slice(-10).forEach(entry => {
-        txt += `• <code>${escapeHtml(entry.w)}</code> [${entry.r}]\n  ${new Date(entry.t).toISOString().substring(0, 16)}\n\n`;
+    case "/workerbl": {
+      const bl = await getWorkerBlacklist(env);
+      if (!bl.length) { await tg.send(chatId, "📋 Блэклист пуст"); break; }
+      let txt = `🚫 <b>Блэклист воркеров: ${bl.length}</b>\n\n`;
+      bl.forEach(w => {
+        txt += `• <code>${escapeHtml(w.name || "?")}</code>\n  ID: <code>${w.id}</code>\n  ${new Date(w.t).toISOString().substring(0, 10)}\n\n`;
       });
-      txt += "/clearcensorlog — очистить";
+      txt += "\n/clearworkerbl — очистить";
       await tg.send(chatId, txt);
       break;
     }
 
-    case "/clearcensorlog": {
-      await clearCensorLog(env);
-      await tg.send(chatId, "✅ Лог очищен");
+    case "/clearworkerbl": {
+      await clearWorkerBlacklist(env);
+      await tg.send(chatId, "✅ Блэклист воркеров очищен");
       break;
+    }
+
+    default: {
+      if (cmd.startsWith("/")) await tg.send(chatId, "❓ Неизвестная команда — /help");
     }
   }
 }
 
 // ══════════════════════════════════════
-//  CRON
+//  CRON — обработка очереди и автопостинг
 // ══════════════════════════════════════
 
 async function processScheduled(env) {
   if (!env.BOT_KV || !env.TELEGRAM_BOT_TOKEN) return;
-
   const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
   const config = await getConfig(env);
   const pendingList = await KV.list(env, "pending:");
 
   for (const key of pendingList.keys) {
     const id = key.name.replace("pending:", "");
-
     try {
       const data = await KV.get(env, key.name, "json");
       if (!data) { await KV.del(env, key.name); continue; }
 
+      // Таймаут 20 минут
       if (Date.now() - data.at > 20 * 60 * 1000) {
         await KV.del(env, key.name);
         if (data.notify) await tg.send(data.notify, `⏰ Таймаут генерации: <code>${id}</code>`);
@@ -894,7 +964,7 @@ async function processScheduled(env) {
       const check = await hordeCheck(id);
       if (!check.done) continue;
 
-      if (data.notify) await tg.send(data.notify, `⚡ Генерация <code>${id}</code> завершена! Получаю результат...`);
+      if (data.notify) await tg.send(data.notify, `⚡ Генерация <code>${id}</code> завершена!`);
 
       const result = await hordeGetResult(id);
 
@@ -905,102 +975,107 @@ async function processScheduled(env) {
       }
 
       const gens = result.generations || [];
-      if (!gens.length) {
-        await KV.del(env, key.name);
-        continue;
-      }
+      if (!gens.length) { await KV.del(env, key.name); continue; }
 
       let anySent = false;
       let anySmall = false;
-      // v12: Собираем воркеров-цензоров для блэклиста
-      const censoredWorkers = [];
 
       for (const gen of gens) {
-        const worker = gen.worker_name || "?";
+        const workerId = gen.worker_id || "?";
+        const workerName = gen.worker_name || "?";
+
+        // ── Детект цензуры через gen_metadata (официальный метод по swagger) ──
+        const censoredByMeta = isCensored(gen);
 
         if (data.debug && data.notify) {
-          let imgInfo = "null";
-          if (gen.img) {
-            imgInfo = gen.img.startsWith("http")
-              ? `URL (${gen.img.substring(0, 50)}...)`
-              : `base64 (${gen.img.length} chars, ~${Math.round(gen.img.length * 0.75 / 1024)}KB декодировано)`;
-          }
+          const imgInfo = !gen.img ? "null"
+            : gen.img.startsWith("http") ? `URL (${gen.img.substring(0, 45)}...)`
+            : `base64 (${gen.img.length} chars, ~${Math.round(gen.img.length * 0.75 / 1024)}KB декодировано)`;
+
+          const metaInfo = gen.gen_metadata?.length
+            ? gen.gen_metadata.map(m => `${m.type}:${m.value}`).join(", ")
+            : "нет";
+
           await tg.send(data.notify,
             `🔍 <b>Результат:</b>\n` +
-            `   Censored флаг: ${gen.censored ? "🔴 да" : "✅ нет"}\n` +
-            `   Worker: <code>${escapeHtml(worker)}</code>\n` +
+            `   censored флаг: ${gen.censored ? "🔴 да" : "✅ нет"}\n` +
+            `   state: ${gen.state || "ok"}\n` +
+            `   gen_metadata: ${escapeHtml(metaInfo)}\n` +
+            `   isCensored(): ${censoredByMeta ? "🔴 да" : "✅ нет"}\n` +
+            `   Worker: <code>${escapeHtml(workerName)}</code>\n` +
+            `   Worker ID: <code>${escapeHtml(workerId)}</code>\n` +
             `   Model: <code>${escapeHtml(gen.model || "?")}</code>\n` +
             `   Image: ${escapeHtml(imgInfo)}`
           );
         }
 
+        // Если Horde сам сказал что цензура — сразу в блэклист, без скачивания
+        if (censoredByMeta) {
+          await addWorkerToBlacklist(env, workerId, workerName);
+          anySmall = true;
+          if (data.notify) {
+            await tg.send(data.notify,
+              `🔴 Воркер <code>${escapeHtml(workerName)}</code> вернул цензуру (gen_metadata)\n` +
+              `Добавляю в блэклист, повторяю запрос...`
+            );
+          }
+          continue;
+        }
+
+        if (!gen.img) {
+          if (data.notify) await tg.send(data.notify, "❌ gen.img пустой");
+          continue;
+        }
+
         if (data.notify) await tg.send(data.notify, `📨 Скачиваю и отправляю...`);
 
-        const caption = data.prompt ? `🎨 <i>${escapeHtml(data.prompt.substring(0, 150))}</i>` : "";
-        const { sent, tooSmall } = await deliverImage(tg, data.chatId, gen.img, caption, data.notify);
+        const caption = data.prompt
+          ? `🎨 <i>${escapeHtml(data.prompt.substring(0, 200))}</i>`
+          : "";
+
+        const { sent, tooSmall, sizeKB } = await deliverImage(tg, data.chatId, gen.img, caption, data.notify);
 
         if (sent) {
           anySent = true;
         } else if (tooSmall) {
           anySmall = true;
-          await addCensorLog(env, worker, "small_image");
-          // v12: запоминаем воркера-цензора
-          if (worker !== "?") censoredWorkers.push(worker);
+          // Файл слишком мал — тоже блэклистим воркера
+          await addWorkerToBlacklist(env, workerId, workerName);
         }
       }
 
       await KV.del(env, key.name);
 
+      // Повторная попытка с обновлённым блэклистом
       if (anySmall && !anySent && !data.sfwTest) {
         const retries = (data.retries || 0) + 1;
         if (retries < MAX_RETRIES) {
           try {
-            // v12: При повторе исключаем воркера-цензора
-            const previousBlacklist = data.blacklistedWorkers || [];
-            const newBlacklist = [...new Set([...previousBlacklist, ...censoredWorkers])];
-
-            if (data.notify) {
-              await tg.send(data.notify,
-                `🔄 <b>Повтор ${retries}/${MAX_RETRIES}</b>` +
-                (censoredWorkers.length > 0
-                  ? `\nИсключаем: <code>${escapeHtml(censoredWorkers.join(", "))}</code>`
-                  : "")
-              );
-            }
-
-            const nr = await hordeSubmit(data.prompt, config, env, {
-              blacklistedWorkers: newBlacklist,
-            });
+            const bl = await getWorkerBlacklist(env);
+            const blIds = bl.map(w => w.id).filter(Boolean);
+            const nr = await hordeSubmit(data.prompt, config, env, { workerBlacklist: blIds });
             if (nr.id) {
               await KV.put(env, `pending:${nr.id}`, JSON.stringify({
-                ...data,
-                at: Date.now(),
-                retries,
-                blacklistedWorkers: newBlacklist,
+                ...data, at: Date.now(), retries,
               }), { expirationTtl: 3600 });
-              if (data.notify) await tg.send(data.notify, `📤 Новый ID: <code>${nr.id}</code>`);
+              if (data.notify) {
+                await tg.send(data.notify,
+                  `🔄 Повтор ${retries}/${MAX_RETRIES}: <code>${nr.id}</code>\n` +
+                  `🚫 Блэклист: ${blIds.length} воркеров`
+                );
+              }
             }
           } catch (e) { console.error("[CRON] retry:", e.message); }
         } else {
-          // v12: После MAX_RETRIES — добавляем воркеров в глобальный блэклист
-          const allCensored = [...new Set([...(data.blacklistedWorkers || []), ...censoredWorkers])];
           if (data.notify) {
             await tg.send(data.notify,
-              `❌ <b>${MAX_RETRIES} попытки — всё равно заглушки!</b>\n\n` +
-              (allCensored.length > 0
-                ? `Воркеры-цензоры добавлены в глобальный блэклист:\n` +
-                  allCensored.map(w => `• <code>${escapeHtml(w)}</code>`).join("\n") + "\n\n" +
-                  `Используй /workerblacklist и /clearworkerblacklist для управления.`
-                : `Попробуй сменить модель (/setmodel) или промпт (/setprompt)`)
+              `❌ <b>${MAX_RETRIES} попыток — все заглушки!</b>\n\n` +
+              `Возможные причины:\n` +
+              `• Анонимный ключ Horde (NSFW не работает с 0000000000)\n` +
+              `• Аккаунт помечен (проверь /checkkey)\n` +
+              `• Все доступные воркеры цензурируют эту модель\n\n` +
+              `/clearworkerbl — сбросить блэклист и попробовать снова`
             );
-          }
-          // v12: Автоматически сохраняем в глобальный блэклист
-          if (allCensored.length > 0) {
-            const freshConfig = await getConfig(env);
-            const globalBl = new Set(freshConfig.workerBlacklist || []);
-            allCensored.forEach(w => globalBl.add(w));
-            freshConfig.workerBlacklist = [...globalBl];
-            await saveConfig(env, freshConfig);
           }
         }
       }
@@ -1024,10 +1099,14 @@ async function processScheduled(env) {
   if (now - lastPost < config.interval * 60 * 1000) return;
 
   await KV.put(env, "last_post_time", String(now));
+
+  const bl = await getWorkerBlacklist(env);
+  const blIds = bl.map(w => w.id).filter(Boolean);
+
   for (let i = 0; i < config.count; i++) {
     try {
       const prompt = await generatePrompt(config.generalPrompt, env);
-      const result = await hordeSubmit(prompt, config, env);
+      const result = await hordeSubmit(prompt, config, env, { workerBlacklist: blIds });
       if (result.id) {
         await KV.put(env, `pending:${result.id}`, JSON.stringify({
           chatId: config.chatId, prompt, at: now, notify: null, retries: 0,
@@ -1038,7 +1117,7 @@ async function processScheduled(env) {
 }
 
 // ══════════════════════════════════════
-//  EXPORT
+//  ENTRY POINT
 // ══════════════════════════════════════
 
 export default {
@@ -1049,7 +1128,6 @@ export default {
       if (request.method !== "POST") return new Response("POST only", { status: 405 });
       let upd;
       try { upd = await request.json(); } catch { return new Response("Bad JSON", { status: 400 }); }
-
       if (upd.message?.text) {
         try { await handleCommand(upd.message, env); }
         catch (e) { console.error("[WH]", e.message); }
@@ -1065,11 +1143,10 @@ export default {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: wh, allowed_updates: ["message"], drop_pending_updates: true }),
       });
-      const res = await r.json();
-      return new Response(`Webhook: ${wh}\n\n${JSON.stringify(res, null, 2)}`);
+      return new Response(`Webhook: ${wh}\n\n${JSON.stringify(await r.json(), null, 2)}`);
     }
 
-    return new Response("🤖 Image Bot v12 OK");
+    return new Response("🤖 Image Bot v13 OK");
   },
 
   async scheduled(event, env, ctx) {
