@@ -273,7 +273,7 @@ async function hordeSubmit(prompt, config, env, opts = {}) {
     karras: config.karras !== false,
     clip_skip: config.clipSkip || 2,
     tiling: false,
-    allow_downgrade: true,
+    auto_downgrade: true,
     post_processing: [],
     n: 1,
   };
