@@ -120,7 +120,7 @@ const Redis = {
     }
 };
 
-const KV = Redis; // Подменяем старый KV на Redis
+const KV = Redis;
 
 // ----------------------------------------------------
 // CONFIG & BLACKLIST HELPERS
@@ -302,7 +302,6 @@ async function generatePrompt(basePrompt, env, config) {
     let instruction = null;
     let cleanPrompt = basePrompt;
     
-    // Извлечение инструкций из квадратных скобок: [сделай киберпанк]
     const match = basePrompt.match(/\[(.*?)\]/);
     if (match) {
         instruction = match[1];
@@ -411,18 +410,16 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot (Upgraded)</b>\n\n<b>Куда постить:</b>\n/setgroup — привязать текущую группу\n/setchannel &lt;@name&gt; — привязать канал\n/ungroup | /unchannel\n\n<b>Базовые:</b>\n/setprompt &lt;текст&gt; — тема (можно юзать [команды для LLM])\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt;\n/enable | /disable | /generate\n\n<b>Подписи и ИИ (Caption):</b>\n/setcaptionmode &lt;0|1|2&gt; (0-ничего, 1-промпт, 2-AI текст)\n/setcaptionprompt &lt;инструкция для AI текста&gt;\n\n<b>Модели, LoRA, Фильтры:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/searchlora &lt;запрос&gt; | /addlora &lt;id&gt; | /listloras\n/setenhancer &lt;FaceFix|Upscale|clear&gt;\n\n<b>Параметры:</b>\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt;\n/setsampler &lt;name&gt; | /setneg &lt;text&gt; | /setllm &lt;model&gt;\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl`);
+            await tg.send(chatId, `🤖 <b>Image Bot (Upgraded)</b>\n\n<b>Куда постить:</b>\n/setgroup — привязать текущую группу\n/setchannel &lt;@name&gt; — привязать канал\n/ungroup | /unchannel\n\n<b>Базовые:</b>\n/setprompt &lt;текст&gt; — тема (можно юзать [команды для LLM])\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt;\n/enable | /disable | /generate\n\n<b>Подписи и ИИ (Caption):</b>\n/setcaptionmode &lt;0|1|2&gt; (0-ничего, 1-промпт, 2-AI текст)\n/setcaptionprompt &lt;инструкция для AI текста&gt;\n\n<b>Модели, LoRA, Фильтры:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/searchlora &lt;запрос&gt; | /addlora &lt;id&gt; | /listloras | /clearloras\n/setenhancer &lt;FaceFix|Upscale|clear&gt;\n\n<b>Параметры:</b>\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt;\n/setsampler &lt;name&gt; | /setneg &lt;text&gt; | /setllm &lt;model&gt;\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl`);
             break;
 
         case "/setgroup":
-            config.groupId = chatId;
-            await saveConfig(env, config);
+            config.groupId = chatId; await saveConfig(env, config);
             await tg.send(chatId, `✅ Группа для автопостов установлена: <code>${chatId}</code>`);
             break;
         case "/setchannel":
             if (!params[0]) return await tg.send(chatId, "❌ /setchannel &lt;@channel_username&gt; или ID");
-            config.channelId = params[0];
-            await saveConfig(env, config);
+            config.channelId = params[0]; await saveConfig(env, config);
             await tg.send(chatId, `✅ Канал для автопостов установлен: <code>${params[0]}</code>`);
             break;
         case "/ungroup":
@@ -435,43 +432,37 @@ async function handleCommand(msg, env) {
             break;
 
         case "/setprompt":
-            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема&gt;\n(Можно использовать [сделай так-то] для LLM)");
-            config.generalPrompt = params.join(" ");
-            await saveConfig(env, config);
+            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема&gt; (Можно использовать [сделай так-то] для LLM)");
+            config.generalPrompt = params.join(" "); await saveConfig(env, config);
             await tg.send(chatId, `✅ Промпт:\n<code>${escapeHtml(config.generalPrompt)}</code>`);
             break;
 
         case "/setcaptionmode":
             const mode = parseInt(params[0]);
             if (![0, 1, 2].includes(mode)) return await tg.send(chatId, "❌ /setcaptionmode <0|1|2>\n0 - Без текста\n1 - Промпт\n2 - AI Генерация текста");
-            config.captionMode = mode;
-            await saveConfig(env, config);
+            config.captionMode = mode; await saveConfig(env, config);
             await tg.send(chatId, `✅ Режим подписи изменен на: ${mode}`);
             break;
             
         case "/setcaptionprompt":
             if (!params.length) return await tg.send(chatId, "❌ /setcaptionprompt <инструкция для ИИ>");
-            config.captionPrompt = params.join(" ");
-            await saveConfig(env, config);
+            config.captionPrompt = params.join(" "); await saveConfig(env, config);
             await tg.send(chatId, `✅ Инструкция для подписей обновлена!`);
             break;
 
         case "/setenhancer":
             const enh = params[0]?.toLowerCase();
             if (enh === "clear") {
-                config.postProcessors = [];
-                await tg.send(chatId, "✅ Улучшайзеры сброшены");
+                config.postProcessors = []; await tg.send(chatId, "✅ Улучшайзеры сброшены");
             } else if (enh === "facefix") {
-                config.postProcessors = ["GFPGAN"];
-                await tg.send(chatId, "✅ Включен FaceFix (GFPGAN)");
+                config.postProcessors = ["GFPGAN"]; await tg.send(chatId, "✅ Включен FaceFix (GFPGAN)");
             } else if (enh === "upscale") {
-                config.postProcessors = ["RealESRGAN_x4plus"];
-                await tg.send(chatId, "✅ Включен Upscale (RealESRGAN_x4plus)");
+                config.postProcessors = ["RealESRGAN_x4plus"]; await tg.send(chatId, "✅ Включен Upscale (RealESRGAN_x4plus)");
             } else {
-                await tg.send(chatId, "❌ /setenhancer <FaceFix | Upscale | clear>\n(Или можешь напрямую вписать название, например CodeFormer)");
                 if (enh && !["facefix", "upscale", "clear"].includes(enh)) {
-                    config.postProcessors = [params[0]]; // Кастомный ввод
-                    await tg.send(chatId, `✅ Включен кастомный улучшайзер: ${params[0]}`);
+                    config.postProcessors = [params[0]]; await tg.send(chatId, `✅ Включен кастомный улучшайзер: ${params[0]}`);
+                } else {
+                    await tg.send(chatId, "❌ /setenhancer <FaceFix | Upscale | clear>");
                 }
             }
             await saveConfig(env, config);
@@ -479,8 +470,7 @@ async function handleCommand(msg, env) {
 
         case "/setmodel":
             if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;");
-            config.model = params.join(" ");
-            await saveConfig(env, config);
+            config.model = params.join(" "); await saveConfig(env, config);
             await tg.send(chatId, `✅ Модель: <code>${escapeHtml(config.model)}</code>`);
             break;
 
@@ -506,24 +496,94 @@ async function handleCommand(msg, env) {
             } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
 
-        // Команды из старого кода без изменений
+        case "/searchlora":
+            const ql = params.join(" ");
+            if (!ql) return await tg.send(chatId, "❌ /searchlora <запрос>");
+            try {
+                const res = await fetch(`https://civitai.com/api/v1/models?query=${encodeURIComponent(ql)}&limit=10`);
+                const data = await res.json();
+                if (!data.items || !data.items.length) return await tg.send(chatId, "😕 Ничего не найдено");
+                let text = `🔍 <b>Найдено LoRA:</b>\n\n`;
+                data.items.forEach(m => text += `<code>${m.id}</code> - ${escapeHtml(m.name)}\n`);
+                await tg.send(chatId, text);
+            } catch (e) { await tg.send(chatId, "❌ Ошибка поиска: " + e.message); }
+            break;
+
+        case "/addlora":
+            if (!params.length) return await tg.send(chatId, "❌ /addlora <ID> [strength=1] [clip=1]");
+            const loraId = params[0];
+            const loraStr = parseFloat(params[1] || 1);
+            const loraClip = parseFloat(params[2] || 1);
+            if (!config.loras) config.loras = [];
+            config.loras.push({ name: loraId, strength: loraStr, clip: loraClip });
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена!`);
+            break;
+
+        case "/listloras":
+            if (!config.loras || !config.loras.length) return await tg.send(chatId, "📋 Список LoRA пуст. Добавь через /addlora.");
+            let lt = "📋 <b>Активные LoRA:</b>\n\n";
+            config.loras.forEach((l, i) => lt += `${i + 1}. ID: <code>${l.name}</code> (str: ${l.strength}, clip: ${l.clip})\n`);
+            lt += "\nОчистить список: /clearloras";
+            await tg.send(chatId, lt);
+            break;
+            
+        case "/clearloras":
+            config.loras = []; await saveConfig(env, config);
+            await tg.send(chatId, "✅ Список LoRA очищен!");
+            break;
+
+        case "/setsampler":
+            if (!params[0]) return await tg.send(chatId, "❌ /setsampler <имя>");
+            config.sampler = params[0]; await saveConfig(env, config);
+            await tg.send(chatId, `✅ Sampler: ${config.sampler}`);
+            break;
+
+        case "/setcfg":
+            if (!params[0]) return await tg.send(chatId, "❌ /setcfg <число>");
+            config.cfgScale = parseFloat(params[0]); await saveConfig(env, config);
+            await tg.send(chatId, `✅ CFG: ${config.cfgScale}`);
+            break;
+
+        case "/setsteps":
+            if (!params[0]) return await tg.send(chatId, "❌ /setsteps <число>");
+            config.steps = parseInt(params[0]); await saveConfig(env, config);
+            await tg.send(chatId, `✅ Steps: ${config.steps}`);
+            break;
+
+        case "/setneg":
+            if (!params.length) return await tg.send(chatId, "❌ /setneg <текст>");
+            config.negativePrompt = params.join(" "); await saveConfig(env, config);
+            await tg.send(chatId, `✅ Негативный промпт сохранён`);
+            break;
+
+        case "/setllm":
+            if (!params.length) return await tg.send(chatId, "❌ /setllm <модель>");
+            config.llmModel = params.join(" "); await saveConfig(env, config);
+            await tg.send(chatId, `✅ LLM Модель: <code>${config.llmModel}</code>`);
+            break;
+
         case "/setinterval":
             const inv = parseInt(params[0]);
             if (inv > 0) { config.interval = inv; await saveConfig(env, config); await tg.send(chatId, `✅ Интервал: ${inv} мин`); }
             break;
+
         case "/setcount":
             const cnt = parseInt(params[0]);
             if (cnt > 0 && cnt <= 10) { config.count = cnt; await saveConfig(env, config); await tg.send(chatId, `✅ Количество: ${cnt}`); }
             break;
+
         case "/setsize":
             const w = parseInt(params[0]); const h = parseInt(params[1]);
             if (w > 255 && h > 255) { config.width = 64 * Math.round(w/64); config.height = 64 * Math.round(h/64); await saveConfig(env, config); await tg.send(chatId, `✅ Размер: ${config.width}x${config.height}`); }
             break;
+
         case "/enable":
             if (!config.groupId && !config.channelId) return await tg.send(chatId, "❌ Сначала привяжи группу (/setgroup) или канал (/setchannel)");
             config.enabled = true; await saveConfig(env, config);
             await tg.send(chatId, `🟢 Автопостинг включен!`);
             break;
+
         case "/disable":
             config.enabled = false; await saveConfig(env, config);
             await tg.send(chatId, "🔴 Автопостинг выключен");
@@ -557,7 +617,30 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
 
-        // ...остальные команды типа /searchlora, /addlora, /pending и т.д. (сократил в switch для чистоты ответа, они работают аналогично)
+        case "/pending":
+            try {
+                const pendList = await KV.list(env, "pending:");
+                await tg.send(chatId, `⏳ В очереди: ${pendList.keys.length} генераций`);
+            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+            break;
+
+        case "/cancel":
+            try {
+                const plist = await KV.list(env, "pending:");
+                let canceled = 0;
+                for (let k of plist.keys) {
+                    await KV.del(env, k.name);
+                    canceled++;
+                }
+                await tg.send(chatId, `✅ Очередь очищена. Удалено задач: ${canceled}`);
+            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+            break;
+
+        case "/workerbl":
+            await clearWorkerBlacklist(env);
+            await tg.send(chatId, "✅ Блэклист воркеров очищен");
+            break;
+
         default:
             if (cmd.startsWith("/")) await tg.send(chatId, "❓ Неизвестная команда. Введи /help");
     }
