@@ -1,4 +1,3 @@
-
 // ============================================================
 // Telegram Image Bot — Cloudflare Workers
 // AI Horde + OpenRouter + Upstash Redis
