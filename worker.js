@@ -6,12 +6,12 @@
 // Improvements:
 //  - Settings organized via buttons (/settings)
 //  - Enhanced model/LoRA list with search and pagination
-  - Added AI Horde enhancers (face fixer, upscalers, etc.) with selection
-  - Prompt modification via [brackets] for LLM-driven prompt editing
-  - Auto-post modes: prompt hidden/shown/AI-generated post text
-  - Telegram channel/group auto-posting with independent control
-  - Preset saving/loading for quick configuration switching
-  - KV database migrated to Upstash Redis (using UPSTASH_REDIS_REST_URL/TOKEN)
+// - Added AI Horde enhancers (face fixer, upscalers, etc.) with selection
+//  - Prompt modification via [brackets] for LLM-driven prompt editing
+ // - Auto-post modes: prompt hidden/shown/AI-generated post text
+ // - Telegram channel/group auto-posting with independent control
+// - Preset saving/loading for quick configuration switching
+ // - KV database migrated to Upstash Redis(using UPSTASH_REDIS_REST_URL/TOKEN)
 // ============================================================
 
 const DEFAULT_CONFIG = {
