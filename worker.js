@@ -4,7 +4,6 @@ const DEFAULT_CONFIG = {
   chatId: null,
   channelId: null,
   adminId: null,
-
   interval: 60,
   count: 1,
 
@@ -16,299 +15,272 @@ const DEFAULT_CONFIG = {
   width: 1024,
   height: 1024,
   steps: 25,
-  cfgScale: 7,
+  cfgScale: 5,
   sampler: "k_dpmpp_2m",
 
+  clipSkip: 2,
+  karras: true,
   nsfw: true,
+
   negativePrompt: "worst quality, low quality, blurry",
 
-  clipSkip: 2,
+  // NEW
+  postProcessing: [],
+  faceFix: false,
+  upscale: null,
 
-  hiresFix: false,
-  hiresFixDenoising: 0.65,
-
-  karras: true,
-
-  postProcessing: [], // 🔥 NEW
+  captionMode: 1, // 0 none, 1 prompt, 2 ai text
+  captionPrompt: "Опиши изображение красиво для телеграм поста",
 
   llmModel: "openrouter/auto",
-
-  autopostMode: 2 // 0=no text,1=prompt,2=AI caption
 };
 
-// ================= REDIS =================
-const Redis = {
-  async cmd(env, ...args) {
-    const res = await fetch(env.UPSTASH_REDIS_REST_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ command: args })
-    });
-    return res.json();
-  },
+// ================= REDIS (UPSTASH) =================
+async function redis(env, cmd, args = []) {
+  const res = await fetch(env.UPSTASH_REDIS_REST_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ command: [cmd, ...args] }),
+  });
+  const json = await res.json();
+  return json.result;
+}
 
+const KV = {
   async get(env, key) {
-    const r = await this.cmd(env, "GET", key);
-    return r.result ? JSON.parse(r.result) : null;
+    const v = await redis(env, "GET", [key]);
+    return v ? JSON.parse(v) : null;
   },
-
-  async set(env, key, value) {
-    await this.cmd(env, "SET", key, JSON.stringify(value));
+  async put(env, key, val) {
+    await redis(env, "SET", [key, JSON.stringify(val)]);
   },
-
   async del(env, key) {
-    await this.cmd(env, "DEL", key);
+    await redis(env, "DEL", [key]);
   },
-
   async keys(env, prefix) {
-    const r = await this.cmd(env, "SCAN", "0", "MATCH", prefix + "*");
-    return r.result?.[1] || [];
-  }
+    return await redis(env, "KEYS", [`${prefix}*`]);
+  },
 };
 
-// ================= TELEGRAM =================
-class Telegram {
-  constructor(token) {
-    this.base = `https://api.telegram.org/bot${token}`;
+// ================= UTILS =================
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
+function escapeHtml(t) {
+  return t?.replace(/[<>&]/g, "_") || "";
+}
+
+// ================= PROMPT COMMANDS =================
+function applyPromptCommands(prompt, cfg) {
+  const matches = prompt.match(/\[(.*?)\]/g);
+  if (!matches) return { prompt, cfg };
+
+  for (let m of matches) {
+    const cmd = m.slice(1, -1).toLowerCase();
+
+    if (cmd.startsWith("cfg:")) cfg.cfgScale = +cmd.split(":")[1];
+    if (cmd.startsWith("steps:")) cfg.steps = +cmd.split(":")[1];
+    if (cmd.startsWith("sampler:")) cfg.sampler = cmd.split(":")[1];
+    if (cmd.startsWith("model:")) cfg.model = cmd.split(":")[1];
+    if (cmd.startsWith("no:")) cfg.negativePrompt += ", " + cmd.split(":")[1];
+
+    if (cmd === "facefix") cfg.postProcessing.push("GFPGAN");
+    if (cmd === "upscale") cfg.postProcessing.push("RealESRGAN_x4plus");
   }
 
-  async api(method, data) {
-    const res = await fetch(`${this.base}/${method}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data)
-    });
-    return res.json();
-  }
-
-  send(chat, text, extra = {}) {
-    return this.api("sendMessage", {
-      chat_id: chat,
-      text,
-      parse_mode: "HTML",
-      ...extra
-    });
-  }
-
-  keyboard(chat, text, buttons) {
-    return this.api("sendMessage", {
-      chat_id: chat,
-      text,
-      reply_markup: { inline_keyboard: buttons }
-    });
-  }
-
-  sendPhoto(chat, buffer, caption = "") {
-    const f = new FormData();
-    f.append("chat_id", chat);
-    f.append("photo", new File([buffer], "img.webp"));
-    if (caption) f.append("caption", caption);
-
-    return fetch(`${this.base}/sendPhoto`, { method: "POST", body: f });
-  }
+  return {
+    prompt: prompt.replace(/\[.*?\]/g, "").trim(),
+    cfg,
+  };
 }
 
 // ================= HORDE =================
 const HORDE = "https://stablehorde.net/api/v2";
 
-async function hordeGenerate(prompt, cfg, env) {
-  const body = {
-    prompt: prompt + " ### " + cfg.negativePrompt,
-    params: {
-      sampler_name: cfg.sampler,
-      cfg_scale: cfg.cfgScale,
-      width: cfg.width,
-      height: cfg.height,
-      steps: cfg.steps,
-      karras: cfg.karras,
-      post_processing: cfg.postProcessing,
-      clip_skip: cfg.clipSkip
-    },
-    models: [cfg.model],
-    nsfw: true,
-    r2: true,
-    allow_downgrade: true
-  };
+async function hordeSubmit(prompt, cfg, env) {
+  const { prompt: finalPrompt, cfg: newCfg } = applyPromptCommands(prompt, { ...cfg });
 
-  if (cfg.hiresFix) {
-    body.params.hires_fix = true;
-    body.params.hires_fix_denoising_strength = cfg.hiresFixDenoising;
-  }
+  const body = {
+    prompt: finalPrompt + " ### " + newCfg.negativePrompt,
+    params: {
+      sampler_name: newCfg.sampler,
+      cfg_scale: newCfg.cfgScale,
+      width: newCfg.width,
+      height: newCfg.height,
+      steps: newCfg.steps,
+      post_processing: newCfg.postProcessing,
+      clip_skip: newCfg.clipSkip,
+    },
+    nsfw: true,
+    models: [newCfg.model],
+  };
 
   const res = await fetch(`${HORDE}/generate/async`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      apikey: env.HORDE_API_KEY
+      apikey: env.HORDE_API_KEY || "0000000000",
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
 
-  return res.json();
+  return await res.json();
 }
 
-// ================= LLM PROMPT =================
-function applyPromptCommands(text) {
-  // [style: anime], [add: ...], [remove: ...]
-  return text.replace(/\[(.*?)\]/g, (_, cmd) => {
-    if (cmd.startsWith("add:")) return cmd.replace("add:", "");
-    if (cmd.startsWith("remove:")) return "";
-    if (cmd.startsWith("style:")) return cmd.replace("style:", "");
-    return "";
-  });
-}
-
-// ================= AI CAPTION =================
-async function generateCaption(prompt, env) {
-  if (!env.OPENROUTER_API_KEY) return prompt;
-
+// ================= OPENROUTER =================
+async function aiCaption(env, text, imgPrompt) {
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "openrouter/auto",
+      model: "openrouter/free",
       messages: [
-        { role: "system", content: "Write a short красивый пост для Telegram" },
-        { role: "user", content: prompt }
-      ]
-    })
+        { role: "system", content: text },
+        { role: "user", content: imgPrompt },
+      ],
+    }),
   });
 
   const j = await res.json();
-  return j.choices?.[0]?.message?.content || prompt;
+  return j.choices?.[0]?.message?.content || imgPrompt;
+}
+
+// ================= TELEGRAM =================
+class TG {
+  constructor(token) {
+    this.url = `https://api.telegram.org/bot${token}`;
+  }
+
+  async send(chat, text) {
+    return fetch(`${this.url}/sendMessage`, {
+      method: "POST",
+      body: JSON.stringify({
+        chat_id: chat,
+        text,
+        parse_mode: "HTML",
+      }),
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  async photo(chat, url, caption) {
+    return fetch(`${this.url}/sendPhoto`, {
+      method: "POST",
+      body: JSON.stringify({
+        chat_id: chat,
+        photo: url,
+        caption,
+        parse_mode: "HTML",
+      }),
+      headers: { "Content-Type": "application/json" },
+    });
+  }
 }
 
 // ================= COMMANDS =================
 async function handle(msg, env) {
-  const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
-  const chat = msg.chat.id;
-  const user = msg.from.id;
+  const tg = new TG(env.TELEGRAM_BOT_TOKEN);
+  const id = msg.chat.id;
   const text = msg.text || "";
 
-  let cfg = await Redis.get(env, "config") || DEFAULT_CONFIG;
+  let cfg = (await KV.get(env, "config")) || DEFAULT_CONFIG;
 
   if (!cfg.adminId) {
-    cfg.adminId = user;
-    await Redis.set(env, "config", cfg);
+    cfg.adminId = msg.from.id;
+    await KV.put(env, "config", cfg);
   }
 
-  if (user !== cfg.adminId) return tg.send(chat, "🔒 admin only");
+  if (msg.from.id !== cfg.adminId) return;
 
-  if (text === "/menu") {
-    return tg.keyboard(chat, "⚙️ Меню", [
-      [{ text: "🎨 Модель", callback_data: "model" }],
-      [{ text: "🧠 LLM", callback_data: "llm" }],
-      [{ text: "📤 Автопост", callback_data: "auto" }]
-    ]);
-  }
-
+  // ===== BASIC =====
   if (text.startsWith("/setprompt")) {
     cfg.generalPrompt = text.replace("/setprompt", "").trim();
-    await Redis.set(env, "config", cfg);
-    return tg.send(chat, "✅ prompt set");
   }
 
-  if (text === "/generate") {
-    let p = applyPromptCommands(cfg.generalPrompt);
+  if (text === "/enable") cfg.enabled = true;
+  if (text === "/disable") cfg.enabled = false;
 
-    const gen = await hordeGenerate(p, cfg, env);
-
-    if (!gen.id) return tg.send(chat, "❌ Horde error");
-
-    await Redis.set(env, "pending:" + gen.id, {
-      prompt: p,
-      chatId: chat
-    });
-
-    return tg.send(chat, "⏳ Генерация...");
+  // ===== CHANNEL =====
+  if (text.startsWith("/setchannel")) {
+    cfg.channelId = text.split(" ")[1];
   }
 
-  if (text === "/setchannel") {
-    cfg.channelId = chat;
-    await Redis.set(env, "config", cfg);
-    return tg.send(chat, "✅ канал привязан");
+  if (text === "/clearchannel") cfg.channelId = null;
+
+  // ===== CAPTION =====
+  if (text.startsWith("/setcaptionmode")) {
+    cfg.captionMode = +text.split(" ")[1];
   }
 
-  if (text === "/setgroup") {
-    cfg.chatId = chat;
-    await Redis.set(env, "config", cfg);
-    return tg.send(chat, "✅ группа привязана");
+  if (text.startsWith("/setcaptionprompt")) {
+    cfg.captionPrompt = text.replace("/setcaptionprompt", "").trim();
   }
 
-  if (text === "/autopostmode") {
-    cfg.autopostMode = (cfg.autopostMode + 1) % 3;
-    await Redis.set(env, "config", cfg);
-    return tg.send(chat, "🔄 режим: " + cfg.autopostMode);
-  }
+  // ===== POST PROCESS =====
+  if (text === "/facefix") cfg.postProcessing.push("GFPGAN");
+
+  if (text === "/upscale") cfg.postProcessing.push("RealESRGAN_x4plus");
+
+  await KV.put(env, "config", cfg);
+
+  await tg.send(id, "✅ OK");
 }
 
 // ================= CRON =================
 async function cron(env) {
-  const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
-  const cfg = await Redis.get(env, "config");
-  if (!cfg?.enabled) return;
+  const cfg = (await KV.get(env, "config")) || DEFAULT_CONFIG;
+  if (!cfg.enabled) return;
 
-  const keys = await Redis.keys(env, "pending:");
+  const tg = new TG(env.TELEGRAM_BOT_TOKEN);
 
-  for (const key of keys) {
-    const id = key.replace("pending:", "");
+  const prompt = cfg.generalPrompt;
 
-    const res = await fetch(`${HORDE}/generate/status/${id}`);
-    const data = await res.json();
+  const job = await hordeSubmit(prompt, cfg, env);
 
-    if (!data.done) continue;
+  if (!job.id) return;
 
-    await Redis.del(env, key);
+  // simplified polling
+  await new Promise(r => setTimeout(r, 5000));
 
-    const img = data.generations?.[0]?.img;
-    if (!img) continue;
+  const res = await fetch(`${HORDE}/generate/status/${job.id}`);
+  const j = await res.json();
 
-    let caption = "";
+  const img = j.generations?.[0]?.img;
+  if (!img) return;
 
-    if (cfg.autopostMode === 1) caption = cfg.generalPrompt;
-    if (cfg.autopostMode === 2)
-      caption = await generateCaption(cfg.generalPrompt, env);
+  let caption = "";
 
-    const buffer = await (await fetch(img)).arrayBuffer();
+  if (cfg.captionMode === 1) caption = prompt;
+  if (cfg.captionMode === 2) {
+    caption = await aiCaption(env, cfg.captionPrompt, prompt);
+  }
 
-    if (cfg.chatId) await tg.sendPhoto(cfg.chatId, buffer, caption);
-    if (cfg.channelId) await tg.sendPhoto(cfg.channelId, buffer, caption);
+  await tg.photo(cfg.chatId, img, caption);
+
+  if (cfg.channelId) {
+    await tg.photo(cfg.channelId, img, caption);
   }
 }
 
-// ================= EXPORT =================
+// ================= WORKER =================
 export default {
   async fetch(req, env) {
-    const url = new URL(req.url);
-
-    if (url.pathname === "/webhook") {
+    if (req.method === "POST") {
       const upd = await req.json();
       if (upd.message) await handle(upd.message, env);
       return new Response("ok");
     }
-
-    if (url.pathname === "/setup") {
-      await fetch(
-        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: url.origin + "/webhook" })
-        }
-      );
-      return new Response("ok");
-    }
-
     return new Response("running");
   },
 
-  async scheduled(_, env) {
+  async scheduled(event, env) {
     await cron(env);
-  }
+  },
 };
