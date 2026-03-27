@@ -1,1463 +1,314 @@
-// Configuration
+// ================= CONFIG =================
 const DEFAULT_CONFIG = {
-    enabled: false,
-    chatId: null,
-    channelId: null,
-    adminId: null,
-    interval: 60,
-    count: 1,
-    generalPrompt: "",
-    model: "AlbedoBase XL (SDXL)",
-    loras: [],
-    width: 1024,
-    height: 1024,
-    steps: 25,
-    cfgScale: 7.5,
-    sampler: "k_dpmpp_2m",
-    nsfw: true,
-    negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
-    llmModel: "",
-    clipSkip: 2,
-    hiresFix: false,
-    hiresFixDenoising: 0.65,
-    karras: true,
-    captionMode: 1,
-    captionPrompt: "",
-    postProcessing: {
-        faceRestore: null,
-        faceRestoreStrength: 0.8,
-        upscale: null,
-        upscaleStrength: 1.0
-    }
+  enabled: false,
+  chatId: null,
+  channelId: null,
+  adminId: null,
+
+  interval: 60,
+  count: 1,
+
+  generalPrompt: "",
+
+  model: "AlbedoBase XL (SDXL)",
+  loras: [],
+
+  width: 1024,
+  height: 1024,
+  steps: 25,
+  cfgScale: 7,
+  sampler: "k_dpmpp_2m",
+
+  nsfw: true,
+  negativePrompt: "worst quality, low quality, blurry",
+
+  clipSkip: 2,
+
+  hiresFix: false,
+  hiresFixDenoising: 0.65,
+
+  karras: true,
+
+  postProcessing: [], // 🔥 NEW
+
+  llmModel: "openrouter/auto",
+
+  autopostMode: 2 // 0=no text,1=prompt,2=AI caption
 };
 
-const HORDE_API = "https://stablehorde.net/api/v2";
-const HORDE_HEADERS = { "Client-Agent": "TgImageBot:15.0:tg" };
-
-// Upstash Redis
+// ================= REDIS =================
 const Redis = {
-    async get(key, type = "text") {
-        if (!globalThis.UPSTASH_REDIS_REST_URL || !globalThis.UPSTASH_REDIS_REST_TOKEN) return null;
-        try {
-            const response = await fetch(globalThis.UPSTASH_REDIS_REST_URL, {
-                method: "POST",
-                headers: {
-                    "Authorization": `Bearer ${globalThis.UPSTASH_REDIS_REST_TOKEN}`,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify(["GET", key])
-            });
-            const result = await response.json();
-            if (result.error) throw new Error(result.error);
-            const data = result[1];
-            if (data === null) return null;
-            if (type === "json") {
-                try { return JSON.parse(data); } catch { return data; }
-            }
-            return data;
-        } catch (e) {
-            console.error("[Redis] GET error:", e.message);
-            return null;
-        }
-    },
-    
-    async set(key, value, options = {}) {
-        if (!globalThis.UPSTASH_REDIS_REST_URL || !globalThis.UPSTASH_REDIS_REST_TOKEN) {
-            throw new Error("Redis not configured");
-        }
-        try {
-            const val = typeof value === "object" ? JSON.stringify(value) : String(value);
-            const commands = ["SET", key, val];
-            if (options.expirationTtl) commands.push("EX", options.expirationTtl);
-            const response = await fetch(globalThis.UPSTASH_REDIS_REST_URL, {
-                method: "POST",
-                headers: {
-                    "Authorization": `Bearer ${globalThis.UPSTASH_REDIS_REST_TOKEN}`,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify(commands)
-            });
-            const result = await response.json();
-            if (result.error) throw new Error(result.error);
-            return result;
-        } catch (e) {
-            console.error("[Redis] SET error:", e.message);
-            throw e;
-        }
-    },
-    
-    async del(key) {
-        if (!globalThis.UPSTASH_REDIS_REST_URL || !globalThis.UPSTASH_REDIS_REST_TOKEN) return;
-        try {
-            const response = await fetch(globalThis.UPSTASH_REDIS_REST_URL, {
-                method: "POST",
-                headers: {
-                    "Authorization": `Bearer ${globalThis.UPSTASH_REDIS_REST_TOKEN}`,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify(["DEL", key])
-            });
-            return await response.json();
-        } catch (e) {
-            console.error("[Redis] DEL error:", e.message);
-        }
-    },
-    
-    async keys(pattern) {
-        if (!globalThis.UPSTASH_REDIS_REST_URL || !globalThis.UPSTASH_REDIS_REST_TOKEN) return [];
-        try {
-            const response = await fetch(globalThis.UPSTASH_REDIS_REST_URL, {
-                method: "POST",
-                headers: {
-                    "Authorization": `Bearer ${globalThis.UPSTASH_REDIS_REST_TOKEN}`,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify(["KEYS", pattern])
-            });
-            const result = await response.json();
-            if (result.error) throw new Error(result.error);
-            return result[1] || [];
-        } catch (e) {
-            console.error("[Redis] KEYS error:", e.message);
-            return [];
-        }
-    }
-};
-
-// Utilities
-function escapeHtml(text) {
-    if (text == null) return " ";
-    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function isHttpUrl(str) {
-    return typeof str === "string" && /^https?:\/\//i.test(str);
-}
-
-function getApiKey(env) {
-    return (env.HORDE_API_KEY || "").trim() || "0000000000";
-}
-
-// Telegram Bot
-class Telegram {
-    constructor(token) {
-        this.base = `https://api.telegram.org/bot${token}`;
-    }
-    
-    async api(method, params = {}) {
-        const response = await fetch(`${this.base}/${method}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(params)
-        });
-        return await response.json();
-    }
-    
-    send(chatId, text, options = {}) {
-        return this.api("sendMessage", {
-            chat_id: chatId,
-            text: text,
-            parse_mode: "HTML",
-            disable_web_page_preview: true,
-            ...options
-        });
-    }
-    
-    async sendPhoto(chatId, buffer, caption = "", options = {}) {
-        const formData = new FormData();
-        formData.append("chat_id", String(chatId));
-        formData.append("photo", new File([buffer], "image.webp", { type: "image/webp" }));
-        if (caption) {
-            formData.append("caption", caption.substring(0, 1024));
-            formData.append("parse_mode", "HTML");
-        }
-        const response = await fetch(`${this.base}/sendPhoto`, { method: "POST", body: formData });
-        return await response.json();
-    }
-    
-    async sendDocument(chatId, buffer, caption = "", options = {}) {
-        const formData = new FormData();
-        formData.append("chat_id", String(chatId));
-        formData.append("document", new File([buffer], "image.webp", { type: "image/webp" }));
-        if (caption) {
-            formData.append("caption", caption.substring(0, 1024));
-            formData.append("parse_mode", "HTML");
-        }
-        const response = await fetch(`${this.base}/sendDocument`, { method: "POST", body: formData });
-        return await response.json();
-    }
-    
-    sendPhotoUrl(chatId, url, caption = "", options = {}) {
-        return this.api("sendPhoto", {
-            chat_id: chatId,
-            photo: url,
-            caption: caption?.substring(0, 1024),
-            parse_mode: "HTML",
-            ...options
-        });
-    }
-    
-    editMessage(chatId, messageId, text, options = {}) {
-        return this.api("editMessageText", {
-            chat_id: chatId,
-            message_id: messageId,
-            text: text,
-            parse_mode: "HTML",
-            disable_web_page_preview: true,
-            ...options
-        });
-    }
-    
-    answerCallback(callbackQueryId, text, showAlert = false) {
-        return this.api("answerCallbackQuery", {
-            callback_query_id: callbackQueryId,
-            text: text,
-            show_alert: showAlert
-        });
-    }
-}
-
-// Inline Keyboard Builder
-class InlineKeyboard {
-    constructor() {
-        this.rows = [];
-        this.currentRow = [];
-    }
-    
-    add(text, callbackData, url = null) {
-        this.currentRow.push({
-            text,
-            callback_data: callbackData,
-            url: url || undefined
-        });
-        return this;
-    }
-    
-    row() {
-        if (this.currentRow.length > 0) {
-            this.rows.push([...this.currentRow]);
-            this.currentRow = [];
-        }
-        return this;
-    }
-    
-    build() {
-        if (this.currentRow.length > 0) {
-            this.rows.push([...this.currentRow]);
-        }
-        return { inline_keyboard: this.rows };
-    }
-}
-
-// Config Management
-async function getConfig(env) {
-    const stored = await Redis.get("config", "json");
-    return { ...DEFAULT_CONFIG, ...(stored || {}) };
-}
-
-async function saveConfig(env, config) {
-    await Redis.set("config", config);
-}
-
-async function getWorkerBlacklist(env) {
-    return await Redis.get("worker_blacklist", "json") || [];
-}
-
-async function addWorkerToBlacklist(env, workerId, workerName) {
-    if (!workerId || workerId === "?" || String(workerId).length < 10) return;
-    const blacklist = await getWorkerBlacklist(env);
-    if (!blacklist.find(w => w.id === workerId)) {
-        blacklist.push({ id: workerId, name: workerName || "?", t: Date.now() });
-        while (blacklist.length > 30) blacklist.shift();
-        await Redis.set("worker_blacklist", blacklist);
-        console.log(`[BL] Added worker: ${workerName} (${workerId})`);
-    }
-}
-
-async function clearWorkerBlacklist(env) {
-    await Redis.set("worker_blacklist", []);
-}
-
-// AI Horde Functions
-async function hordeCheckKey(env) {
-    const apiKey = getApiKey(env);
-    try {
-        const response = await fetch(`${HORDE_API}/find_user`, {
-            headers: { apikey: apiKey, ...HORDE_HEADERS }
-        });
-        if (response.status === 401 || response.status === 403) {
-            return { ok: false, anon: apiKey === "0000000000" };
-        }
-        const data = await response.json();
-        return {
-            ok: true,
-            anon: apiKey === "0000000000",
-            user: data.username,
-            kudos: data.kudos,
-            trusted: data.trusted,
-            flagged: data.flagged
-        };
-    } catch (e) {
-        return { ok: false, anon: apiKey === "0000000000", err: e.message };
-    }
-}
-
-async function hordeSubmit(prompt, config, env, options = {}) {
-    const apiKey = getApiKey(env);
-    const params = {
-        sampler_name: config.sampler,
-        cfg_scale: config.cfgScale,
-        width: config.width,
-        height: config.height,
-        steps: config.steps,
-        karras: config.karras !== false,
-        clip_skip: config.clipSkip || 2,
-        tiling: false,
-        post_processing: [],
-        n: 1
-    };
-    
-    if (config.hiresFix) {
-        params.hires_fix = true;
-        params.hires_fix_denoising_strength = config.hiresFixDenoising || 0.65;
-    }
-    
-    if (config.postProcessing) {
-        if (config.postProcessing.faceRestore) {
-            params.post_processing.push(config.postProcessing.faceRestore);
-        }
-        if (config.postProcessing.upscale) {
-            params.post_processing.push(config.postProcessing.upscale);
-        }
-    }
-    
-    if (!options.skipLoras && config.loras?.length > 0) {
-        params.loras = config.loras.map(lora => ({
-            name: String(lora.name),
-            model: lora.strength ?? 1,
-            clip: lora.clip ?? 1,
-            inject_trigger: "any",
-            is_version: true
-        }));
-    }
-    
-    const body = {
-        prompt: config.negativePrompt ? `${prompt} ### ${config.negativePrompt}` : prompt,
-        params: params,
-        nsfw: true,
-        censor_nsfw: false,
-        trusted_workers: false,
-        replacement_filter: true,
-        models: [config.model],
-        r2: true,
-        shared: false,
-        allow_downgrade: true
-    };
-    
-    if (options.workerBlacklist?.length > 0) {
-        body.workers = options.workerBlacklist.slice(0, 5);
-        body.worker_blacklist = true;
-    }
-    
-    const response = await fetch(`${HORDE_API}/generate/async`, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            apikey: apiKey,
-            ...HORDE_HEADERS
-        },
-        body: JSON.stringify(body)
+  async cmd(env, ...args) {
+    const res = await fetch(env.UPSTASH_REDIS_REST_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ command: args })
     });
-    
-    return await response.json();
-}
+    return res.json();
+  },
 
-async function hordeCheck(id) {
-    const response = await fetch(`${HORDE_API}/generate/check/${id}`, { headers: HORDE_HEADERS });
-    return await response.json();
-}
+  async get(env, key) {
+    const r = await this.cmd(env, "GET", key);
+    return r.result ? JSON.parse(r.result) : null;
+  },
 
-async function hordeGetResult(id) {
-    const response = await fetch(`${HORDE_API}/generate/status/${id}`, { headers: HORDE_HEADERS });
-    return await response.json();
-}
+  async set(env, key, value) {
+    await this.cmd(env, "SET", key, JSON.stringify(value));
+  },
 
-async function hordeGetModels() {
-    const response = await fetch(`${HORDE_API}/status/models?type=image`, { headers: HORDE_HEADERS });
-    return await response.json();
-}
+  async del(env, key) {
+    await this.cmd(env, "DEL", key);
+  },
 
-// Prompt Enhancement
-const PROMPT_TEMPLATES = {
-    angle: ["from above", "low angle", "eye level", "dutch angle", "bird's eye view", "extreme close-up"],
-    light: ["golden hour sunlight", "dramatic chiaroscuro", "soft overcast light", "neon cyberpunk glow", "moonlit night"],
-    style: ["photorealistic photography", "digital concept art", "oil painting", "anime cel shading", "dark fantasy illustration"],
-    mood: ["serene and peaceful", "intense and dramatic", "mysterious and enigmatic", "vibrant and energetic", "ethereal and dreamlike"]
+  async keys(env, prefix) {
+    const r = await this.cmd(env, "SCAN", "0", "MATCH", prefix + "*");
+    return r.result?.[1] || [];
+  }
 };
 
-function pick(arr) {
-    return arr[Math.floor(Math.random() * arr.length)];
+// ================= TELEGRAM =================
+class Telegram {
+  constructor(token) {
+    this.base = `https://api.telegram.org/bot${token}`;
+  }
+
+  async api(method, data) {
+    const res = await fetch(`${this.base}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data)
+    });
+    return res.json();
+  }
+
+  send(chat, text, extra = {}) {
+    return this.api("sendMessage", {
+      chat_id: chat,
+      text,
+      parse_mode: "HTML",
+      ...extra
+    });
+  }
+
+  keyboard(chat, text, buttons) {
+    return this.api("sendMessage", {
+      chat_id: chat,
+      text,
+      reply_markup: { inline_keyboard: buttons }
+    });
+  }
+
+  sendPhoto(chat, buffer, caption = "") {
+    const f = new FormData();
+    f.append("chat_id", chat);
+    f.append("photo", new File([buffer], "img.webp"));
+    if (caption) f.append("caption", caption);
+
+    return fetch(`${this.base}/sendPhoto`, { method: "POST", body: f });
+  }
 }
 
-function templatePrompt(base) {
-    return [
-        base,
-        pick(PROMPT_TEMPLATES.angle),
-        pick(PROMPT_TEMPLATES.light),
-        pick(PROMPT_TEMPLATES.style),
-        pick(PROMPT_TEMPLATES.mood),
-        "masterpiece", "best quality", "highly detailed"
-    ].join(", ");
-}
+// ================= HORDE =================
+const HORDE = "https://stablehorde.net/api/v2";
 
-async function llmPrompt(base, apiKey, model) {
-    try {
-        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiKey}`,
-                "HTTP-Referer": "https://t.me",
-                "X-Title": "TgImageBot"
-            },
-            body: JSON.stringify({
-                model: model || "google/gemma-2-9b-it:free",
-                messages: [
-                    { role: "system", content: "You are a Stable Diffusion prompt engineer. Output ONLY comma-separated descriptive phrases. No explanations, no quotes, no markdown. Under 100 words." },
-                    { role: "user", content: `Create a unique detailed image generation prompt for: ${base}` }
-                ],
-                temperature: 1.3,
-                max_tokens: 200
-            })
-        });
-        const data = await response.json();
-        const enhanced = data.choices?.[0]?.message?.content?.trim().replace(/^["'`*]+|["'`*]+$/g, "");
-        if (enhanced?.length > 10) return enhanced;
-    } catch (e) {
-        console.error("[LLM] Error:", e.message);
-    }
-    return templatePrompt(base);
-}
-
-async function generatePrompt(base, env) {
-    if (env.OPENROUTER_API_KEY) {
-        const config = await getConfig(env);
-        return llmPrompt(base, env.OPENROUTER_API_KEY, config.llmModel || env.LLM_MODEL || "google/gemma-2-9b-it:free");
-    }
-    return templatePrompt(base);
-}
-
-// Image Handling
-function isCensored(gen) {
-    if (!gen) return false;
-    const hasMetadataCensorship = gen.gen_metadata?.some(m => m.type === "censorship");
-    const isExplicitlyCensored = gen.censored === true;
-    const isCensoredState = gen.state === "censored";
-    return hasMetadataCensorship || isExplicitlyCensored || isCensoredState;
-}
-
-async function downloadImage(url) {
-    try {
-        const response = await fetch(url);
-        if (!response.ok) return null;
-        return await response.arrayBuffer();
-    } catch (e) {
-        console.error("[IMG] Fetch error:", e.message);
-        return null;
-    }
-}
-
-function base64ToBuffer(base64) {
-    try {
-        const binary = atob(base64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-            bytes[i] = binary.charCodeAt(i);
-        }
-        return bytes.buffer;
-    } catch (e) {
-        console.error("[IMG] Base64 error:", e.message);
-        return null;
-    }
-}
-
-function bufferSizeKB(buffer) {
-    return Math.round(buffer.byteLength / 1024);
-}
-
-async function deliverImage(bot, chatId, imageData, caption, notifyChat) {
-    if (!imageData) {
-        if (notifyChat) await bot.send(notifyChat, "❌ No image data from worker");
-        return { sent: false, tooSmall: false, sizeKB: 0 };
-    }
-    
-    let buffer = null;
-    const isUrl = isHttpUrl(imageData);
-    
-    if (isUrl) {
-        const result = await bot.sendPhotoUrl(chatId, imageData, caption);
-        if (result.ok) return { sent: true, tooSmall: false, sizeKB: 0 };
-        buffer = await downloadImage(imageData);
-        if (!buffer) return { sent: false, tooSmall: false, sizeKB: 0 };
-    } else {
-        buffer = base64ToBuffer(imageData);
-        if (!buffer) return { sent: false, tooSmall: false, sizeKB: 0 };
-    }
-    
-    const sizeKB = bufferSizeKB(buffer);
-    
-    if (sizeKB < 10) {
-        if (notifyChat) {
-            await bot.send(notifyChat, `🚫 <b>Placeholder/censored image</b>\nSize: ${sizeKB}KB (min: 10KB)`);
-        }
-        return { sent: false, tooSmall: true, sizeKB: sizeKB };
-    }
-    
-    let result = await bot.sendPhoto(chatId, buffer, caption);
-    
-    if (!result.ok) {
-        console.log("[IMG] sendPhoto failed, trying sendDocument");
-        result = await bot.sendDocument(chatId, buffer, caption);
-    }
-    
-    if (!result.ok && isUrl) {
-        await bot.sendPhotoUrl(chatId, imageData, caption);
-    }
-    
-    if (!result.ok && notifyChat) {
-        await bot.send(notifyChat, `❌ Failed to send image: ${escapeHtml(result.description || "unknown error")}`);
-    }
-    
-    return { sent: result.ok, tooSmall: false, sizeKB: sizeKB };
-}
-
-// Command Handler
-async function handleCommand(message, env) {
-    const chatId = message.chat.id;
-    const userId = message.from?.id;
-    const text = message.text || "";
-    
-    if (!env.TELEGRAM_BOT_TOKEN) return;
-    
-    const bot = new Telegram(env.TELEGRAM_BOT_TOKEN);
-    const parts = text.split(/\s+/);
-    const cmd = parts[0].split("@")[0].toLowerCase();
-    const args = parts.slice(1);
-    
-    // Public commands (work without KV/Redis check)
-    if (cmd === "/ping") {
-        const apiKey = getApiKey(env);
-        await bot.send(chatId, 
-            `🏓 <b>Pong!</b>\n\n` +
-            `📍 Chat: <code>${chatId}</code>\n` +
-            `👤 User: <code>${userId}</code>\n` +
-            `💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n` +
-            `🎨 Horde: ${apiKey === "0000000000" ? "🔴 anonymous" : "✅ " + apiKey.substring(0, 8) + "..."}`
-        );
-        return;
-    }
-    
-    if (cmd === "/start" || cmd === "/help") {
-        const config = await getConfig(env);
-        
-        // Auto-set admin if not set
-        if (!config.adminId) {
-            config.adminId = userId;
-            await saveConfig(env, config);
-            await bot.send(chatId, `👑 You are now admin. ID: <code>${userId}</code>`);
-        }
-        
-        const keyboard = new InlineKeyboard()
-            .add("⚙️ Settings", "menu_settings").row()
-            .add("🎨 Models", "menu_models")
-            .add("🔧 LoRA", "menu_lora").row()
-            .add("📊 Status", "cmd_status")
-            .add("🚀 Generate", "cmd_generate").row()
-            .add("🔄 Auto: " + (config.enabled ? "ON" : "OFF"), "cmd_toggle_auto").row()
-            .add("📋 Queue", "cmd_pending")
-            .add("❌ Cancel", "cmd_cancel").row()
-            .add("🔑 Check Key", "cmd_checkkey")
-            .add("🔧 Diagnostics", "cmd_diagnostic").row()
-            .build();
-        
-        await bot.send(chatId, 
-            `🤖 <b>Telegram Image Bot</b>\n\n` +
-            `<b>Quick Commands:</b>\n` +
-            `/setchat - Set target chat\n` +
-            `/setprompt <text> - Set main theme\n` +
-            `/generate - Generate now\n` +
-            `/enable | /disable - Toggle auto\n\n` +
-            `<b>Or use buttons below!</b>`,
-            { reply_markup: keyboard }
-        );
-        return;
-    }
-    
-    // Check Redis availability for other commands
-    if (!env.UPSTASH_REDIS_REST_URL) {
-        await bot.send(chatId, "❌ Redis not configured! Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN");
-        return;
-    }
-    
-    // Check admin
-    const config = await getConfig(env);
-    if (!config.adminId) {
-        config.adminId = userId;
-        await saveConfig(env, config);
-    }
-    
-    if (config.adminId !== userId) {
-        await bot.send(chatId, `🔒 Admin only (ID: ${config.adminId})`);
-        return;
-    }
-    
-    // Admin commands
-    switch (cmd) {
-        case "/setchat":
-            config.chatId = chatId;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ Target chat set: <code>${chatId}</code>`);
-            break;
-            
-        case "/setprompt":
-            const prompt = args.join(" ");
-            if (!prompt) {
-                await bot.send(chatId, "❌ /setprompt <theme>");
-                return;
-            }
-            config.generalPrompt = prompt;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ Prompt:\n<code>${escapeHtml(prompt)}</code>\n\n💡 Use [directives] to modify:\n[focus on dramatic lighting]\n[use extreme close-up]`);
-            break;
-            
-        case "/setinterval":
-            const interval = parseInt(args[0], 10);
-            if (isNaN(interval) || interval < 1) {
-                await bot.send(chatId, "❌ /setinterval <minutes> (min 1)");
-                return;
-            }
-            config.interval = interval;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ Interval: ${interval} min`);
-            break;
-            
-        case "/setcount":
-            const count = parseInt(args[0], 10);
-            if (isNaN(count) || count < 1 || count > 10) {
-                await bot.send(chatId, "❌ /setcount <1-10>");
-                return;
-            }
-            config.count = count;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ Count: ${count}`);
-            break;
-            
-        case "/setmodel":
-            const model = args.join(" ");
-            if (!model) {
-                await bot.send(chatId, "❌ /setmodel <name>\nUse /listmodels");
-                return;
-            }
-            config.model = model;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ Model: <code>${escapeHtml(model)}</code>`);
-            break;
-            
-        case "/listmodels":
-            await bot.send(chatId, "⏳ Loading models...");
-            try {
-                const models = await hordeGetModels();
-                const modelList = (Array.isArray(models) ? models : [])
-                    .filter(m => m.count > 0)
-                    .sort((a, b) => b.count - a.count)
-                    .slice(0, 40);
-                
-                let text = "📋 <b>Top 40 Models</b>\n\n";
-                modelList.forEach((m, i) => {
-                    const isSdxl = m.name?.includes("XL") || m.name?.includes("SDXL");
-                    text += `${i + 1}. ${isSdxl ? "🟢" : "⚪"} <code>${escapeHtml(m.name)}</code> (${m.count}w)\n`;
-                });
-                text += "\n🟢 = SDXL  ⚪ = SD1.5\nCopy name: /setmodel <name>";
-                await bot.send(chatId, text);
-            } catch (e) {
-                await bot.send(chatId, `❌ ${escapeHtml(e.message)}`);
-            }
-            break;
-            
-        case "/searchlora":
-            const query = args.join(" ");
-            if (!query) {
-                await bot.send(chatId, "❌ /searchlora <query in English>");
-                return;
-            }
-            await bot.send(chatId, "🔍 Searching CivitAI...");
-            try {
-                const response = await fetch(`https://civitai.com/api/v1/models?types=LORA&query=${encodeURIComponent(query)}&limit=10&sort=Highest%20Rated&nsfw=true`);
-                const data = await response.json();
-                if (!data.items?.length) {
-                    await bot.send(chatId, "😕 Nothing found");
-                    return;
-                }
-                let text = `🔍 <b>LoRA: "${escapeHtml(query)}"</b>\n\n`;
-                for (const item of data.items.slice(0, 10)) {
-                    const version = item.modelVersions?.[0];
-                    const id = version?.id || "?";
-                    text += `${item.nsfw ? "🔞" : "✅"} <b>${escapeHtml(item.name)}</b> [${escapeHtml(version?.baseModel || "?")}]\n`;
-                    text += `➕ <code>/addlora ${id} 0.8</code>\n\n`;
-                }
-                await bot.send(chatId, text);
-            } catch (e) {
-                await bot.send(chatId, `❌ ${escapeHtml(e.message)}`);
-            }
-            break;
-            
-        case "/addlora":
-            const loraId = args[0];
-            const strength = parseFloat(args[1]) || 0.8;
-            const clip = parseFloat(args[2]) || 1;
-            if (!loraId) {
-                await bot.send(chatId, "❌ /addlora <civitai_version_id> [strength=0.8] [clip=1]");
-                return;
-            }
-            config.loras = (config.loras || []).filter(l => String(l.name) !== String(loraId));
-            config.loras.push({ name: loraId, strength, clip });
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ LoRA <code>${escapeHtml(loraId)}</code> (strength: ${strength}, clip: ${clip})`);
-            break;
-            
-        case "/removelora":
-            const removeId = args[0];
-            if (!removeId) {
-                await bot.send(chatId, "❌ /removelora <id>");
-                return;
-            }
-            config.loras = (config.loras || []).filter(l => String(l.name) !== String(removeId));
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ LoRA <code>${escapeHtml(removeId)}</code> removed`);
-            break;
-            
-        case "/listloras":
-            const loras = config.loras || [];
-            if (!loras.length) {
-                await bot.send(chatId, "📋 No LoRA yet. Use /searchlora");
-                return;
-            }
-            let loraText = "📋 <b>Your LoRA:</b>\n\n";
-            loras.forEach((l, i) => {
-                loraText += `${i + 1}. <code>${escapeHtml(l.name)}</code> (str: ${l.strength}, clip: ${l.clip})\n`;
-                loraText += `   ❌ /removelora ${escapeHtml(l.name)}\n\n`;
-            });
-            await bot.send(chatId, loraText);
-            break;
-            
-        case "/setsize":
-            let width = parseInt(args[0], 10);
-            let height = parseInt(args[1], 10);
-            if (isNaN(width) || isNaN(height) || width < 256 || height < 256 || width > 2048 || height > 2048) {
-                await bot.send(chatId, "❌ /setsize <W> <H> (256-2048, multiple of 64)\nExample: /setsize 1024 1024");
-                return;
-            }
-            config.width = 64 * Math.round(width / 64);
-            config.height = 64 * Math.round(height / 64);
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ Size: ${config.width}×${config.height}`);
-            break;
-            
-        case "/setsteps":
-            const steps = parseInt(args[0], 10);
-            if (isNaN(steps) || steps < 1 || steps > 150) {
-                await bot.send(chatId, "❌ /setsteps <1-150>");
-                return;
-            }
-            config.steps = steps;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ Steps: ${steps}`);
-            break;
-            
-        case "/setcfg":
-            const cfg = parseFloat(args[0]);
-            if (isNaN(cfg) || cfg < 1 || cfg > 30) {
-                await bot.send(chatId, "❌ /setcfg <1-30>");
-                return;
-            }
-            config.cfgScale = cfg;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ CFG: ${cfg}`);
-            break;
-            
-        case "/setsampler":
-            const samplers = ["k_euler", "k_euler_a", "k_lms", "k_heun", "k_dpm_2", "k_dpm_2_a", "k_dpmpp_2s_a", "k_dpmpp_2m", "k_dpmpp_sde", "DDIM"];
-            const sampler = args[0];
-            if (!sampler || !samplers.includes(sampler)) {
-                await bot.send(chatId, "❌ Available samplers:\n" + samplers.map(s => `<code>${s}</code>`).join("\n"));
-                return;
-            }
-            config.sampler = sampler;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ Sampler: ${sampler}`);
-            break;
-            
-        case "/setneg":
-            config.negativePrompt = args.join(" ") || DEFAULT_CONFIG.negativePrompt;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ Negative prompt:\n<code>${escapeHtml(config.negativePrompt)}</code>`);
-            break;
-            
-        case "/setclipskip":
-            const clipSkip = parseInt(args[0], 10);
-            if (isNaN(clipSkip) || clipSkip < 1 || clipSkip > 4) {
-                await bot.send(chatId, "❌ /setclipskip <1-4>");
-                return;
-            }
-            config.clipSkip = clipSkip;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ CLIP Skip: ${clipSkip}`);
-            break;
-            
-        case "/setllm":
-            const llm = args.join(" ");
-            if (!llm) {
-                await bot.send(chatId, "❌ /setllm <model_id>\n\nFree models:\n`google/gemma-2-9b-it:free`\n`meta-llama/llama-3.1-8b-instruct:free`");
-                return;
-            }
-            config.llmModel = llm;
-            await saveConfig(env, config);
-            await bot.send(chatId, `✅ LLM: <code>${escapeHtml(llm)}</code>`);
-            break;
-            
-        case "/enable":
-            if (!config.chatId) {
-                await bot.send(chatId, "❌ First: /setchat");
-                return;
-            }
-            if (!config.generalPrompt) {
-                await bot.send(chatId, "❌ First: /setprompt");
-                return;
-            }
-            config.enabled = true;
-            await saveConfig(env, config);
-            await bot.send(chatId, `🟢 Autoposting enabled!\nInterval: ${config.interval} min\nCount: ${config.count}`);
-            break;
-            
-        case "/disable":
-            config.enabled = false;
-            await saveConfig(env, config);
-            await bot.send(chatId, "🔴 Autoposting disabled");
-            break;
-            
-        case "/status":
-            const pending = await Redis.keys("pending:*");
-            const blacklist = await getWorkerBlacklist(env);
-            const loraList = (config.loras || []).map(l => `• <code>${escapeHtml(l.name)}</code> (${l.strength})`).join("\n") || "none";
-            
-            const statusText = `📊 <b>Status</b>\n\n` +
-                `<b>Autopost:</b> ${config.enabled ? "🟢 ON" : "🔴 OFF"}\n` +
-                `<b>Chat:</b> <code>${config.chatId || "—"}</code>\n` +
-                `<b>Interval:</b> ${config.interval} min\n` +
-                `<b>Count:</b> ${config.count}\n\n` +
-                `<b>Prompt:</b>\n<code>${escapeHtml(config.generalPrompt || "—")}</code>\n\n` +
-                `<b>Model:</b> <code>${escapeHtml(config.model)}</code>\n` +
-                `<b>Size:</b> ${config.width}×${config.height}\n` +
-                `<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n` +
-                `<b>Sampler:</b> ${config.sampler}\n` +
-                `<b>CLIP Skip:</b> ${config.clipSkip || 1}\n` +
-                `<b>NSFW:</b> ${config.nsfw ? "🔞 yes" : "no"}\n\n` +
-                `<b>Negative:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n` +
-                `<b>LoRA:</b>\n${loraList}\n\n` +
-                `<b>Queue:</b> ${pending.length}\n` +
-                `<b>Blacklist:</b> ${blacklist.length} workers`;
-            
-            await bot.send(chatId, statusText);
-            break;
-            
-        case "/generate":
-            if (!config.generalPrompt) {
-                await bot.send(chatId, "❌ First: /setprompt");
-                return;
-            }
-            const targetChat = config.chatId || chatId;
-            await bot.send(chatId, `⏳ Generating ${config.count} images...`);
-            const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
-            
-            for (let i = 0; i < config.count; i++) {
-                try {
-                    const enhancedPrompt = await generatePrompt(config.generalPrompt, env);
-                    await bot.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(enhancedPrompt.substring(0, 300))}</code>`);
-                    const result = await hordeSubmit(enhancedPrompt, config, env, { workerBlacklist: bl });
-                    
-                    if (result.id) {
-                        await Redis.set(`pending:${result.id}`, {
-                            chatId: targetChat,
-                            prompt: enhancedPrompt,
-                            at: Date.now(),
-                            notify: chatId,
-                            retries: 0
-                        }, { expirationTtl: 3600 });
-                        await bot.send(chatId, `📤 ID: <code>${result.id}</code>`);
-                    } else {
-                        await bot.send(chatId, `❌ Horde: <code>${escapeHtml(JSON.stringify(result).substring(0, 300))}</code>`);
-                    }
-                } catch (e) {
-                    await bot.send(chatId, `❌ ${escapeHtml(e.message)}`);
-                }
-            }
-            break;
-            
-        case "/pending":
-            const pendingList = await Redis.keys("pending:*");
-            if (!pendingList.length) {
-                await bot.send(chatId, "📋 Queue is empty");
-                return;
-            }
-            let pendingText = `📋 <b>In queue: ${pendingList.length}</b>\n\n`;
-            for (const key of pendingList.slice(0, 10)) {
-                const id = key.replace("pending:", "");
-                try {
-                    const status = await hordeCheck(id);
-                    pendingText += `🔸 <code>${id}</code>\n`;
-                    pendingText += status.done ? "✅ Ready\n" : status.processing ? "⚙️ Processing\n" : `⏳ Queue #${status.queue_position || "?"}\n`;
-                    pendingText += `~${status.wait_time || 0}s\n\n`;
-                } catch {
-                    pendingText += `🔸 <code>${id}</code> — failed\n\n`;
-                }
-            }
-            await bot.send(chatId, pendingText);
-            break;
-            
-        case "/cancel":
-            const cancelList = await Redis.keys("pending:*");
-            await Promise.all(cancelList.map(key => Redis.del(key)));
-            await bot.send(chatId, `🗑 Removed from queue: ${cancelList.length}`);
-            break;
-            
-        case "/workerbl":
-            const workerBl = await getWorkerBlacklist(env);
-            if (!workerBl.length) {
-                await bot.send(chatId, "📋 Worker blacklist is empty");
-                return;
-            }
-            let blText = `🚫 <b>Worker blacklist: ${workerBl.length}</b>\n\n`;
-            for (const w of workerBl) {
-                blText += `• <code>${escapeHtml(w.name || "?")}</code>\n`;
-                blText += `  ID: <code>${escapeHtml(w.id)}</code>\n`;
-                blText += `  ${new Date(w.t).toISOString().slice(0, 10)}\n\n`;
-            }
-            blText += "/clearworkerbl — clear blacklist";
-            await bot.send(chatId, blText);
-            break;
-            
-        case "/clearworkerbl":
-            await clearWorkerBlacklist(env);
-            await bot.send(chatId, "✅ Worker blacklist cleared");
-            break;
-            
-        case "/checkkey":
-            await bot.send(chatId, "🔑 Checking Horde key...");
-            const keyResult = await hordeCheckKey(env);
-            if (!keyResult.ok) {
-                await bot.send(chatId, `❌ <b>Invalid key</b>\n${escapeHtml(keyResult.err || "")}`);
-                return;
-            }
-            const anonText = keyResult.anon ? "🔴 Anonymous key\nNSFW will not work.\nRegister at stablehorde.net." :
-                            keyResult.flagged ? "⚠️ Account flagged — censorship may happen" :
-                            "✅ Key looks fine, NSFW should work";
-            const keyText = `${keyResult.anon ? "🔴" : "✅"} <b>${escapeHtml(keyResult.user || "anonymous")}</b>\n\n` +
-                           `💎 Kudos: ${keyResult.kudos || 0}\n` +
-                           `🛡 Trusted: ${keyResult.trusted ? "yes" : "no"}\n` +
-                           `🚩 Flagged: ${keyResult.flagged ? "yes" : "no"}\n\n` +
-                           anonText;
-            await bot.send(chatId, keyText);
-            break;
-            
-        case "/diagnostic":
-            const apiKey = getApiKey(env);
-            const diagBl = await getWorkerBlacklist(env);
-            const diagText = `🔧 <b>Diagnostics</b>\n\n` +
-                            `💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌ not configured"}\n` +
-                            `🔑 Horde key: ${apiKey === "0000000000" ? "🔴 anonymous" : "✅ " + apiKey.substring(0, 8) + "..."}\n` +
-                            `🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "⚠️"}\n\n` +
-                            `<b>Request flags:</b>\n` +
-                            ` nsfw: true\n` +
-                            ` censor_nsfw: false\n` +
-                            ` trusted_workers: false\n` +
-                            ` replacement_filter: true\n` +
-                            ` r2: true\n` +
-                            ` allow_downgrade: true\n\n` +
-                            `🚫 Blacklisted workers: <b>${diagBl.length}</b>\n` +
-                            `📏 Min image size: 10KB\n\n` +
-                            `<b>Censorship detection:</b>\n` +
-                            ` 1. gen_metadata[].type=="censorship"\n` +
-                            ` 2. gen.censored === true\n` +
-                            ` 3. gen.state === "censored"\n` +
-                            ` 4. size < 10KB`;
-            await bot.send(chatId, diagText);
-            break;
-            
-        default:
-            if (cmd.startsWith("/")) {
-                await bot.send(chatId, "❓ Unknown command — /help");
-            }
-    }
-}
-
-// Callback Handler
-async function handleCallback(callbackQuery, env) {
-    const bot = new Telegram(env.TELEGRAM_BOT_TOKEN);
-    const chatId = callbackQuery.message.chat.id;
-    const messageId = callbackQuery.message.message_id;
-    const data = callbackQuery.data;
-    
-    const config = await getConfig(env);
-    
-    try {
-        if (data === "menu_settings") {
-            const keyboard = new InlineKeyboard()
-                .add("💬 Chat: " + (config.chatId ? "✅" : "❌"), "set_chat").row()
-                .add("📝 Prompt", "set_prompt")
-                .add("⏱️ Interval", "set_interval").row()
-                .add("🔢 Count", "set_count")
-                .add("🎯 Model", "set_model").row()
-                .add("🔙 Back", "menu_main").row()
-                .build();
-            await bot.editMessage(chatId, messageId, "⚙️ <b>Settings Menu</b>", { reply_markup: keyboard });
-            await bot.answerCallback(callbackQuery.id, "");
-        }
-        else if (data === "menu_models") {
-            await bot.answerCallback(callbackQuery.id, "⏳ Loading models...");
-            try {
-                const models = await hordeGetModels();
-                const modelList = (Array.isArray(models) ? models : [])
-                    .filter(m => m.count > 0)
-                    .sort((a, b) => b.count - a.count)
-                    .slice(0, 40);
-                
-                let text = "📋 <b>Top 40 Models</b>\n\n";
-                modelList.forEach((m, i) => {
-                    const isSdxl = m.name?.includes("XL") || m.name?.includes("SDXL");
-                    text += `${i + 1}. ${isSdxl ? "🟢" : "⚪"} <code>${escapeHtml(m.name)}</code> (${m.count}w)\n`;
-                });
-                text += "\n🟢 = SDXL  ⚪ = SD1.5";
-                
-                const keyboard = new InlineKeyboard()
-                    .add("🔙 Back", "menu_main")
-                    .build();
-                
-                await bot.editMessage(chatId, messageId, text, { reply_markup: keyboard });
-            } catch (e) {
-                await bot.send(chatId, `❌ Error: ${escapeHtml(e.message)}`);
-            }
-        }
-        else if (data === "menu_lora") {
-            const keyboard = new InlineKeyboard()
-                .add("🔍 Search LoRA", "lora_search").row()
-                .add("📋 My LoRAs", "lora_list")
-                .add("➕ Add LoRA", "lora_add").row()
-                .add("🔙 Back", "menu_main")
-                .build();
-            await bot.editMessage(chatId, messageId, "🔧 <b>LoRA Management</b>", { reply_markup: keyboard });
-            await bot.answerCallback(callbackQuery.id, "");
-        }
-        else if (data === "menu_main") {
-            const keyboard = new InlineKeyboard()
-                .add("⚙️ Settings", "menu_settings").row()
-                .add("🎨 Models", "menu_models")
-                .add("🔧 LoRA", "menu_lora").row()
-                .add("📊 Status", "cmd_status")
-                .add("🚀 Generate", "cmd_generate").row()
-                .add("🔄 Auto: " + (config.enabled ? "ON" : "OFF"), "cmd_toggle_auto").row()
-                .build();
-            await bot.editMessage(chatId, messageId, "🤖 <b>Main Menu</b>", { reply_markup: keyboard });
-            await bot.answerCallback(callbackQuery.id, "");
-        }
-        else if (data === "set_chat") {
-            config.chatId = chatId;
-            await saveConfig(env, config);
-            await bot.answerCallback(callbackQuery.id, `✅ Chat set: ${chatId}`, true);
-        }
-        else if (data === "cmd_status") {
-            const pending = await Redis.keys("pending:*");
-            const blacklist = await getWorkerBlacklist(env);
-            const loras = (config.loras || []).map(l => `• <code>${escapeHtml(l.name)}</code> (${l.strength})`).join("\n") || "none";
-            
-            const text = `📊 <b>Status</b>\n\n` +
-                `<b>Auto-post:</b> ${config.enabled ? "🟢 ON" : "🔴 OFF"}\n` +
-                `<b>Chat:</b> <code>${config.chatId || "—"}</code>\n` +
-                `<b>Interval:</b> ${config.interval} min\n` +
-                `<b>Count:</b> ${config.count}\n\n` +
-                `<b>Prompt:</b>\n<code>${escapeHtml(config.generalPrompt || "—")}</code>\n\n` +
-                `<b>Model:</b> <code>${escapeHtml(config.model)}</code>\n` +
-                `<b>Size:</b> ${config.width}×${config.height}\n` +
-                `<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n` +
-                `<b>Sampler:</b> ${config.sampler}\n` +
-                `<b>CLIP Skip:</b> ${config.clipSkip || 1}\n` +
-                `<b>NSFW:</b> ${config.nsfw ? "🔞 yes" : "no"}\n\n` +
-                `<b>Negative:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n` +
-                `<b>LoRA:</b>\n${loras}\n\n` +
-                `<b>Queue:</b> ${pending.length}\n` +
-                `<b>Blacklist:</b> ${blacklist.length} workers`;
-            
-            await bot.send(chatId, text);
-            await bot.answerCallback(callbackQuery.id, "");
-        }
-        else if (data === "cmd_generate") {
-            await bot.answerCallback(callbackQuery.id, "Use /generate command", true);
-        }
-        else if (data === "cmd_toggle_auto") {
-            if (!config.enabled) {
-                if (!config.chatId) {
-                    await bot.answerCallback(callbackQuery.id, "❌ Set chat first: /setchat", true);
-                    return;
-                }
-                if (!config.generalPrompt) {
-                    await bot.answerCallback(callbackQuery.id, "❌ Set prompt first: /setprompt", true);
-                    return;
-                }
-            }
-            config.enabled = !config.enabled;
-            await saveConfig(env, config);
-            await bot.answerCallback(callbackQuery.id, `Auto-posting ${config.enabled ? "enabled" : "disabled"}`, true);
-        }
-        else if (data === "cmd_pending") {
-            const pending = await Redis.keys("pending:*");
-            if (!pending.length) {
-                await bot.answerCallback(callbackQuery.id, "📋 Queue is empty", true);
-                return;
-            }
-            let text = `📋 <b>In queue: ${pending.length}</b>\n\n`;
-            for (const key of pending.slice(0, 10)) {
-                const id = key.replace("pending:", "");
-                try {
-                    const status = await hordeCheck(id);
-                    text += `🔸 <code>${id}</code>\n`;
-                    text += status.done ? "✅ Ready\n" : status.processing ? "⚙️ Processing\n" : `⏳ Queue #${status.queue_position || "?"}\n`;
-                    text += `~${status.wait_time || 0}s\n\n`;
-                } catch {
-                    text += `🔸 <code>${id}</code> — failed\n\n`;
-                }
-            }
-            await bot.send(chatId, text);
-            await bot.answerCallback(callbackQuery.id, "");
-        }
-        else if (data === "cmd_cancel") {
-            const pending = await Redis.keys("pending:*");
-            for (const key of pending) {
-                await Redis.del(key);
-            }
-            await bot.answerCallback(callbackQuery.id, `🗑 Cleared ${pending.length} from queue`, true);
-        }
-        else if (data === "cmd_checkkey") {
-            await bot.answerCallback(callbackQuery.id, "🔑 Checking...", false);
-            const result = await hordeCheckKey(env);
-            if (!result.ok) {
-                await bot.send(chatId, `❌ <b>Invalid key</b>\n${escapeHtml(result.err || "")}`);
-                return;
-            }
-            const anonText = result.anon ? "🔴 Anonymous key\nNSFW will not work.\nRegister at stablehorde.net." :
-                            result.flagged ? "⚠️ Account flagged — censorship may happen" :
-                            "✅ Key looks fine, NSFW should work";
-            const text = `${result.anon ? "🔴" : "✅"} <b>${escapeHtml(result.user || "anonymous")}</b>\n\n` +
-                        `💎 Kudos: ${result.kudos || 0}\n` +
-                        `🛡 Trusted: ${result.trusted ? "yes" : "no"}\n` +
-                        `🚩 Flagged: ${result.flagged ? "yes" : "no"}\n\n` +
-                        anonText;
-            await bot.send(chatId, text);
-        }
-        else if (data === "cmd_diagnostic") {
-            const apiKey = getApiKey(env);
-            const blacklist = await getWorkerBlacklist(env);
-            const text = `🔧 <b>Diagnostics</b>\n\n` +
-                `💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌ not configured"}\n` +
-                `🔑 Horde key: ${apiKey === "0000000000" ? "🔴 anonymous" : "✅ " + apiKey.substring(0, 8) + "..."}\n` +
-                `🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "⚠️"}\n\n` +
-                `<b>Request flags:</b>\n` +
-                ` nsfw: true\n` +
-                ` censor_nsfw: false\n` +
-                ` trusted_workers: false\n` +
-                ` replacement_filter: true\n` +
-                ` r2: true\n` +
-                ` allow_downgrade: true\n\n` +
-                `🚫 Blacklisted workers: <b>${blacklist.length}</b>\n` +
-                `📏 Min image size: 10KB`;
-            await bot.send(chatId, text);
-            await bot.answerCallback(callbackQuery.id, "");
-        }
-        
-    } catch (e) {
-        console.error("[Callback] Error:", e.message);
-        await bot.answerCallback(callbackQuery.id, `❌ Error: ${e.message}`, true);
-    }
-}
-
-// Scheduled Task Handler
-async function processScheduled(env) {
-    if (!env.UPSTASH_REDIS_REST_URL || !env.TELEGRAM_BOT_TOKEN) return;
-    
-    const bot = new Telegram(env.TELEGRAM_BOT_TOKEN);
-    const config = await getConfig(env);
-    
-    // Process pending generations
-    const pending = await Redis.keys("pending:*");
-    
-    for (const key of pending) {
-        const id = key.replace("pending:", "");
-        
-        try {
-            const pendingData = await Redis.get(key, "json");
-            if (!pendingData) {
-                await Redis.del(key);
-                continue;
-            }
-            
-            // Check timeout (2 minutes)
-            if (Date.now() - pendingData.at > 120000) {
-                await Redis.del(key);
-                if (pendingData.notify) {
-                    await bot.send(pendingData.notify, `⏰ Generation timeout: <code>${id}</code>`);
-                }
-                continue;
-            }
-            
-            // Check if done
-            const checkResult = await hordeCheck(id);
-            if (!checkResult.done) continue;
-            
-            // Get result
-            const result = await hordeGetResult(id);
-            await Redis.del(key);
-            
-            if (result.faulted) {
-                if (pendingData.notify) {
-                    await bot.send(pendingData.notify, `❌ Generation <code>${id}</code> failed`);
-                }
-                continue;
-            }
-            
-            const generations = result.generations || [];
-            if (!generations.length) {
-                if (pendingData.notify) {
-                    await bot.send(pendingData.notify, `❌ No generations for <code>${id}</code>`);
-                }
-                continue;
-            }
-            
-            let success = false;
-            let needsRetry = false;
-            
-            for (const gen of generations) {
-                const workerId = gen.worker_id || "?";
-                const workerName = gen.worker_name || "?";
-                const censored = isCensored(gen);
-                
-                if (censored) {
-                    await addWorkerToBlacklist(env, workerId, workerName);
-                    needsRetry = true;
-                    
-                    if (pendingData.notify) {
-                        await bot.send(pendingData.notify, `🔴 Worker <code>${escapeHtml(workerName)}</code> returned censorship\nAdded to blacklist`);
-                    }
-                    continue;
-                }
-                
-                if (!gen.img) {
-                    if (pendingData.notify) {
-                        await bot.send(pendingData.notify, "❌ gen.img is empty");
-                    }
-                    continue;
-                }
-                
-                // Generate caption based on mode
-                let caption = "";
-                if (config.captionMode === 1) {
-                    caption = `🎨 <i>${escapeHtml(pendingData.prompt?.substring(0, 200) || "")}</i>`;
-                } else if (config.captionMode === 2) {
-                    // AI caption generation
-                    if (env.OPENROUTER_API_KEY) {
-                        try {
-                            const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-                                method: "POST",
-                                headers: {
-                                    "Content-Type": "application/json",
-                                    "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-                                    "HTTP-Referer": "https://t.me",
-                                    "X-Title": "TgImageBot"
-                                },
-                                body: JSON.stringify({
-                                    model: "google/gemma-2-9b-it:free",
-                                    messages: [
-                                        { role: "system", content: `${config.captionPrompt || "Describe this image in an engaging way for social media."} Keep it under 150 words.` },
-                                        { role: "user", content: `Image prompt: ${pendingData.prompt || ""}` }
-                                    ],
-                                    temperature: 0.9,
-                                    max_tokens: 250
-                                })
-                            });
-                            const data = await response.json();
-                            caption = data.choices?.[0]?.message?.content?.trim() || pendingData.prompt || "";
-                        } catch (e) {
-                            console.error("[Caption AI] Error:", e.message);
-                            caption = pendingData.prompt || "";
-                        }
-                    } else {
-                        caption = pendingData.prompt || "";
-                    }
-                }
-                // mode 0 = no caption
-                
-                const targetChat = pendingData.chatId;
-                const { sent, tooSmall } = await deliverImage(bot, targetChat, gen.img, caption, pendingData.notify);
-                
-                if (sent) {
-                    success = true;
-                } else if (tooSmall) {
-                    needsRetry = true;
-                    await addWorkerToBlacklist(env, workerId, workerName);
-                }
-            }
-            
-            // Retry if needed
-            if (needsRetry && !success && !pendingData.sfwTest) {
-                const retries = (pendingData.retries || 0) + 1;
-                
-                if (retries < 3) {
-                    const blacklist = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
-                    
-                    try {
-                        const retryResult = await hordeSubmit(pendingData.prompt, config, env, { workerBlacklist: blacklist });
-                        
-                        if (retryResult.id) {
-                            await Redis.set(`pending:${retryResult.id}`, {
-                                ...pendingData,
-                                at: Date.now(),
-                                retries: retries
-                            }, { expirationTtl: 3600 });
-                            
-                            if (pendingData.notify) {
-                                await bot.send(pendingData.notify, `🔄 Retry ${retries}/3: <code>${retryResult.id}</code>\n🚫 Blacklist: ${blacklist.length} workers`);
-                            }
-                        }
-                    } catch (e) {
-                        console.error("[Retry] Error:", e.message);
-                    }
-                } else {
-                    if (pendingData.notify) {
-                        await bot.send(pendingData.notify, 
-                            "❌ <b>3 attempts — all placeholders/censored</b>\n\n" +
-                            "Possible reasons:\n" +
-                            "• Anonymous Horde key (NSFW won't work)\n" +
-                            "• Account flagged\n" +
-                            "• All workers censor this model\n\n" +
-                            "/clearworkerbl — clear blacklist"
-                        );
-                    }
-                }
-            }
-            
-        } catch (e) {
-            console.error(`[CRON] ${id}:`, e.message);
-        }
-    }
-    
-    // Auto-post if enabled
-    if (!config.enabled || !config.chatId || !config.generalPrompt) return;
-    
-    // Check if queue has items
-    const pendingCount = (await Redis.keys("pending:*")).length;
-    if (pendingCount > 0) return;
-    
-    // Check interval
-    const lastPost = parseInt(await Redis.get("last_post_time") || "0", 10);
-    const now = Date.now();
-    
-    if (now - lastPost < config.interval * 60 * 1000) return;
-    
-    await Redis.set("last_post_time", String(now));
-    
-    // Generate new images
-    const blacklist = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
-    
-    for (let i = 0; i < config.count; i++) {
-        try {
-            const prompt = await generatePrompt(config.generalPrompt, env);
-            const result = await hordeSubmit(prompt, config, env, { workerBlacklist: blacklist });
-            
-            if (result.id) {
-                await Redis.set(`pending:${result.id}`, {
-                    chatId: config.chatId,
-                    prompt: prompt,
-                    at: now,
-                    notify: null,
-                    retries: 0
-                }, { expirationTtl: 3600 });
-            }
-        } catch (e) {
-            console.error("[CRON] auto:", e.message);
-        }
-    }
-}
-
-// Main Handler
-export default {
-    async fetch(request, env) {
-        const url = new URL(request.url);
-        
-        // Webhook handler - FIXED: Now handles both message and callback_query
-        if (url.pathname === "/webhook") {
-            if (request.method !== "POST") {
-                return new Response("POST only", { status: 405 });
-            }
-            
-            try {
-                const data = await request.json();
-                
-                // Handle messages
-                if (data.message) {
-                    await handleCommand(data.message, env);
-                }
-                // Handle callback queries (INLINE KEYBOARDS)
-                else if (data.callback_query) {
-                    await handleCallback(data.callback_query, env);
-                }
-            } catch (e) {
-                console.error("[WH] Error:", e.message);
-            }
-            
-            return new Response("OK");
-        }
-        
-        // Setup webhook
-        if (url.pathname === "/setup") {
-            if (!env.TELEGRAM_BOT_TOKEN) {
-                return new Response("No TELEGRAM_BOT_TOKEN!", { status: 500 });
-            }
-            
-            const webhookUrl = `${url.origin}/webhook`;
-            const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    url: webhookUrl,
-                    allowed_updates: ["message", "callback_query"],
-                    drop_pending_updates: true
-                })
-            });
-            
-            const result = await response.json();
-            return new Response(`Webhook: ${webhookUrl}\n\n${JSON.stringify(result, null, 2)}`);
-        }
-        
-        // Root
-        if (url.pathname === "/") {
-            return new Response("🤖 Telegram Image Bot is running!\nVisit /setup to configure webhook.");
-        }
-        
-        return new Response("Not found", { status: 404 });
+async function hordeGenerate(prompt, cfg, env) {
+  const body = {
+    prompt: prompt + " ### " + cfg.negativePrompt,
+    params: {
+      sampler_name: cfg.sampler,
+      cfg_scale: cfg.cfgScale,
+      width: cfg.width,
+      height: cfg.height,
+      steps: cfg.steps,
+      karras: cfg.karras,
+      post_processing: cfg.postProcessing,
+      clip_skip: cfg.clipSkip
     },
-    
-    async scheduled(event, env, ctx) {
-        try {
-            await processScheduled(env);
-        } catch (e) {
-            console.error("[CRON] CRASH:", e.message);
-        }
+    models: [cfg.model],
+    nsfw: true,
+    r2: true,
+    allow_downgrade: true
+  };
+
+  if (cfg.hiresFix) {
+    body.params.hires_fix = true;
+    body.params.hires_fix_denoising_strength = cfg.hiresFixDenoising;
+  }
+
+  const res = await fetch(`${HORDE}/generate/async`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: env.HORDE_API_KEY
+    },
+    body: JSON.stringify(body)
+  });
+
+  return res.json();
+}
+
+// ================= LLM PROMPT =================
+function applyPromptCommands(text) {
+  // [style: anime], [add: ...], [remove: ...]
+  return text.replace(/\[(.*?)\]/g, (_, cmd) => {
+    if (cmd.startsWith("add:")) return cmd.replace("add:", "");
+    if (cmd.startsWith("remove:")) return "";
+    if (cmd.startsWith("style:")) return cmd.replace("style:", "");
+    return "";
+  });
+}
+
+// ================= AI CAPTION =================
+async function generateCaption(prompt, env) {
+  if (!env.OPENROUTER_API_KEY) return prompt;
+
+  const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "openrouter/auto",
+      messages: [
+        { role: "system", content: "Write a short красивый пост для Telegram" },
+        { role: "user", content: prompt }
+      ]
+    })
+  });
+
+  const j = await res.json();
+  return j.choices?.[0]?.message?.content || prompt;
+}
+
+// ================= COMMANDS =================
+async function handle(msg, env) {
+  const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
+  const chat = msg.chat.id;
+  const user = msg.from.id;
+  const text = msg.text || "";
+
+  let cfg = await Redis.get(env, "config") || DEFAULT_CONFIG;
+
+  if (!cfg.adminId) {
+    cfg.adminId = user;
+    await Redis.set(env, "config", cfg);
+  }
+
+  if (user !== cfg.adminId) return tg.send(chat, "🔒 admin only");
+
+  if (text === "/menu") {
+    return tg.keyboard(chat, "⚙️ Меню", [
+      [{ text: "🎨 Модель", callback_data: "model" }],
+      [{ text: "🧠 LLM", callback_data: "llm" }],
+      [{ text: "📤 Автопост", callback_data: "auto" }]
+    ]);
+  }
+
+  if (text.startsWith("/setprompt")) {
+    cfg.generalPrompt = text.replace("/setprompt", "").trim();
+    await Redis.set(env, "config", cfg);
+    return tg.send(chat, "✅ prompt set");
+  }
+
+  if (text === "/generate") {
+    let p = applyPromptCommands(cfg.generalPrompt);
+
+    const gen = await hordeGenerate(p, cfg, env);
+
+    if (!gen.id) return tg.send(chat, "❌ Horde error");
+
+    await Redis.set(env, "pending:" + gen.id, {
+      prompt: p,
+      chatId: chat
+    });
+
+    return tg.send(chat, "⏳ Генерация...");
+  }
+
+  if (text === "/setchannel") {
+    cfg.channelId = chat;
+    await Redis.set(env, "config", cfg);
+    return tg.send(chat, "✅ канал привязан");
+  }
+
+  if (text === "/setgroup") {
+    cfg.chatId = chat;
+    await Redis.set(env, "config", cfg);
+    return tg.send(chat, "✅ группа привязана");
+  }
+
+  if (text === "/autopostmode") {
+    cfg.autopostMode = (cfg.autopostMode + 1) % 3;
+    await Redis.set(env, "config", cfg);
+    return tg.send(chat, "🔄 режим: " + cfg.autopostMode);
+  }
+}
+
+// ================= CRON =================
+async function cron(env) {
+  const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
+  const cfg = await Redis.get(env, "config");
+  if (!cfg?.enabled) return;
+
+  const keys = await Redis.keys(env, "pending:");
+
+  for (const key of keys) {
+    const id = key.replace("pending:", "");
+
+    const res = await fetch(`${HORDE}/generate/status/${id}`);
+    const data = await res.json();
+
+    if (!data.done) continue;
+
+    await Redis.del(env, key);
+
+    const img = data.generations?.[0]?.img;
+    if (!img) continue;
+
+    let caption = "";
+
+    if (cfg.autopostMode === 1) caption = cfg.generalPrompt;
+    if (cfg.autopostMode === 2)
+      caption = await generateCaption(cfg.generalPrompt, env);
+
+    const buffer = await (await fetch(img)).arrayBuffer();
+
+    if (cfg.chatId) await tg.sendPhoto(cfg.chatId, buffer, caption);
+    if (cfg.channelId) await tg.sendPhoto(cfg.channelId, buffer, caption);
+  }
+}
+
+// ================= EXPORT =================
+export default {
+  async fetch(req, env) {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/webhook") {
+      const upd = await req.json();
+      if (upd.message) await handle(upd.message, env);
+      return new Response("ok");
     }
+
+    if (url.pathname === "/setup") {
+      await fetch(
+        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: url.origin + "/webhook" })
+        }
+      );
+      return new Response("ok");
+    }
+
+    return new Response("running");
+  },
+
+  async scheduled(_, env) {
+    await cron(env);
+  }
 };
