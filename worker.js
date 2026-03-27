@@ -1,874 +1,1452 @@
-
+// Configuration
 const DEFAULT_CONFIG = {
-  enabled: false,
-  chatId: null,
-  adminId: null,
-  interval: 60,
-  count: 1,
-  generalPrompt: "",
-  model: "AlbedoBase XL (SDXL)",
-  loras: [],
-  width: 1024,
-  height: 1024,
-  steps: 25,
-  cfgScale: 2,
-  sampler: "k_dpmpp_2m",
-  nsfw: true,
-  negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
-  llmModel: "",
-  clipSkip: 2,
-  hiresFix: false,
-  hiresFixDenoising: 0.65,
-  karras: true,
-  postProcessing: [],
-  captionMode: 0,
-  captionInstruction: "Напиши короткое, красивое и поэтичное описание к этому изображению на русском языке. Максимум 180 символов. Добавь 1-2 эмодзи. Стиль: вдохновляющий пост в Telegram-канале.",
-  channelId: null
+    enabled: false,
+    chatId: null,
+    channelId: null,
+    adminId: null,
+    interval: 60,
+    count: 1,
+    generalPrompt: "",
+    model: "AlbedoBase XL (SDXL)",
+    loras: [],
+    width: 1024,
+    height: 1024,
+    steps: 25,
+    cfgScale: 7.5,
+    sampler: "k_dpmpp_2m",
+    nsfw: true,
+    negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
+    llmModel: "",
+    clipSkip: 2,
+    hiresFix: false,
+    hiresFixDenoising: 0.65,
+    karras: true,
+    
+    // Post-processing
+    postProcessing: {
+        faceRestore: null, // "GFPGAN", "CodeFormers"
+        faceRestoreStrength: 0.8,
+        upscale: null, // "RealESRGAN_x4plus", "RealESRGAN_x2plus", etc.
+        upscaleStrength: 1.0
+    },
+    
+    // Auto-post caption mode: 0 = no caption, 1 = prompt only, 2 = AI-generated
+    captionMode: 1,
+    captionPrompt: "", // Initial instruction for AI caption generation
+    
+    // Advanced settings
+    tiling: false,
+    seed: -1,
+    workerBlacklist: [],
+    trustedWorkers: false,
+    allowDowngrade: true,
+    replacementFilter: true
 };
 
 const HORDE_API = "https://stablehorde.net/api/v2";
-const HORDE_HEADERS = { "Client-Agent": "TgImageBot:14.0:tg" };
-const MIN_IMAGE_KB = 10;
-
-function escapeHtml(e) {
-  return null == e ? "" : String(e).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-function isHttpUrl(e) {
-  return "string" == typeof e && /^https?:\/\//i.test(e);
-}
-
-class Telegram {
-  constructor(e) {
-    this.base = `https://api.telegram.org/bot${e}`;
-  }
-  async api(e, t) {
-    const a = await fetch(`${this.base}/${e}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(t) });
-    const n = await a.json();
-    return n.ok || console.error(`[TG] ${e}:`, JSON.stringify(n).substring(0, 400)), n;
-  }
-  send(e, t, a = {}) {
-    return this.api("sendMessage", { chat_id: e, text: t, parse_mode: "HTML", ...a });
-  }
-  async sendPhoto(e, t, a = "") {
-    const n = new FormData();
-    n.append("chat_id", String(e));
-    n.append("photo", new File([t], "image.webp", { type: "image/webp" }));
-    if (a) {
-      n.append("caption", a.substring(0, 1024));
-      n.append("parse_mode", "HTML");
-    }
-    return (await fetch(`${this.base}/sendPhoto`, { method: "POST", body: n })).json();
-  }
-  async sendDocument(e, t, a = "") {
-    const n = new FormData();
-    n.append("chat_id", String(e));
-    n.append("document", new File([t], "image.webp", { type: "image/webp" }));
-    if (a) {
-      n.append("caption", a.substring(0, 1024));
-      n.append("parse_mode", "HTML");
-    }
-    return (await fetch(`${this.base}/sendDocument`, { method: "POST", body: n })).json();
-  }
-  sendPhotoUrl(e, t, a = "") {
-    return this.api("sendPhoto", { chat_id: e, photo: t, caption: a.substring(0, 1024), parse_mode: "HTML" });
-  }
-}
-
-const KV = {
-  async command(e, t) {
-    const a = e.UPSTASH_REDIS_REST_URL;
-    const n = e.UPSTASH_REDIS_REST_TOKEN;
-    if (!a || !n) return console.error("[REDIS] Нет UPSTASH_REDIS_REST_URL / TOKEN"), null;
-    const s = await fetch(a, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${n}`, "Content-Type": "application/json" },
-      body: JSON.stringify(t)
-    });
-    if (!s.ok) return console.error(`[REDIS] HTTP ${s.status}`), null;
-    const r = await s.json();
-    return r.error ? (console.error("[REDIS] Error:", r.error), null) : r.result;
-  },
-  async get(e, t, a = "text") {
-    const n = await this.command(e, ["GET", t]);
-    if (null == n) return null;
-    if ("json" === a) try { return JSON.parse(n); } catch { return null; }
-    return n;
-  },
-  async put(e, t, a, n = {}) {
-    let s = ["SET", t];
-    "string" != typeof a && (a = JSON.stringify(a));
-    s.push(a);
-    if (n.expirationTtl) s.push("EX", n.expirationTtl);
-    await this.command(e, s);
-  },
-  async del(e, t) {
-    await this.command(e, ["DEL", t]);
-  },
-  list: async (e, t) => {
-    const a = await this.command(e, ["KEYS", `${t}*`]) || [];
-    return { keys: a.map(e => ({ name: e })) };
-  }
+const HORDE_HEADERS = {
+    "Client-Agent": "TgImageBot:15.0:tg"
 };
 
-async function getConfig(e) {
-  const t = await KV.get(e, "config", "json");
-  return { ...DEFAULT_CONFIG, ...t || {} };
+// Upstash Redis functions
+const Redis = {
+    async get(key, type = "text") {
+        if (!globalThis.UPSTASH_REDIS_REST_URL || !globalThis.UPSTASH_REDIS_REST_TOKEN) {
+            console.error("[Redis] Not configured");
+            return null;
+        }
+        try {
+            const response = await fetch(globalThis.UPSTASH_REDIS_REST_URL, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${globalThis.UPSTASH_REDIS_REST_TOKEN}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(["GET", key])
+            });
+            const result = await response.json();
+            if (result.error) throw new Error(result.error);
+            
+            const data = result[1];
+            if (data === null) return null;
+            
+            if (type === "json") {
+                try {
+                    return JSON.parse(data);
+                } catch {
+                    return data;
+                }
+            }
+            return data;
+        } catch (e) {
+            console.error("[Redis] GET error:", e.message);
+            return null;
+        }
+    },
+    
+    async set(key, value, options = {}) {
+        if (!globalThis.UPSTASH_REDIS_REST_URL || !globalThis.UPSTASH_REDIS_REST_TOKEN) {
+            throw new Error("Redis not configured");
+        }
+        try {
+            const val = typeof value === "object" ? JSON.stringify(value) : String(value);
+            const commands = ["SET", key, val];
+            
+            if (options.expirationTtl) {
+                commands.push("EX", options.expirationTtl);
+            }
+            
+            const response = await fetch(globalThis.UPSTASH_REDIS_REST_URL, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${globalThis.UPSTASH_REDIS_REST_TOKEN}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(commands)
+            });
+            const result = await response.json();
+            if (result.error) throw new Error(result.error);
+            return result;
+        } catch (e) {
+            console.error("[Redis] SET error:", e.message);
+            throw e;
+        }
+    },
+    
+    async del(key) {
+        if (!globalThis.UPSTASH_REDIS_REST_URL || !globalThis.UPSTASH_REDIS_REST_TOKEN) return;
+        try {
+            const response = await fetch(globalThis.UPSTASH_REDIS_REST_URL, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${globalThis.UPSTASH_REDIS_REST_TOKEN}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(["DEL", key])
+            });
+            return await response.json();
+        } catch (e) {
+            console.error("[Redis] DEL error:", e.message);
+        }
+    },
+    
+    async scan(pattern, count = 100) {
+        if (!globalThis.UPSTASH_REDIS_REST_URL || !globalThis.UPSTASH_REDIS_REST_TOKEN) {
+            return { keys: [] };
+        }
+        try {
+            const response = await fetch(globalThis.UPSTASH_REDIS_REST_URL, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${globalThis.UPSTASH_REDIS_REST_TOKEN}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(["KEYS", pattern])
+            });
+            const result = await response.json();
+            if (result.error) throw new Error(result.error);
+            return { keys: result[1] || [] };
+        } catch (e) {
+            console.error("[Redis] SCAN error:", e.message);
+            return { keys: [] };
+        }
+    },
+    
+    async hgetall(key) {
+        if (!globalThis.UPSTASH_REDIS_REST_URL || !globalThis.UPSTASH_REDIS_REST_TOKEN) return {};
+        try {
+            const response = await fetch(globalThis.UPSTASH_REDIS_REST_URL, {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${globalThis.UPSTASH_REDIS_REST_TOKEN}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(["HGETALL", key])
+            });
+            const result = await response.json();
+            if (result.error) throw new Error(result.error);
+            
+            const obj = {};
+            const arr = result[1] || [];
+            for (let i = 0; i < arr.length; i += 2) {
+                obj[arr[i]] = arr[i + 1];
+            }
+            return obj;
+        } catch (e) {
+            console.error("[Redis] HGETALL error:", e.message);
+            return {};
+        }
+    }
+};
+
+// Utility functions
+function escapeHtml(text) {
+    if (text == null) return " ";
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
 }
 
-async function saveConfig(e, t) {
-  await KV.put(e, "config", JSON.stringify(t));
+function isHttpUrl(str) {
+    return typeof str === "string" && /^https?:\/\//i.test(str);
 }
 
-async function getWorkerBlacklist(e) {
-  return await KV.get(e, "worker_blacklist", "json") || [];
+function getApiKey(env) {
+    return (env.HORDE_API_KEY || "").trim() || "0000000000";
 }
 
-async function addWorkerToBlacklist(e, t, a) {
-  if (!t || "?" === t || String(t).length < 10) return;
-  const n = await getWorkerBlacklist(e);
-  if (!n.find(e => e.id === t)) {
-    n.push({ id: t, name: a || "?", t: Date.now() });
-    while (n.length > 30) n.shift();
-    await KV.put(e, "worker_blacklist", JSON.stringify(n));
-  }
+// Telegram Bot with inline keyboards
+class Telegram {
+    constructor(token) {
+        this.base = `https://api.telegram.org/bot${token}`;
+    }
+    
+    async api(method, params = {}) {
+        const response = await fetch(`${this.base}/${method}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(params)
+        });
+        return await response.json();
+    }
+    
+    send(chatId, text, options = {}) {
+        return this.api("sendMessage", {
+            chat_id: chatId,
+            text: text,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+            ...options
+        });
+    }
+    
+    async sendPhoto(chatId, buffer, caption = "", options = {}) {
+        const formData = new FormData();
+        formData.append("chat_id", String(chatId));
+        formData.append("photo", new File([buffer], "image.webp", { type: "image/webp" }));
+        if (caption) {
+            formData.append("caption", caption.substring(0, 1024));
+            formData.append("parse_mode", "HTML");
+        }
+        const response = await fetch(`${this.base}/sendPhoto`, {
+            method: "POST",
+            body: formData
+        });
+        return await response.json();
+    }
+    
+    sendPhotoUrl(chatId, url, caption = "", options = {}) {
+        return this.api("sendPhoto", {
+            chat_id: chatId,
+            photo: url,
+            caption: caption?.substring(0, 1024),
+            parse_mode: "HTML",
+            ...options
+        });
+    }
+    
+    editMessage(chatId, messageId, text, options = {}) {
+        return this.api("editMessageText", {
+            chat_id: chatId,
+            message_id: messageId,
+            text: text,
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+            ...options
+        });
+    }
+    
+    answerCallback(callbackQueryId, text, showAlert = false) {
+        return this.api("answerCallbackQuery", {
+            callback_query_id: callbackQueryId,
+            text: text,
+            show_alert: showAlert
+        });
+    }
 }
 
-async function clearWorkerBlacklist(e) {
-  await KV.put(e, "worker_blacklist", "[]");
+// Inline keyboard builder
+class InlineKeyboard {
+    constructor() {
+        this.rows = [];
+        this.currentRow = [];
+    }
+    
+    add(text, callbackData, url = null) {
+        this.currentRow.push({
+            text,
+            callback_data: callbackData,
+            url: url || undefined
+        });
+        return this;
+    }
+    
+    row() {
+        if (this.currentRow.length > 0) {
+            this.rows.push([...this.currentRow]);
+            this.currentRow = [];
+        }
+        return this;
+    }
+    
+    build() {
+        if (this.currentRow.length > 0) {
+            this.rows.push([...this.currentRow]);
+        }
+        return { inline_keyboard: this.rows };
+    }
 }
 
-function isCensored(e) {
-  return !( !e || !e.gen_metadata?.some(e => "censorship" === e.type) && !0 !== e.censored && "censored" !== e.state );
+// AI Horde functions
+async function hordeCheckKey(env) {
+    const apiKey = getApiKey(env);
+    try {
+        const response = await fetch(`${HORDE_API}/find_user`, {
+            headers: {
+                apikey: apiKey,
+                ...HORDE_HEADERS
+            }
+        });
+        
+        if (response.status === 401 || response.status === 403) {
+            return { ok: false, anon: apiKey === "0000000000" };
+        }
+        
+        const data = await response.json();
+        return {
+            ok: true,
+            anon: apiKey === "0000000000",
+            user: data.username,
+            kudos: data.kudos,
+            trusted: data.trusted,
+            flagged: data.flagged
+        };
+    } catch (e) {
+        return { ok: false, anon: apiKey === "0000000000", err: e.message };
+    }
 }
 
-function getApiKey(e) {
-  return (e.HORDE_API_KEY || "").trim() || "0000000000";
+async function hordeSubmit(prompt, config, env, options = {}) {
+    const apiKey = getApiKey(env);
+    
+    const params = {
+        sampler_name: config.sampler,
+        cfg_scale: config.cfgScale,
+        width: config.width,
+        height: config.height,
+        steps: config.steps,
+        karras: config.karras !== false,
+        clip_skip: config.clipSkip || 2,
+        tiling: config.tiling || false,
+        post_processing: [],
+        n: 1
+    };
+    
+    // Add hires fix
+    if (config.hiresFix) {
+        params.hires_fix = true;
+        params.hires_fix_denoising_strength = config.hiresFixDenoising || 0.65;
+    }
+    
+    // Add post-processing
+    if (config.postProcessing) {
+        if (config.postProcessing.faceRestore) {
+            params.post_processing.push(config.postProcessing.faceRestore);
+            if (config.postProcessing.faceRestoreStrength) {
+                params.post_processing.push(`strength:${config.postProcessing.faceRestoreStrength}`);
+            }
+        }
+        if (config.postProcessing.upscale) {
+            params.post_processing.push(config.postProcessing.upscale);
+            if (config.postProcessing.upscaleStrength) {
+                params.post_processing.push(`strength:${config.postProcessing.upscaleStrength}`);
+            }
+        }
+    }
+    
+    // Add LoRAs
+    if (!options.skipLoras && config.loras?.length > 0) {
+        params.loras = config.loras.map(lora => ({
+            name: String(lora.name),
+            model: lora.strength ?? 1,
+            clip: lora.clip ?? 1,
+            inject_trigger: "any",
+            is_version: true
+        }));
+    }
+    
+    // Add seed
+    if (config.seed && config.seed !== -1) {
+        params.seed = config.seed;
+    }
+    
+    const body = {
+        prompt: config.negativePrompt ? `${prompt} ### ${config.negativePrompt}` : prompt,
+        params: params,
+        nsfw: config.nsfw !== false,
+        censor_nsfw: false,
+        trusted_workers: config.trustedWorkers || false,
+        replacement_filter: config.replacementFilter !== false,
+        models: [config.model],
+        r2: true,
+        shared: false,
+        allow_downgrade: config.allowDowngrade !== false
+    };
+    
+    // Add worker blacklist
+    if (options.workerBlacklist?.length > 0) {
+        body.workers = options.workerBlacklist.slice(0, 5);
+        body.worker_blacklist = true;
+    }
+    
+    const response = await fetch(`${HORDE_API}/generate/async`, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            apikey: apiKey,
+            ...HORDE_HEADERS
+        },
+        body: JSON.stringify(body)
+    });
+    
+    return await response.json();
 }
 
-async function hordeCheckKey(e) {
-  const t = getApiKey(e);
-  try {
-    const e = await fetch(`${HORDE_API}/find_user`, { headers: { apikey: t, ...HORDE_HEADERS } });
-    if (401 === e.status || 403 === e.status) return { ok: false, anon: "0000000000" === t };
-    const a = await e.json();
-    return { ok: true, anon: "0000000000" === t, user: a.username, kudos: a.kudos, trusted: a.trusted, flagged: a.flagged };
-  } catch (e) {
-    return { ok: false, anon: "0000000000" === t, err: e.message };
-  }
+async function hordeCheck(id) {
+    const response = await fetch(`${HORDE_API}/generate/check/${id}`, {
+        headers: HORDE_HEADERS
+    });
+    return await response.json();
 }
 
-async function hordeSubmit(e, t, a, n = {}) {
-  const s = getApiKey(a);
-  const o = {
-    sampler_name: t.sampler,
-    cfg_scale: t.cfgScale,
-    width: t.width,
-    height: t.height,
-    steps: t.steps,
-    karras: !1 !== t.karras,
-    clip_skip: t.clipSkip || 2,
-    tiling: false,
-    post_processing: t.postProcessing || [],
-    n: 1
-  };
-  if (t.hiresFix) {
-    o.hires_fix = true;
-    o.hires_fix_denoising_strength = t.hiresFixDenoising || 0.65;
-  }
-  if (!n.skipLoras && t.loras?.length > 0) {
-    o.loras = t.loras.map(e => ({ name: String(e.name), model: e.strength ?? 1, clip: e.clip ?? 1, inject_trigger: "any", is_version: true }));
-  }
-  const i = {
-    prompt: t.negativePrompt ? `${e} ### ${t.negativePrompt}` : e,
-    params: o,
-    nsfw: true,
-    censor_nsfw: false,
-    trusted_workers: false,
-    replacement_filter: true,
-    models: [t.model],
-    r2: true,
-    shared: false,
-    allow_downgrade: true
-  };
-  if (n.workerBlacklist?.length > 0) {
-    i.workers = n.workerBlacklist.slice(0, 5);
-    i.worker_blacklist = true;
-  }
-  return (await fetch(`${HORDE_API}/generate/async`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", apikey: s, ...HORDE_HEADERS },
-    body: JSON.stringify(i)
-  })).json();
-}
-
-async function hordeCheck(e) {
-  return (await fetch(`${HORDE_API}/generate/check/${e}`, { headers: HORDE_HEADERS })).json();
-}
-
-async function hordeGetResult(e) {
-  return (await fetch(`${HORDE_API}/generate/status/${e}`, { headers: HORDE_HEADERS })).json();
+async function hordeGetResult(id) {
+    const response = await fetch(`${HORDE_API}/generate/status/${id}`, {
+        headers: HORDE_HEADERS
+    });
+    return await response.json();
 }
 
 async function hordeGetModels() {
-  return (await fetch(`${HORDE_API}/status/models?type=image`, { headers: HORDE_HEADERS })).json();
+    const response = await fetch(`${HORDE_API}/status/models?type=image`, {
+        headers: HORDE_HEADERS
+    });
+    return await response.json();
 }
 
-async function downloadImage(e) {
-  try {
-    const t = await fetch(e);
-    return t.ok ? await t.arrayBuffer() : null;
-  } catch (e) {
-    return console.error("[IMG] Fetch error:", e.message), null;
-  }
+async function hordeGetWorkers() {
+    const response = await fetch(`${HORDE_API}/workers`, {
+        headers: HORDE_HEADERS
+    });
+    return await response.json();
 }
 
-function base64ToBuffer(e) {
-  try {
-    const t = atob(e);
-    const a = new Uint8Array(t.length);
-    for (let e = 0; e < t.length; e++) a[e] = t.charCodeAt(e);
-    return a.buffer;
-  } catch (e) {
-    return console.error("[IMG] Base64 decode error:", e.message), null;
-  }
+// Config management
+async function getConfig(env) {
+    const stored = await Redis.get("config", "json");
+    return { ...DEFAULT_CONFIG, ...(stored || {}) };
 }
 
-function bufferSizeKB(e) {
-  return Math.round(e.byteLength / 1024);
+async function saveConfig(env, config) {
+    await Redis.set("config", config);
 }
 
-async function deliverImage(e, t, a, n, s) {
-  if (!a) return s && await e.send(s, "❌ Нет данных картинки от воркера"), { sent: false, tooSmall: false, sizeKB: 0 };
-  const o = isHttpUrl(a);
-  let i = null;
-  if (o) {
-    if (i = await downloadImage(a), !i) return (await e.sendPhotoUrl(t, a, n)).ok ? { sent: true, tooSmall: false, sizeKB: 0 } : { sent: false, tooSmall: false, sizeKB: 0 };
-  } else if (i = base64ToBuffer(a), !i) return { sent: false, tooSmall: false, sizeKB: 0 };
-  const r = bufferSizeKB(i);
-  if (r < 10) return s && await e.send(s, `🚫 <b>Похоже на заглушку/цензуру</b>\nРазмер: ${r}KB (норма > 10KB)`), { sent: false, tooSmall: true, sizeKB: r };
-  let c = await e.sendPhoto(t, i, n);
-  return c.ok ? { sent: true, tooSmall: false, sizeKB: r } : (console.log("[IMG] sendPhoto failed, trying sendDocument:", c.description), c = await e.sendDocument(t, i, n), c.ok || o && (await e.sendPhotoUrl(t, a, n)).ok ? { sent: true, tooSmall: false, sizeKB: r } : (s && await e.send(s, `❌ Не удалось отправить изображение: ${escapeHtml(c.description || "unknown error")}`), { sent: false, tooSmall: false, sizeKB: r }));
-}
-
-const P = {
-  angle: ["from above", "low angle", "eye level", "dutch angle", "bird's eye view", "extreme close-up", "wide establishing shot", "portrait framing", "three-quarter view", "profile view", "from behind", "over the shoulder"],
-  light: ["golden hour sunlight", "blue hour twilight", "dramatic chiaroscuro", "soft overcast light", "neon cyberpunk glow", "moonlit night", "studio rim lighting", "dappled forest light", "harsh midday shadows", "candlelit ambiance", "volumetric god rays", "backlit silhouette"],
-  style: ["photorealistic photography", "digital concept art", "oil painting", "watercolor washes", "anime cel shading", "dark fantasy illustration", "hyperrealistic 8k render", "film noir", "surrealist dreamlike", "pop art", "renaissance painting", "vaporwave aesthetic"],
-  mood: ["serene and peaceful", "intense and dramatic", "mysterious and enigmatic", "vibrant and energetic", "ethereal and dreamlike", "dark and brooding", "warm and intimate", "epic and grandiose", "melancholic and wistful", "playful and whimsical"],
-  detail: ["intricate filigree details", "rough textured surfaces", "smooth polished finish", "ornate decoration", "minimalist clean lines", "weathered aged patina", "crystalline sharp focus", "beautiful bokeh", "particle effects", "reflections and refractions"]
+// Prompt enhancement with LLM
+const PROMPT_DIRECTIVES = {
+    "focus on unusual creative perspective": "Emphasize unique viewpoint and composition",
+    "emphasize dramatic lighting": "Add strong contrast and shadows",
+    "place in unexpected environment": "Put subject in surprising setting",
+    "focus on intricate textures": "Highlight detailed surfaces and materials",
+    "use bold unconventional colors": "Apply vibrant unusual color palette",
+    "capture dynamic motion": "Show movement and energy",
+    "create atmospheric scene": "Add mood and ambiance",
+    "use extreme framing": "Very close-up or very wide shot",
+    "cinematic composition": "Movie-like framing and style",
+    "add weather effects": "Include rain, snow, fog, etc.",
+    "focus on reflections": "Emphasize mirrors and reflective surfaces",
+    "futuristic aesthetic": "Apply sci-fi futuristic style"
 };
 
-function pick(e) {
-  return e[Math.floor(Math.random() * e.length)];
+function parsePromptDirectives(basePrompt) {
+    const directives = [];
+    let cleanPrompt = basePrompt;
+    
+    // Extract directives from [brackets]
+    const regex = /\[([^\]]+)\]/g;
+    let match;
+    while ((match = regex.exec(basePrompt)) !== null) {
+        const directive = match[1].toLowerCase().trim();
+        directives.push(directive);
+        cleanPrompt = cleanPrompt.replace(match[0], "");
+    }
+    
+    return {
+        cleanPrompt: cleanPrompt.trim(),
+        directives: directives
+    };
 }
 
-function pickN(e, t) {
-  return [...e].sort(() => Math.random() - 0.5).slice(0, t);
-}
-
-function templatePrompt(e) {
-  return [e, pick(P.angle), pick(P.light), pick(P.style), pick(P.mood), ...pickN(P.detail, 2), "masterpiece", "best quality", "highly detailed"].join(", ");
-}
-
-async function llmPrompt(e, t, a) {
-  const n = ["Focus on unusual creative perspective", "Emphasize dramatic lighting and deep shadows", "Place subject in unexpected environment", "Focus on intricate textures and micro-details", "Use bold unconventional color palette", "Capture dynamic motion and energy", "Create contemplative atmospheric scene", "Use extreme framing — very close or very wide", "Create cinematic movie composition", "Add weather effects — rain, snow, fog", "Focus on reflections and mirror surfaces", "Give it futuristic sci-fi aesthetic"];
-  try {
-    const s = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${t}`, "HTTP-Referer": "https://t.me", "X-Title": "TgImageBot" },
-      body: JSON.stringify({
-        model: a || "meta-llama/llama-3.1-8b-instruct:free",
-        messages: [
-          { role: "system", content: `You are a Stable Diffusion prompt engineer. Output ONLY comma-separated descriptive phrases. No explanations, no quotes, no markdown. Under 100 words. Be creative and unique. Direction: ${pick(n)}. If the user request contains instructions in [square brackets], incorporate them creatively into the prompt as specific style or content directives.` },
-          { role: "user", content: `Create a unique detailed image generation prompt for: ${e}` }
-        ],
-        temperature: 1.3,
-        max_tokens: 200
-      })
-    });
-    const o = await s.json();
-    const i = o.choices?.[0]?.message?.content?.trim().replace(/^["'`*]+|["'`*]+$/g, "");
-    if (i?.length > 10) return i;
-  } catch (e) {
-    console.error("[LLM]", e.message);
-  }
-  return templatePrompt(e);
-}
-
-async function generatePrompt(e, t) {
-  if (t.OPENROUTER_API_KEY) {
-    const a = await getConfig(t);
-    return llmPrompt(e, t.OPENROUTER_API_KEY, a.llmModel || t.LLM_MODEL || "meta-llama/llama-3.1-8b-instruct:free");
-  }
-  return templatePrompt(e);
-}
-
-async function generateAICaption(e, t, a) {
-  if (!a.OPENROUTER_API_KEY || !e) return e ? `🎨 <i>${escapeHtml(e.substring(0, 200))}</i>` : "";
-  const n = t.llmModel || a.LLM_MODEL || "google/gemma-2-9b-it:free";
-  try {
-    const s = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${a.OPENROUTER_API_KEY}`, "HTTP-Referer": "https://t.me", "X-Title": "TgImageBot" },
-      body: JSON.stringify({
-        model: n,
-        messages: [
-          { role: "system", content: t.captionInstruction || DEFAULT_CONFIG.captionInstruction },
-          { role: "user", content: `Промпт изображения: ${e}\n\nНапиши подпись:` }
-        ],
-        temperature: 0.9,
-        max_tokens: 150
-      })
-    });
-    const o = await s.json();
-    const i = o.choices?.[0]?.message?.content?.trim();
-    if (i?.length > 10) return i;
-  } catch (e) {
-    console.error("[CAPTION LLM]", e.message);
-  }
-  return e ? `🎨 <i>${escapeHtml(e.substring(0, 200))}</i>` : "";
-}
-
-async function getSendCaption(e, t, a) {
-  switch (t.captionMode) {
-    case 0: return "";
-    case 1: return e ? `🎨 <i>${escapeHtml(e.substring(0, 300))}</i>` : "";
-    case 2: return await generateAICaption(e, t, a);
-    default: return "";
-  }
-}
-
-async function getStatusResponse(e, t) {
-  let a = 0;
-  try { a = (await KV.list(t, "pending:")).keys.length; } catch {}
-  const n = await getWorkerBlacklist(t);
-  const s = (e.loras || []).map(e => `  • <code>${escapeHtml(e.name)}</code> (${e.strength})`).join("\n") || "  none";
-  const r = `📊 <b>Status</b>\n\n<b>Autopost:</b> ${e.enabled ? "🟢 ON" : "🔴 OFF"}\n<b>Chat (группа):</b> <code>${e.chatId || "—"}</code>\n<b>Channel:</b> <code>${e.channelId || "—"}</code>\n<b>Interval:</b> ${e.interval} min.\n<b>Count:</b> ${e.count}\n\n<b>Prompt:</b>\n<code>${escapeHtml(e.generalPrompt || "—")}</code>\n\n<b>Model:</b> <code>${escapeHtml(e.model)}</code>\n<b>Size:</b> ${e.width}×${e.height}\n<b>Steps:</b> ${e.steps} | <b>CFG:</b> ${e.cfgScale}\n<b>Sampler:</b> ${e.sampler}\n<b>CLIP Skip:</b> ${e.clipSkip || 1}\n<b>NSFW:</b> ${e.nsfw ? "🔞 yes" : "no"}\n<b>Post-processing:</b> ${e.postProcessing?.length ? e.postProcessing.join(", ") : "нет"}\n\n<b>Negative:</b>\n<code>${escapeHtml(e.negativePrompt)}</code>\n\n<b>LoRA:</b>\n${s}\n\n<b>Caption mode:</b> ${["Нет подписи", "Только промпт", "🤖 AI-генерация"][e.captionMode || 0]}\n<b>LLM:</b> <code>${escapeHtml(e.llmModel || t.LLM_MODEL || "auto")}</code>\n<b>Queue:</b> ${a}\n<b>Blacklist:</b> ${n.length} workers`;
-  return { text: r, keyboard: { inline_keyboard: [[{ text: e.enabled ? "🔴 Отключить автопост" : "🟢 Включить автопост", callback_data: "toggle:enabled" }], [{ text: "📝 Промпт", callback_data: "hint:setprompt" }, { text: "🎨 Модель / LoRA", callback_data: "hint:setmodel" }], [{ text: "🔄 Обновить статус", callback_data: "refresh:status" }]] } };
-}
-
-async function handleCallback(e, t) {
-  if (!t.TELEGRAM_BOT_TOKEN) return;
-  const a = new Telegram(t.TELEGRAM_BOT_TOKEN);
-  try { await a.api("answerCallbackQuery", { callback_query_id: e.id }); } catch {}
-  const n = e.data || "";
-  const s = e.message?.chat?.id;
-  const r = e.message?.message_id;
-  if (!s || !r) return;
-  let o = await getConfig(t);
-  if (o.adminId !== e.from?.id) return void await a.api("answerCallbackQuery", { callback_query_id: e.id, text: "🔒 Только для админа", show_alert: true });
-  if ("toggle:enabled" === n) {
-    o.enabled = !o.enabled;
-    await saveConfig(t, o);
-    const { text: e, keyboard: n } = await getStatusResponse(o, t);
-    await a.api("editMessageText", { chat_id: s, message_id: r, text: e, parse_mode: "HTML", reply_markup: n });
-  } else if ("refresh:status" === n) {
-    const { text: e, keyboard: n } = await getStatusResponse(o, t);
-    await a.api("editMessageText", { chat_id: s, message_id: r, text: e, parse_mode: "HTML", reply_markup: n });
-  } else if (n.startsWith("hint:")) {
-    const t = n.split(":")[1];
-    const o = "setprompt" === t ? "Отправь /setprompt <новый текст темы>" : "setmodel" === t ? "Отправь /setmodel <имя модели> или /listmodels" : "Неизвестная подсказка";
-    await a.send(s, `💡 ${o}`);
-  }
-}
-
-async function handleCommand(e, t) {
-  const a = e.chat.id;
-  const n = e.from?.id;
-  const s = e.text || "";
-  if (!t.TELEGRAM_BOT_TOKEN) return;
-  const o = new Telegram(t.TELEGRAM_BOT_TOKEN);
-  const i = s.split(/\s+/);
-  const r = i[0].split("@")[0].toLowerCase();
-  const c = i.slice(1);
-  if ("/ping" === r) {
-    const e = getApiKey(t);
-    return void await o.send(a, `🏓 <b>Pong!</b>\n\n📍 Chat: <code>${a}</code>\n👤 User: <code>${n}</code>\n💾 Redis: ${t.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde: ${"0000000000" === e ? "🔴 anonymous (NSFW will not work)" : "✅ " + e.substring(0, 8) + "..."}\n🤖 OpenRouter: ` + (t.OPENROUTER_API_KEY ? "✅" : "⚠️ templates"));
-  }
-  if ("/diagnostic" === r) {
-    const e = getApiKey(t);
-    const n = await getWorkerBlacklist(t);
-    return void await o.send(a, `🔧 <b>Diagnostics</b>\n\n💾 Redis: ${t.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🔑 Horde key: ${"0000000000" === e ? "🔴 anonymous" : "✅ " + e.substring(0, 8) + "..."}\n🤖 OpenRouter: ${t.OPENROUTER_API_KEY ? "✅" : "⚠️"}\n\n<b>Request flags:</b>\n  nsfw: true\n  censor_nsfw: false\n  trusted_workers: false\n  replacement_filter: true\n  r2: true\n  allow_downgrade: true\n\n🚫 Blacklisted workers: <b>${n.length}</b>\n📏 Min image size: 10KB\n\n<b>Censorship detection:</b>\n  1. gen_metadata[].type=="censorship"\n  2. gen.censored === true\n  3. gen.state === "censored"\n  4. size < 10KB`);
-  }
-  if ("/checkkey" === r) {
-    await o.send(a, "🔑 Checking Horde key...");
-    const e = await hordeCheckKey(t);
-    if (!e.ok) return void await o.send(a, `❌ <b>Invalid key</b>\n${escapeHtml(e.err || "")}`);
-    const n = e.anon ? "🔴 <b>Anonymous key</b>\nNSFW will not work.\nRegister at stablehorde.net." : e.flagged ? "⚠️ Account flagged — censorship may happen" : "✅ Key looks fine, NSFW should work";
-    return void await o.send(a, `${e.anon ? "🔴" : "✅"} <b>${escapeHtml(e.user || "anonymous")}</b>\n\n💎 Kudos: ${e.kudos || 0}\n🛡 Trusted: ${e.trusted ? "yes" : "no"}\n🚩 Flagged: ${e.flagged ? "yes" : "no"}\n\n` + n);
-  }
-  if ("/testimg" === r) {
-    await o.send(a, "🧪 Testing image sending...");
-    const e = await o.sendPhotoUrl(a, "https://picsum.photos/512/512", "URL test");
-    await o.send(a, e.ok ? "✅ URL photo works" : `❌ URL test failed: ${escapeHtml(e.description || "")}`);
+async function enhancePromptWithLLM(basePrompt, env) {
+    const { cleanPrompt, directives } = parsePromptDirectives(basePrompt);
+    
+    // Build instruction based on directives
+    let instruction = "You are a Stable Diffusion prompt engineer. Output ONLY comma-separated descriptive phrases. No explanations, no quotes, no markdown. Under 100 words. Be creative and unique.";
+    
+    if (directives.length > 0) {
+        instruction += ` Apply these modifications: ${directives.join(", ")}.`;
+    } else {
+        // Random directive if none specified
+        const randomDirective = Object.values(PROMPT_DIRECTIVES)[Math.floor(Math.random() * Object.keys(PROMPT_DIRECTIVES).length)];
+        instruction += ` ${randomDirective}`;
+    }
+    
+    const apiKey = env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+        return generateTemplatePrompt(cleanPrompt);
+    }
+    
     try {
-      const e = await fetch("https://picsum.photos/256/256");
-      const t = await e.arrayBuffer();
-      const n = await o.sendPhoto(a, t, "Buffer test");
-      await o.send(a, n.ok ? "✅ Buffer photo works" : `❌ Buffer test failed: ${escapeHtml(n.description || "")}`);
+        const config = await getConfig(env);
+        const model = config.llmModel || env.LLM_MODEL || "google/gemma-2-9b-it:free";
+        
+        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKey}`,
+                "HTTP-Referer": "https://t.me",
+                "X-Title": "TgImageBot"
+            },
+            body: JSON.stringify({
+                model: model,
+                messages: [
+                    { role: "system", content: instruction },
+                    { role: "user", content: `Create a unique detailed image generation prompt for: ${cleanPrompt}` }
+                ],
+                temperature: 1.3,
+                max_tokens: 200
+            })
+        });
+        
+        const data = await response.json();
+        const enhanced = data.choices?.[0]?.message?.content?.trim()
+            .replace(/^["'`*]+|["'`*]+$/g, "");
+        
+        if (enhanced?.length > 10) {
+            return enhanced;
+        }
     } catch (e) {
-      await o.send(a, `❌ ${escapeHtml(e.message)}`);
+        console.error("[LLM] Error:", e.message);
     }
-    return;
-  }
-  if ("/testsfw" === r) {
-    if (!t.UPSTASH_REDIS_REST_URL) return void await o.send(a, "❌ Upstash Redis не настроен!");
-    const e = await getConfig(t);
-    const n = "beautiful mountain landscape, crystal clear lake, sunset sky, orange and pink clouds, pine trees, snow capped peaks, nature photography, 4k, masterpiece, best quality, highly detailed, sharp focus";
-    await o.send(a, "🧪 Sending SFW test generation to Horde...");
-    try {
-      const s = await hordeSubmit(n, e, t, { skipLoras: true });
-      if (s.id) {
-        await KV.put(t, `pending:${s.id}`, JSON.stringify({ chatId: a, prompt: n, at: Date.now(), notify: a, debug: true, retries: 99, sfwTest: true }), { expirationTtl: 3600 });
-        await o.send(a, `📤 ID: <code>${s.id}</code>\n⏳ Wait for cron...`);
-      } else await o.send(a, `❌ Horde: <code>${escapeHtml(JSON.stringify(s).substring(0, 400))}</code>`);
-    } catch (e) {
-      await o.send(a, `❌ ${escapeHtml(e.message)}`);
-    }
-    return;
-  }
-  if (!t.UPSTASH_REDIS_REST_URL) return void await o.send(a, "❌ Upstash Redis не настроен! Используй /diagnostic");
-  let l = await getConfig(t);
-  if (!l.adminId) {
-    l.adminId = n;
-    await saveConfig(t, l);
-    await o.send(a, `👑 You are admin. ID: <code>${n}</code>`);
-  }
-  if (l.adminId === n) {
-    switch (r) {
-      case "/start":
-      case "/help": {
-        await o.send(a, "🤖 <b>Image Bot</b>\n\n<b>Basics:</b>\n/setchat — set post chat\n/setprompt &lt;text&gt; — main theme\n/setinterval &lt;min&gt; — interval\n/setcount &lt;1-10&gt; — amount\n/enable | /disable — auto mode\n/generate — generate now\n\n<b>Model and LoRA:</b>\n/setmodel &lt;name&gt;\n/listmodels — top-40 models\n/searchlora &lt;query&gt;\n/addlora &lt;version_id&gt; [strength] [clip]\n/removelora &lt;id&gt; | /listloras\n\n<b>Params:</b>\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt;\n/setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setneg &lt;text&gt; | /setclipskip &lt;1-4&gt;\n/setllm &lt;model_id&gt;\n\n<b>Autopost captions + channel:</b>\n/setcaption none | prompt | ai\n/setcaptioninstr &lt;инструкция ИИ&gt;\n/setchannel &lt;@канал или ID&gt;\n/unsetchannel\n\n<b>Horde улучшайзеры (лица и т.д.):</b>\n/addpostproc GFPGAN\n/removepostproc GFPGAN\n/listpostproc\n\n<b>Management:</b>\n/status | /pending | /cancel\n/workerbl | /clearworkerbl\n/checkkey | /diagnostic | /testsfw | /testimg\n\nИспользуй /status — там удобные кнопки!");
-        break;
-      }
-      case "/setchat": {
-        l.chatId = a;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Post chat set: <code>${a}</code>`);
-        break;
-      }
-      case "/setprompt": {
-        const promptText = c.join(" ");
-        if (!promptText) { await o.send(a, "❌ /setprompt &lt;theme&gt;"); break; }
-        l.generalPrompt = promptText;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Prompt:\n<code>${escapeHtml(promptText)}</code>`);
-        break;
-      }
-      case "/setinterval": {
-        const interval = parseInt(c[0], 10);
-        if (Number.isNaN(interval) || interval < 1) { await o.send(a, "❌ /setinterval &lt;minutes&gt; (min 1)"); break; }
-        l.interval = interval;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Interval: ${interval} min`);
-        break;
-      }
-      case "/setcount": {
-        const count = parseInt(c[0], 10);
-        if (Number.isNaN(count) || count < 1 || count > 10) { await o.send(a, "❌ /setcount &lt;1-10&gt;"); break; }
-        l.count = count;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Count: ${count}`);
-        break;
-      }
-      case "/setmodel": {
-        const modelName = c.join(" ");
-        if (!modelName) { await o.send(a, "❌ /setmodel &lt;name&gt;\nUse /listmodels"); break; }
-        l.model = modelName;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Model: <code>${escapeHtml(modelName)}</code>`);
-        break;
-      }
-      case "/listmodels": {
-        await o.send(a, "⏳ Loading model list...");
-        try {
-          const models = await hordeGetModels();
-          const filtered = (Array.isArray(models) ? models : []).filter(m => m.count > 0).sort((a, b) => b.count - a.count).slice(0, 40);
-          let text = "📋 <b>Models (top-40 by workers):</b>\n\n";
-          for (const m of filtered) text += `${m.name?.includes("XL") || m.name?.includes("SDXL") ? "🟢" : "⚪"} <code>${escapeHtml(m.name || "?")}</code> (${m.count}w)\n`;
-          text += "\n🟢 = SDXL  ⚪ = SD1.5\nCopy name: /setmodel &lt;name&gt;";
-          await o.send(a, text);
-        } catch (err) {
-          await o.send(a, `❌ ${escapeHtml(err.message)}`);
-        }
-        break;
-      }
-      case "/searchlora": {
-        const query = c.join(" ");
-        if (!query) { await o.send(a, "❌ /searchlora &lt;query in English&gt;"); break; }
-        await o.send(a, "🔍 Searching CivitAI...");
-        try {
-          const url = `https://civitai.com/api/v1/models?types=LORA&query=${encodeURIComponent(query)}&limit=10&sort=Highest%20Rated&nsfw=true`;
-          const data = await (await fetch(url)).json();
-          if (!data.items?.length) { await o.send(a, "😕 Nothing found"); break; }
-          let text = `🔍 <b>LoRA: "${escapeHtml(query)}"</b>\n\n`;
-          for (const item of data.items.slice(0, 10)) {
-            const version = item.modelVersions?.[0];
-            const id = version?.id || "?";
-            text += `${item.nsfw ? "🔞" : "✅"} <b>${escapeHtml(item.name)}</b> [${escapeHtml(version?.baseModel || "?")}]\n`;
-            text += `   ➕ <code>/addlora ${id} 0.8</code>\n\n`;
-          }
-          await o.send(a, text);
-        } catch (err) {
-          await o.send(a, `❌ ${escapeHtml(err.message)}`);
-        }
-        break;
-      }
-      case "/addlora": {
-        const id = c[0];
-        const strength = parseFloat(c[1]) || 0.8;
-        const clip = parseFloat(c[2]) || 1;
-        if (!id) { await o.send(a, "❌ /addlora &lt;civitai_version_id&gt; [strength=0.8] [clip=1]"); break; }
-        l.loras = (l.loras || []).filter(lora => String(lora.name) !== String(id));
-        l.loras.push({ name: id, strength, clip });
-        await saveConfig(t, l);
-        await o.send(a, `✅ LoRA <code>${escapeHtml(id)}</code> (strength: ${strength}, clip: ${clip})`);
-        break;
-      }
-      case "/removelora": {
-        const id = c[0];
-        if (!id) { await o.send(a, "❌ /removelora &lt;id&gt;"); break; }
-        l.loras = (l.loras || []).filter(lora => String(lora.name) !== String(id));
-        await saveConfig(t, l);
-        await o.send(a, `✅ LoRA <code>${escapeHtml(id)}</code> removed`);
-        break;
-      }
-      case "/listloras": {
-        const lorasList = l.loras || [];
-        if (!lorasList.length) { await o.send(a, "📋 No LoRA yet. Use /searchlora"); break; }
-        let text = "📋 <b>Your LoRA:</b>\n\n";
-        lorasList.forEach((lora, idx) => { text += `${idx + 1}. <code>${escapeHtml(lora.name)}</code> (str: ${lora.strength}, clip: ${lora.clip})\n   ❌ /removelora ${escapeHtml(lora.name)}\n\n`; });
-        await o.send(a, text);
-        break;
-      }
-      case "/setsize": {
-        let w = parseInt(c[0], 10);
-        let h = parseInt(c[1], 10);
-        if (Number.isNaN(w) || Number.isNaN(h) || w < 256 || h < 256 || w > 2048 || h > 2048) {
-          await o.send(a, "❌ /setsize &lt;W&gt; &lt;H&gt; (256-2048, multiple of 64)\n\n<code>/setsize 1024 1024</code> — square\n<code>/setsize 832 1216</code> — portrait\n<code>/setsize 1216 832</code> — landscape");
-          break;
-        }
-        l.width = 64 * Math.round(w / 64);
-        l.height = 64 * Math.round(h / 64);
-        await saveConfig(t, l);
-        await o.send(a, `✅ Size: ${l.width}×${l.height}`);
-        break;
-      }
-      case "/setsteps": {
-        const steps = parseInt(c[0], 10);
-        if (Number.isNaN(steps) || steps < 1 || steps > 150) { await o.send(a, "❌ /setsteps &lt;1-150&gt;"); break; }
-        l.steps = steps;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Steps: ${steps}`);
-        break;
-      }
-      case "/setcfg": {
-        const cfg = parseFloat(c[0]);
-        if (Number.isNaN(cfg) || cfg < 1 || cfg > 30) { await o.send(a, "❌ /setcfg &lt;1-30&gt;"); break; }
-        l.cfgScale = cfg;
-        await saveConfig(t, l);
-        await o.send(a, `✅ CFG: ${cfg}`);
-        break;
-      }
-      case "/setsampler": {
-        const samplers = ["k_euler", "k_euler_a", "k_lms", "k_heun", "k_dpm_2", "k_dpm_2_a", "k_dpmpp_2s_a", "k_dpmpp_2m", "k_dpmpp_sde", "DDIM"];
-        const samplerName = c[0];
-        if (!samplerName || !samplers.includes(samplerName)) { await o.send(a, "❌ Available samplers:\n" + samplers.map(s => `<code>${s}</code>`).join("\n")); break; }
-        l.sampler = samplerName;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Sampler: ${samplerName}`);
-        break;
-      }
-      case "/setneg": {
-        l.negativePrompt = c.join(" ") || DEFAULT_CONFIG.negativePrompt;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Negative prompt:\n<code>${escapeHtml(l.negativePrompt)}</code>`);
-        break;
-      }
-      case "/setclipskip": {
-        const clipSkipVal = parseInt(c[0], 10);
-        if (Number.isNaN(clipSkipVal) || clipSkipVal < 1 || clipSkipVal > 4) { await o.send(a, "❌ /setclipskip &lt;1-4&gt;"); break; }
-        l.clipSkip = clipSkipVal;
-        await saveConfig(t, l);
-        await o.send(a, `✅ CLIP Skip: ${clipSkipVal}`);
-        break;
-      }
-      case "/setllm": {
-        const llm = c.join(" ");
-        if (!llm) {
-          await o.send(a, "❌ /setllm &lt;model_id&gt;\n\n<b>Free OpenRouter models:</b>\n<code>meta-llama/llama-3.1-8b-instruct:free</code>\n<code>google/gemma-2-9b-it:free</code>\n<code>mistralai/mistral-7b-instruct:free</code>\n<code>qwen/qwen-2-7b-instruct:free</code>");
-          break;
-        }
-        l.llmModel = llm;
-        await saveConfig(t, l);
-        await o.send(a, `✅ LLM: <code>${escapeHtml(llm)}</code>`);
-        break;
-      }
-      case "/setcaption": {
-        const modeStr = c[0]?.toLowerCase() || "";
-        const mode = "prompt" === modeStr || "1" === modeStr ? 1 : "ai" === modeStr || "2" === modeStr ? 2 : 0;
-        l.captionMode = mode;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Режим подписи: ${0 === mode ? "без" : 1 === mode ? "промпт" : "🤖 AI"}`);
-        break;
-      }
-      case "/setcaptioninstr": {
-        const instr = c.join(" ");
-        if (!instr) { await o.send(a, "❌ /setcaptioninstr &lt;инструкция для ИИ&gt;"); break; }
-        l.captionInstruction = instr;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Инструкция для AI-подписи обновлена`);
-        break;
-      }
-      case "/setchannel": {
-        const channel = c[0];
-        if (!channel) { await o.send(a, "❌ /setchannel &lt;@username или chat ID&gt;"); break; }
-        l.channelId = channel;
-        await saveConfig(t, l);
-        await o.send(a, `✅ Канал для автопоста: <code>${escapeHtml(channel)}</code>\nГруппа остаётся активной: <code>${l.chatId || "—"}</code>`);
-        break;
-      }
-      case "/unsetchannel": {
-        l.channelId = null;
-        await saveConfig(t, l);
-        await o.send(a, "✅ Канал отвязан (группа работает как раньше)");
-        break;
-      }
-      case "/addpostproc": {
-        const proc = c[0];
-        if (!proc) { await o.send(a, "❌ /addpostproc &lt;GFPGAN | CodeFormer&gt;"); break; }
-        l.postProcessing = l.postProcessing || [];
-        if (!l.postProcessing.includes(proc)) l.postProcessing.push(proc);
-        await saveConfig(t, l);
-        await o.send(a, `✅ Post-processing <code>${escapeHtml(proc)}</code> добавлен (улучшайзеры лиц и т.д.)`);
-        break;
-      }
-      case "/removepostproc": {
-        const proc = c[0];
-        if (!proc) { await o.send(a, "❌ /removepostproc &lt;name&gt;"); break; }
-        l.postProcessing = (l.postProcessing || []).filter(p => p !== proc);
-        await saveConfig(t, l);
-        await o.send(a, `✅ Post-processing <code>${escapeHtml(proc)}</code> удалён`);
-        break;
-      }
-      case "/listpostproc": {
-        const procs = l.postProcessing || [];
-        let text = "📋 <b>Post-processing (Horde улучшайзеры):</b>\n\n";
-        text += procs.length ? procs.map(p => `• <code>${escapeHtml(p)}</code> — /removepostproc ${escapeHtml(p)}`).join("\n") : "нет\n\nОбщие: GFPGAN (лица), CodeFormer (лучшие лица)";
-        await o.send(a, text);
-        break;
-      }
-      case "/enable": {
-        if (!l.chatId) { await o.send(a, "❌ First: /setchat"); break; }
-        if (!l.generalPrompt) { await o.send(a, "❌ First: /setprompt"); break; }
-        l.enabled = true;
-        await saveConfig(t, l);
-        await o.send(a, `🟢 Autoposting enabled!\nInterval: ${l.interval} min.\nCount: ${l.count}`);
-        break;
-      }
-      case "/disable": {
-        l.enabled = false;
-        await saveConfig(t, l);
-        await o.send(a, "🔴 Autoposting disabled");
-        break;
-      }
-      case "/status": {
-        const { text: statusText, keyboard: kb } = await getStatusResponse(l, t);
-        await o.send(a, statusText, { reply_markup: kb });
-        break;
-      }
-      case "/generate": {
-        if (!l.generalPrompt) { await o.send(a, "❌ First: /setprompt"); break; }
-        const targetChat = l.chatId || a;
-        await o.send(a, `⏳ Generating ${l.count} images...`);
-        const blacklist = (await getWorkerBlacklist(t)).map(w => w.id).filter(Boolean);
-        for (let i = 0; i < l.count; i++) {
-          try {
-            const prompt = await generatePrompt(l.generalPrompt, t);
-            await o.send(a, `🎨 #${i + 1}:\n<code>${escapeHtml(prompt.substring(0, 300))}</code>`);
-            const result = await hordeSubmit(prompt, l, t, { workerBlacklist: blacklist });
-            if (result.id) {
-              await KV.put(t, `pending:${result.id}`, JSON.stringify({ chatId: targetChat, prompt, at: Date.now(), notify: a, retries: 0 }), { expirationTtl: 3600 });
-              await o.send(a, `📤 ID: <code>${result.id}</code>`);
-            } else await o.send(a, `❌ Horde: <code>${escapeHtml(JSON.stringify(result).substring(0, 300))}</code>`);
-          } catch (err) {
-            await o.send(a, `❌ ${escapeHtml(err.message)}`);
-          }
-        }
-        break;
-      }
-      case "/pending": {
-        const pendingList = await KV.list(t, "pending:");
-        if (!pendingList.keys.length) { await o.send(a, "📋 Queue is empty"); break; }
-        let text = `📋 <b>In queue: ${pendingList.keys.length}</b>\n\n`;
-        for (const item of pendingList.keys.slice(0, 10)) {
-          const id = item.name.replace("pending:", "");
-          try {
-            const check = await hordeCheck(id);
-            text += `🔸 <code>${id}</code>\n   ${check.done ? "✅ Ready" : check.processing ? "⚙️ Processing" : `⏳ Queue #${check.queue_position || "?"}`} | ~${check.wait_time || 0}s\n\n`;
-          } catch {
-            text += `🔸 <code>${id}</code> — failed to check\n\n`;
-          }
-        }
-        await o.send(a, text);
-        break;
-      }
-      case "/cancel": {
-        const pendingList = await KV.list(t, "pending:");
-        await Promise.all(pendingList.keys.map(item => KV.del(t, item.name)));
-        await o.send(a, `🗑 Removed from queue: ${pendingList.keys.length}`);
-        break;
-      }
-      case "/workerbl": {
-        const bl = await getWorkerBlacklist(t);
-        if (!bl.length) { await o.send(a, "📋 Worker blacklist is empty"); break; }
-        let text = `🚫 <b>Worker blacklist: ${bl.length}</b>\n\n`;
-        for (const w of bl) text += `• <code>${escapeHtml(w.name || "?")}</code>\n  ID: <code>${escapeHtml(w.id)}</code>\n  ${new Date(w.t).toISOString().slice(0, 10)}\n\n`;
-        text += "/clearworkerbl — clear blacklist";
-        await o.send(a, text);
-        break;
-      }
-      case "/clearworkerbl": {
-        await clearWorkerBlacklist(t);
-        await o.send(a, "✅ Worker blacklist cleared");
-        break;
-      }
-      default:
-        if (r.startsWith("/")) await o.send(a, "❓ Unknown command — /help");
-    }
-  } else await o.send(a, `🔒 Admin only (ID: ${l.adminId})`);
+    
+    return generateTemplatePrompt(cleanPrompt);
 }
 
-async function processScheduled(e) {
-  if (!e.TELEGRAM_BOT_TOKEN || !e.UPSTASH_REDIS_REST_URL || !e.UPSTASH_REDIS_REST_TOKEN) return;
-  const t = new Telegram(e.TELEGRAM_BOT_TOKEN);
-  const a = await getConfig(e);
-  for (const s of (await KV.list(e, "pending:")).keys) {
-    const n = s.name.replace("pending:", "");
+function generateTemplatePrompt(basePrompt) {
+    const angles = ["from above", "low angle", "eye level", "dutch angle", "bird's eye view", "extreme close-up", "wide establishing shot"];
+    const lighting = ["golden hour sunlight", "dramatic chiaroscuro", "soft overcast light", "neon cyberpunk glow", "moonlit night", "studio rim lighting"];
+    const styles = ["photorealistic photography", "digital concept art", "oil painting", "anime cel shading", "dark fantasy illustration", "hyperrealistic 8k render"];
+    const moods = ["serene and peaceful", "intense and dramatic", "mysterious and enigmatic", "vibrant and energetic", "ethereal and dreamlike"];
+    
+    const parts = [
+        basePrompt,
+        angles[Math.floor(Math.random() * angles.length)],
+        lighting[Math.floor(Math.random() * lighting.length)],
+        styles[Math.floor(Math.random() * styles.length)],
+        moods[Math.floor(Math.random() * moods.length)],
+        "masterpiece", "best quality", "highly detailed"
+    ];
+    
+    return parts.join(", ");
+}
+
+// Generate AI caption for post
+async function generateAICaption(prompt, imageDescription, env) {
+    const apiKey = env.OPENROUTER_API_KEY;
+    if (!apiKey) return prompt;
+    
+    const config = await getConfig(env);
+    const customInstruction = config.captionPrompt || "Describe this image in an engaging way for social media.";
+    
     try {
-      const o = await KV.get(e, s.name, "json");
-      if (!o) { await KV.del(e, s.name); continue; }
-      if (Date.now() - o.at > 12e5) {
-        await KV.del(e, s.name);
-        o.notify && await t.send(o.notify, `⏰ Generation timeout: <code>${n}</code>`);
-        continue;
-      }
-      if (!(await hordeCheck(n)).done) continue;
-      const i = await hordeGetResult(n);
-      await KV.del(e, s.name);
-      if (i.faulted) {
-        o.notify && await t.send(o.notify, `❌ Generation <code>${n}</code> failed`);
-        continue;
-      }
-      const r = i.generations || [];
-      if (!r.length) {
-        o.notify && await t.send(o.notify, `❌ No generations returned for <code>${n}</code>`);
-        continue;
-      }
-      let c = false;
-      let l = false;
-      for (const gen of r) {
-        const workerId = gen.worker_id || "?";
-        const workerName = gen.worker_name || "?";
-        const censored = isCensored(gen);
-        if (o.debug && o.notify) {
-          const imgInfo = gen.img ? isHttpUrl(gen.img) ? `URL (${gen.img.substring(0, 45)}...)` : `base64 (${gen.img.length} chars)` : "null";
-          const meta = gen.gen_metadata?.length ? gen.gen_metadata.map(m => `${m.type}:${m.value}`).join(", ") : "none";
-          await t.send(o.notify, `🔍 <b>Result</b>\ncensored: ${gen.censored ? "yes" : "no"}\nstate: ${gen.state || "ok"}\ngen_metadata: ${escapeHtml(meta)}\nisCensored(): ${censored ? "yes" : "no"}\nWorker: <code>${escapeHtml(workerName)}</code>\nWorker ID: <code>${escapeHtml(workerId)}</code>\nModel: <code>${escapeHtml(gen.model || "?")}</code>\nImage: ${escapeHtml(imgInfo)}`);
+        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKey}`,
+                "HTTP-Referer": "https://t.me",
+                "X-Title": "TgImageBot"
+            },
+            body: JSON.stringify({
+                model: "google/gemma-2-9b-it:free",
+                messages: [
+                    { role: "system", content: `${customInstruction} Keep it under 150 words. Be creative and engaging.` },
+                    { role: "user", content: `Image prompt: ${prompt}\n\nDescription: ${imageDescription}` }
+                ],
+                temperature: 0.9,
+                max_tokens: 250
+            })
+        });
+        
+        const data = await response.json();
+        return data.choices?.[0]?.message?.content?.trim() || prompt;
+    } catch (e) {
+        console.error("[Caption AI] Error:", e.message);
+        return prompt;
+    }
+}
+
+// Download and process images
+async function downloadImage(url) {
+    try {
+        const response = await fetch(url);
+        if (!response.ok) return null;
+        return await response.arrayBuffer();
+    } catch (e) {
+        console.error("[IMG] Fetch error:", e.message);
+        return null;
+    }
+}
+
+function base64ToBuffer(base64) {
+    try {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+            bytes[i] = binary.charCodeAt(i);
         }
-        if (censored) {
-          await addWorkerToBlacklist(e, workerId, workerName);
-          l = true;
-          o.notify && await t.send(o.notify, `🔴 Worker <code>${escapeHtml(workerName)}</code> returned censorship\nAdded to blacklist and retrying...`);
-          continue;
+        return bytes.buffer;
+    } catch (e) {
+        console.error("[IMG] Base64 error:", e.message);
+        return null;
+    }
+}
+
+function bufferSizeKB(buffer) {
+    return Math.round(buffer.byteLength / 1024);
+}
+
+// Check if image is censored
+function isCensored(gen) {
+    if (!gen) return false;
+    
+    const hasMetadataCensorship = gen.gen_metadata?.some(m => m.type === "censorship");
+    const isExplicitlyCensored = gen.censored === true;
+    const isCensoredState = gen.state === "censored";
+    
+    return hasMetadataCensorship || isExplicitlyCensored || isCensoredState;
+}
+
+// Deliver image to chat
+async function deliverImage(bot, chatId, imageData, caption, notifyChat) {
+    if (!imageData) {
+        if (notifyChat) await bot.send(notifyChat, "❌ No image data from worker");
+        return { sent: false, tooSmall: false, sizeKB: 0 };
+    }
+    
+    let buffer = null;
+    const isUrl = isHttpUrl(imageData);
+    
+    if (isUrl) {
+        // Try send URL directly first
+        const result = await bot.sendPhotoUrl(chatId, imageData, caption);
+        if (result.ok) {
+            return { sent: true, tooSmall: false, sizeKB: 0 };
         }
-        if (!gen.img) {
-          o.notify && await t.send(o.notify, "❌ gen.img is empty");
-          continue;
+        // If failed, download and send as buffer
+        buffer = await downloadImage(imageData);
+        if (!buffer) {
+            return { sent: false, tooSmall: false, sizeKB: 0 };
         }
-        const prompt = o.prompt || "";
-        const caption = await getSendCaption(prompt, a, e);
-        const { sent: sentOk, tooSmall: tooSmallFlag, sizeKB: size } = await deliverImage(t, o.chatId, gen.img, caption, o.notify);
-        if (sentOk) c = true;
-        if (tooSmallFlag) {
-          l = true;
-          await addWorkerToBlacklist(e, workerId, workerName);
-          o.notify && await t.send(o.notify, `🚫 Worker <code>${escapeHtml(workerName)}</code> probably returned a placeholder (${size}KB)`);
+    } else {
+        buffer = base64ToBuffer(imageData);
+        if (!buffer) {
+            return { sent: false, tooSmall: false, sizeKB: 0 };
         }
-        if (a.channelId) {
-          await deliverImage(t, a.channelId, gen.img, caption, null);
+    }
+    
+    const sizeKB = bufferSizeKB(buffer);
+    
+    // Check for placeholder/censored images
+    if (sizeKB < 10) {
+        if (notifyChat) {
+            await bot.send(notifyChat, `🚫 <b>Placeholder/censored image</b>\nSize: ${sizeKB}KB (min: 10KB)`);
         }
-      }
-      if (l && !c && !o.sfwTest) {
-        const retries = (o.retries || 0) + 1;
-        if (retries < 3) {
-          try {
-            const bl = (await getWorkerBlacklist(e)).map(w => w.id).filter(Boolean);
-            const retryResult = await hordeSubmit(o.prompt, a, e, { workerBlacklist: bl });
-            if (retryResult.id) {
-              await KV.put(e, `pending:${retryResult.id}`, JSON.stringify({ ...o, at: Date.now(), retries }), { expirationTtl: 3600 });
-              o.notify && await t.send(o.notify, `🔄 Retry ${retries}/3: <code>${retryResult.id}</code>\n🚫 Blacklist: ${bl.length} workers`);
+        return { sent: false, tooSmall: true, sizeKB: sizeKB };
+    }
+    
+    // Try send as photo
+    let result = await bot.sendPhoto(chatId, buffer, caption);
+    
+    if (!result.ok) {
+        console.log("[IMG] sendPhoto failed, trying sendDocument");
+        // Try as document
+        const formData = new FormData();
+        formData.append("chat_id", String(chatId));
+        formData.append("document", new File([buffer], "image.webp", { type: "image/webp" }));
+        if (caption) {
+            formData.append("caption", caption.substring(0, 1024));
+            formData.append("parse_mode", "HTML");
+        }
+        
+        const response = await fetch(`${bot.base}/sendDocument`, {
+            method: "POST",
+            body: formData
+        });
+        result = await response.json();
+    }
+    
+    if (!result.ok && isUrl) {
+        // Last resort: try URL again
+        await bot.sendPhotoUrl(chatId, imageData, caption);
+    }
+    
+    if (!result.ok && notifyChat) {
+        await bot.send(notifyChat, `❌ Failed to send image: ${escapeHtml(result.description || "unknown error")}`);
+    }
+    
+    return { sent: result.ok, tooSmall: false, sizeKB: sizeKB };
+}
+
+// Add worker to blacklist
+async function addWorkerToBlacklist(env, workerId, workerName) {
+    if (!workerId || workerId === "?" || String(workerId).length < 10) return;
+    
+    let blacklist = await Redis.get("worker_blacklist", "json") || [];
+    
+    if (!blacklist.find(w => w.id === workerId)) {
+        blacklist.push({
+            id: workerId,
+            name: workerName || "?",
+            t: Date.now()
+        });
+        
+        // Keep only last 30
+        while (blacklist.length > 30) {
+            blacklist.shift();
+        }
+        
+        await Redis.set("worker_blacklist", blacklist);
+        console.log(`[BL] Added worker: ${workerName} (${workerId})`);
+    }
+}
+
+async function clearWorkerBlacklist(env) {
+    await Redis.set("worker_blacklist", []);
+}
+
+// Command handlers with inline keyboards
+async function handleCommand(message, env) {
+    const chatId = message.chat.id;
+    const userId = message.from?.id;
+    const text = message.text || "";
+    
+    if (!env.TELEGRAM_BOT_TOKEN) return;
+    
+    const bot = new Telegram(env.TELEGRAM_BOT_TOKEN);
+    const parts = text.split(/\s+/);
+    const cmd = parts[0].split("@")[0].toLowerCase();
+    const args = parts.slice(1);
+    
+    // Public commands
+    if (cmd === "/ping") {
+        const apiKey = getApiKey(env);
+        await bot.send(chatId, 
+            `🏓 <b>Pong!</b>\n\n` +
+            `📍 Chat: <code>${chatId}</code>\n` +
+            `👤 User: <code>${userId}</code>\n` +
+            `💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n` +
+            `🎨 Horde: ${apiKey === "0000000000" ? "🔴 anonymous" : "✅ " + apiKey.substring(0, 8) + "..."}`
+        );
+        return;
+    }
+    
+    if (cmd === "/start" || cmd === "/help") {
+        const config = await getConfig(env);
+        
+        // Set admin if not set
+        if (!config.adminId) {
+            config.adminId = userId;
+            await saveConfig(env, config);
+            await bot.send(chatId, `👑 You are now admin. ID: <code>${userId}</code>`);
+        }
+        
+        const keyboard = new InlineKeyboard()
+            .add("⚙️ Settings", "menu_settings").row()
+            .add("🎨 Models", "menu_models")
+            .add("🔧 LoRA", "menu_lora").row()
+            .add("📊 Status", "cmd_status")
+            .add("🚀 Generate", "cmd_generate").row()
+            .add("🔄 Auto-post: " + (config.enabled ? "ON" : "OFF"), "cmd_toggle_auto").row()
+            .add("📋 Queue", "cmd_pending")
+            .add("❌ Cancel All", "cmd_cancel").row()
+            .add("🔑 Check Key", "cmd_checkkey")
+            .add("🔧 Diagnostics", "cmd_diagnostic").row()
+            .build();
+        
+        await bot.send(chatId, 
+            "🤖 <b>Telegram Image Bot</b>\n\n" +
+            "Use buttons below or commands:\n\n" +
+            "<b>Quick Commands:</b>\n" +
+            "/setchat - Set target chat\n" +
+            "/setprompt <text> - Set main theme\n" +
+            "/generate - Generate now\n" +
+            "/enable | /disable - Toggle auto"
+        , { reply_markup: keyboard });
+        return;
+    }
+    
+    // Check admin
+    const config = await getConfig(env);
+    if (!config.adminId) {
+        config.adminId = userId;
+        await saveConfig(env, config);
+    }
+    
+    if (config.adminId !== userId) {
+        await bot.send(chatId, `🔒 Admin only (ID: ${config.adminId})`);
+        return;
+    }
+    
+    // Admin commands
+    switch (cmd) {
+        case "/setchat":
+            config.chatId = chatId;
+            await saveConfig(env, config);
+            await bot.send(chatId, `✅ Target chat set: <code>${chatId}</code>`);
+            break;
+            
+        case "/setprompt":
+            const prompt = args.join(" ");
+            if (!prompt) {
+                await bot.send(chatId, "❌ /setprompt <theme>");
+                return;
             }
-          } catch (err) {
-            console.error("[CRON] retry:", err.message);
-          }
-        } else o.notify && await t.send(o.notify, "❌ <b>3 attempts — all placeholders/censored</b>\n\nPossible reasons:\n• Anonymous Horde key (NSFW will not work)\n• Account flagged\n• All available workers censor this model\n\n/clearworkerbl — clear blacklist and try again");
-      }
-      c && o.notify && o.notify !== o.chatId && await t.send(o.notify, "✅ Image sent");
-    } catch (err) {
-      console.error(`[CRON] ${n}:`, err.message);
+            config.generalPrompt = prompt;
+            await saveConfig(env, config);
+            await bot.send(chatId, `✅ Prompt:\n<code>${escapeHtml(prompt)}</code>\n\n💡 Use [directives] to modify prompt:\n[focus on dramatic lighting]\n[use extreme close-up]\n[add weather effects]`);
+            break;
+            
+        case "/setinterval":
+            const interval = parseInt(args[0], 10);
+            if (isNaN(interval) || interval < 1) {
+                await bot.send(chatId, "❌ /setinterval <minutes> (min 1)");
+                return;
+            }
+            config.interval = interval;
+            await saveConfig(env, config);
+            await bot.send(chatId, `✅ Interval: ${interval} min`);
+            break;
+            
+        case "/setcount":
+            const count = parseInt(args[0], 10);
+            if (isNaN(count) || count < 1 || count > 10) {
+                await bot.send(chatId, "❌ /setcount <1-10>");
+                return;
+            }
+            config.count = count;
+            await saveConfig(env, config);
+            await bot.send(chatId, `✅ Count: ${count}`);
+            break;
+            
+        case "/enable":
+            if (!config.chatId) {
+                await bot.send(chatId, "❌ First: /setchat");
+                return;
+            }
+            if (!config.generalPrompt) {
+                await bot.send(chatId, "❌ First: /setprompt");
+                return;
+            }
+            config.enabled = true;
+            await saveConfig(env, config);
+            await bot.send(chatId, `🟢 Auto-posting enabled!\nInterval: ${config.interval} min\nCount: ${config.count}`);
+            break;
+            
+        case "/disable":
+            config.enabled = false;
+            await saveConfig(env, config);
+            await bot.send(chatId, "🔴 Auto-posting disabled");
+            break;
+            
+        case "/generate":
+            if (!config.generalPrompt) {
+                await bot.send(chatId, "❌ First: /setprompt");
+                return;
+            }
+            
+            const targetChat = config.chatId || chatId;
+            await bot.send(chatId, `⏳ Generating ${config.count} images...`);
+            
+            const blacklist = (await Redis.get("worker_blacklist", "json") || []).map(w => w.id).filter(Boolean);
+            
+            for (let i = 0; i < config.count; i++) {
+                try {
+                    const enhancedPrompt = await enhancePromptWithLLM(config.generalPrompt, env);
+                    await bot.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(enhancedPrompt.substring(0, 300))}</code>`);
+                    
+                    const result = await hordeSubmit(enhancedPrompt, config, env, { workerBlacklist: blacklist });
+                    
+                    if (result.id) {
+                        await Redis.set(`pending:${result.id}`, {
+                            chatId: targetChat,
+                            prompt: enhancedPrompt,
+                            at: Date.now(),
+                            notify: chatId,
+                            retries: 0
+                        }, { expirationTtl: 3600 });
+                        
+                        await bot.send(chatId, `📤 ID: <code>${result.id}</code>`);
+                    } else {
+                        await bot.send(chatId, `❌ Horde: <code>${escapeHtml(JSON.stringify(result).substring(0, 300))}</code>`);
+                    }
+                } catch (e) {
+                    await bot.send(chatId, `❌ ${escapeHtml(e.message)}`);
+                }
+            }
+            break;
+            
+        case "/status":
+        case "/pending":
+        case "/cancel":
+        case "/checkkey":
+        case "/diagnostic":
+        case "/setmodel":
+        case "/listmodels":
+        case "/searchlora":
+        case "/addlora":
+        case "/removelora":
+        case "/listloras":
+        case "/setsize":
+        case "/setsteps":
+        case "/setcfg":
+        case "/setsampler":
+        case "/setneg":
+        case "/setclipskip":
+        case "/setllm":
+        case "/workerbl":
+        case "/clearworkerbl":
+            // These will be handled by callback queries
+            await bot.send(chatId, `⚙️ Use inline keyboard buttons or type /help for menu`);
+            break;
+            
+        default:
+            if (cmd.startsWith("/")) {
+                await bot.send(chatId, "❓ Unknown command — /help");
+            }
     }
-  }
-  if (!a.enabled || !a.chatId || !a.generalPrompt) return;
-  if ((await KV.list(e, "pending:")).keys.length > 0) return;
-  const lastTime = parseInt(await KV.get(e, "last_post_time") || "0", 10);
-  const now = Date.now();
-  if (now - lastTime < 60 * a.interval * 1e3) return;
-  await KV.put(e, "last_post_time", String(now));
-  const blacklist = (await getWorkerBlacklist(e)).map(w => w.id).filter(Boolean);
-  for (let i = 0; i < a.count; i++) {
-    try {
-      const prompt = await generatePrompt(a.generalPrompt, e);
-      const result = await hordeSubmit(prompt, a, e, { workerBlacklist: blacklist });
-      if (result.id) await KV.put(e, `pending:${result.id}`, JSON.stringify({ chatId: a.chatId, prompt, at: now, notify: null, retries: 0 }), { expirationTtl: 3600 });
-    } catch (err) {
-      console.error("[CRON] auto:", err.message);
-    }
-  }
 }
 
-export default {
-  async fetch(e, t) {
-    const a = new URL(e.url);
-    if ("/webhook" === a.pathname) {
-      if ("POST" !== e.method) return new Response("POST only", { status: 405 });
-      try {
-        const a = await e.json();
-        a.message?.text && await handleCommand(a.message, t);
-        a.callback_query && await handleCallback(a.callback_query, t);
-      } catch (err) {
-        console.error("[WH]", err.message);
-      }
-      return new Response("OK");
-    }
-    if ("/setup" === a.pathname) {
-      if (!t.TELEGRAM_BOT_TOKEN) return new Response("No TELEGRAM_BOT_TOKEN!", { status: 500 });
-      const e = `${a.origin}/webhook`;
-      const n = await fetch(`https://api.telegram.org/bot${t.TELEGRAM_BOT_TOKEN}/setWebhook`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: e, allowed_updates: ["message", "callback_query"], drop_pending_updates: true })
-      });
-      return new Response(`Webhook: ${e}\n\n${JSON.stringify(await n.json(), null, 2)}`);
-    }
-    return "/" === a.pathname ? new Response("🤖 Telegram Image Bot is running!\nVisit /setup to configure webhook.") : new Response("Not found", { status: 404 });
-  },
-  async scheduled(e, t, a) {
+// Callback query handler
+async function handleCallback(callbackQuery, env) {
+    const bot = new Telegram(env.TELEGRAM_BOT_TOKEN);
+    const chatId = callbackQuery.message.chat.id;
+    const messageId = callbackQuery.message.message_id;
+    const data = callbackQuery.data;
+    
+    const config = await getConfig(env);
+    
     try {
-      await processScheduled(t);
-    } catch (err) {
-      console.error("[CRON] CRASH:", err.message);
+        // Main menu
+        if (data === "menu_settings") {
+            const keyboard = new InlineKeyboard()
+                .add("💬 Chat: " + (config.chatId ? "✅" : "❌"), "set_chat").row()
+                .add("📝 Prompt", "set_prompt")
+                .add("⏱️ Interval", "set_interval").row()
+                .add("🔢 Count", "set_count")
+                .add("🎯 Model", "set_model").row()
+                .add("📐 Size", "set_size")
+                .add("🔁 Steps", "set_steps").row()
+                .add("⚖️ CFG", "set_cfg")
+                .add("🎲 Sampler", "set_sampler").row()
+                .add("🎨 Negative", "set_negative").row()
+                .add("🔙 Back", "menu_main").row()
+                .build();
+            
+            await bot.editMessage(chatId, messageId, "⚙️ <b>Settings Menu</b>", { reply_markup: keyboard });
+            await bot.answerCallback(callbackQuery.id, "");
+        }
+        else if (data === "menu_models") {
+            await bot.answerCallback(callbackQuery.id, "⏳ Loading models...");
+            
+            try {
+                const models = await hordeGetModels();
+                const modelList = (Array.isArray(models) ? models : [])
+                    .filter(m => m.count > 0)
+                    .sort((a, b) => b.count - a.count)
+                    .slice(0, 40);
+                
+                let text = "📋 <b>Top 40 Models</b>\n\n";
+                modelList.forEach((m, i) => {
+                    const isSdxl = m.name?.includes("XL") || m.name?.includes("SDXL");
+                    text += `${i + 1}. ${isSdxl ? "🟢" : "⚪"} <code>${escapeHtml(m.name)}</code> (${m.count}w)\n`;
+                });
+                text += "\n🟢 = SDXL  ⚪ = SD1.5";
+                
+                const keyboard = new InlineKeyboard()
+                    .add("🔙 Back", "menu_main")
+                    .build();
+                
+                await bot.editMessage(chatId, messageId, text, { reply_markup: keyboard });
+            } catch (e) {
+                await bot.send(chatId, `❌ Error: ${escapeHtml(e.message)}`);
+            }
+        }
+        else if (data === "menu_lora") {
+            const keyboard = new InlineKeyboard()
+                .add("🔍 Search LoRA", "lora_search").row()
+                .add("📋 My LoRAs", "lora_list")
+                .add("➕ Add LoRA", "lora_add").row()
+                .add("🔙 Back", "menu_main")
+                .build();
+            
+            await bot.editMessage(chatId, messageId, "🔧 <b>LoRA Management</b>\n\nUse buttons below", { reply_markup: keyboard });
+            await bot.answerCallback(callbackQuery.id, "");
+        }
+        else if (data === "menu_main") {
+            const keyboard = new InlineKeyboard()
+                .add("⚙️ Settings", "menu_settings").row()
+                .add("🎨 Models", "menu_models")
+                .add("🔧 LoRA", "menu_lora").row()
+                .add("📊 Status", "cmd_status")
+                .add("🚀 Generate", "cmd_generate").row()
+                .add("🔄 Auto: " + (config.enabled ? "ON" : "OFF"), "cmd_toggle_auto").row()
+                .build();
+            
+            await bot.editMessage(chatId, messageId, "🤖 <b>Main Menu</b>", { reply_markup: keyboard });
+            await bot.answerCallback(callbackQuery.id, "");
+        }
+        // Settings callbacks
+        else if (data === "set_chat") {
+            config.chatId = chatId;
+            await saveConfig(env, config);
+            await bot.answerCallback(callbackQuery.id, `✅ Chat set: ${chatId}`, true);
+        }
+        else if (data === "set_prompt") {
+            await bot.answerCallback(callbackQuery.id, "Send /setprompt <text> to set", true);
+        }
+        else if (data === "set_interval") {
+            await bot.answerCallback(callbackQuery.id, "Send /setinterval <minutes>", true);
+        }
+        else if (data === "set_count") {
+            await bot.answerCallback(callbackQuery.id, "Send /setcount <1-10>", true);
+        }
+        else if (data === "set_model") {
+            await bot.answerCallback(callbackQuery.id, "Send /setmodel <name> or /listmodels", true);
+        }
+        else if (data === "set_size") {
+            await bot.answerCallback(callbackQuery.id, "Send /setsize <width> <height>\nExample: /setsize 1024 1024", true);
+        }
+        else if (data === "set_steps") {
+            await bot.answerCallback(callbackQuery.id, "Send /setsteps <1-150>", true);
+        }
+        else if (data === "set_cfg") {
+            await bot.answerCallback(callbackQuery.id, "Send /setcfg <1-30>", true);
+        }
+        else if (data === "set_sampler") {
+            const samplers = ["k_euler", "k_euler_a", "k_lms", "k_heun", "k_dpm_2", "k_dpm_2_a", "k_dpmpp_2s_a", "k_dpmpp_2m", "k_dpmpp_sde", "DDIM"];
+            let text = "🎲 <b>Available Samplers:</b>\n\n";
+            samplers.forEach(s => {
+                text += `${s === config.sampler ? "✅" : "⚪"} <code>${s}</code>\n`;
+            });
+            text += "\nSend /setsampler <name>";
+            
+            await bot.send(chatId, text);
+            await bot.answerCallback(callbackQuery.id, "");
+        }
+        else if (data === "set_negative") {
+            await bot.answerCallback(callbackQuery.id, "Send /setneg <text>", true);
+        }
+        // LoRA callbacks
+        else if (data === "lora_search") {
+            await bot.answerCallback(callbackQuery.id, "Send /searchlora <query>", true);
+        }
+        else if (data === "lora_list") {
+            const loras = config.loras || [];
+            if (!loras.length) {
+                await bot.answerCallback(callbackQuery.id, "📋 No LoRAs yet", true);
+                return;
+            }
+            
+            let text = "📋 <b>Your LoRAs:</b>\n\n";
+            loras.forEach((lora, i) => {
+                text += `${i + 1}. <code>${escapeHtml(lora.name)}</code> (str: ${lora.strength}, clip: ${lora.clip})\n`;
+                text += `   ❌ /removelora ${escapeHtml(lora.name)}\n`;
+            });
+            
+            await bot.send(chatId, text);
+            await bot.answerCallback(callbackQuery.id, "");
+        }
+        else if (data === "lora_add") {
+            await bot.answerCallback(callbackQuery.id, "Send /addlora <civitai_version_id> [strength] [clip]\nExample: /addlora 123456 0.8 1.0", true);
+        }
+        // Command callbacks
+        else if (data === "cmd_status") {
+            const pending = await Redis.scan("pending:*");
+            const blacklist = await Redis.get("worker_blacklist", "json") || [];
+            const loras = (config.loras || []).map(l => `• <code>${escapeHtml(l.name)}</code> (${l.strength})`).join("\n") || "none";
+            
+            const text = `📊 <b>Status</b>\n\n` +
+                `<b>Auto-post:</b> ${config.enabled ? "🟢 ON" : "🔴 OFF"}\n` +
+                `<b>Chat:</b> <code>${config.chatId || "—"}</code>\n` +
+                `<b>Interval:</b> ${config.interval} min\n` +
+                `<b>Count:</b> ${config.count}\n\n` +
+                `<b>Prompt:</b>\n<code>${escapeHtml(config.generalPrompt || "—")}</code>\n\n` +
+                `<b>Model:</b> <code>${escapeHtml(config.model)}</code>\n` +
+                `<b>Size:</b> ${config.width}×${config.height}\n` +
+                `<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n` +
+                `<b>Sampler:</b> ${config.sampler}\n` +
+                `<b>CLIP Skip:</b> ${config.clipSkip || 1}\n` +
+                `<b>NSFW:</b> ${config.nsfw ? "🔞 yes" : "no"}\n\n` +
+                `<b>Negative:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n` +
+                `<b>LoRA:</b>\n${loras}\n\n` +
+                `<b>Queue:</b> ${pending.keys.length}\n` +
+                `<b>Blacklist:</b> ${blacklist.length} workers`;
+            
+            await bot.send(chatId, text);
+            await bot.answerCallback(callbackQuery.id, "");
+        }
+        else if (data === "cmd_generate") {
+            await bot.answerCallback(callbackQuery.id, "Use /generate command", true);
+        }
+        else if (data === "cmd_toggle_auto") {
+            if (!config.enabled) {
+                if (!config.chatId) {
+                    await bot.answerCallback(callbackQuery.id, "❌ Set chat first: /setchat", true);
+                    return;
+                }
+                if (!config.generalPrompt) {
+                    await bot.answerCallback(callbackQuery.id, "❌ Set prompt first: /setprompt", true);
+                    return;
+                }
+            }
+            config.enabled = !config.enabled;
+            await saveConfig(env, config);
+            await bot.answerCallback(callbackQuery.id, `Auto-posting ${config.enabled ? "enabled" : "disabled"}`, true);
+        }
+        else if (data === "cmd_pending") {
+            const pending = await Redis.scan("pending:*");
+            if (!pending.keys.length) {
+                await bot.answerCallback(callbackQuery.id, "📋 Queue is empty", true);
+                return;
+            }
+            
+            let text = `📋 <b>In queue: ${pending.keys.length}</b>\n\n`;
+            
+            for (const key of pending.keys.slice(0, 10)) {
+                const id = key.replace("pending:", "");
+                try {
+                    const status = await hordeCheck(id);
+                    text += `🔸 <code>${id}</code>\n`;
+                    text += status.done ? "✅ Ready\n" : status.processing ? "⚙️ Processing\n" : `⏳ Queue #${status.queue_position || "?"}\n`;
+                    text += `~${status.wait_time || 0}s\n\n`;
+                } catch {
+                    text += `🔸 <code>${id}</code> — failed\n\n`;
+                }
+            }
+            
+            await bot.send(chatId, text);
+            await bot.answerCallback(callbackQuery.id, "");
+        }
+        else if (data === "cmd_cancel") {
+            const pending = await Redis.scan("pending:*");
+            for (const key of pending.keys) {
+                await Redis.del(key);
+            }
+            await bot.answerCallback(callbackQuery.id, `🗑 Cleared ${pending.keys.length} from queue`, true);
+        }
+        else if (data === "cmd_checkkey") {
+            await bot.answerCallback(callbackQuery.id, "🔑 Checking...", false);
+            
+            const result = await hordeCheckKey(env);
+            if (!result.ok) {
+                await bot.send(chatId, `❌ <b>Invalid key</b>\n${escapeHtml(result.err || "")}`);
+                return;
+            }
+            
+            const anonText = result.anon ? "🔴 Anonymous key\nNSFW will not work.\nRegister at stablehorde.net." :
+                            result.flagged ? "⚠️ Account flagged — censorship may happen" :
+                            "✅ Key looks fine, NSFW should work";
+            
+            const text = `${result.anon ? "🔴" : "✅"} <b>${escapeHtml(result.user || "anonymous")}</b>\n\n` +
+                        `💎 Kudos: ${result.kudos || 0}\n` +
+                        `🛡 Trusted: ${result.trusted ? "yes" : "no"}\n` +
+                        `🚩 Flagged: ${result.flagged ? "yes" : "no"}\n\n` +
+                        anonText;
+            
+            await bot.send(chatId, text);
+        }
+        else if (data === "cmd_diagnostic") {
+            const apiKey = getApiKey(env);
+            const blacklist = await Redis.get("worker_blacklist", "json") || [];
+            
+            const text = `🔧 <b>Diagnostics</b>\n\n` +
+                `💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌ not configured"}\n` +
+                `🔑 Horde key: ${apiKey === "0000000000" ? "🔴 anonymous" : "✅ " + apiKey.substring(0, 8) + "..."}\n` +
+                `🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "⚠️"}\n\n` +
+                `<b>Request flags:</b>\n` +
+                ` nsfw: true\n` +
+                ` censor_nsfw: false\n` +
+                ` trusted_workers: false\n` +
+                ` replacement_filter: true\n` +
+                ` r2: true\n` +
+                ` allow_downgrade: true\n\n` +
+                `🚫 Blacklisted workers: <b>${blacklist.length}</b>\n` +
+                `📏 Min image size: 10KB\n\n` +
+                `<b>Censorship detection:</b>\n` +
+                ` 1. gen_metadata[].type=="censorship"\n` +
+                ` 2. gen.censored === true\n` +
+                ` 3. gen.state === "censored"\n` +
+                ` 4. size < 10KB`;
+            
+            await bot.send(chatId, text);
+            await bot.answerCallback(callbackQuery.id, "");
+        }
+        
+    } catch (e) {
+        console.error("[Callback] Error:", e.message);
+        await bot.answerCallback(callbackQuery.id, `❌ Error: ${e.message}`, true);
     }
-  }
+}
+
+// Scheduled task handler
+async function processScheduled(env) {
+    if (!env.UPSTASH_REDIS_REST_URL || !env.TELEGRAM_BOT_TOKEN) return;
+    
+    const bot = new Telegram(env.TELEGRAM_BOT_TOKEN);
+    const config = await getConfig(env);
+    
+    // Process pending generations
+    const pending = await Redis.scan("pending:*");
+    
+    for (const key of pending.keys) {
+        const id = key.replace("pending:", "");
+        
+        try {
+            const pendingData = await Redis.get(key, "json");
+            if (!pendingData) {
+                await Redis.del(key);
+                continue;
+            }
+            
+            // Check timeout (2 minutes)
+            if (Date.now() - pendingData.at > 120000) {
+                await Redis.del(key);
+                if (pendingData.notify) {
+                    await bot.send(pendingData.notify, `⏰ Generation timeout: <code>${id}</code>`);
+                }
+                continue;
+            }
+            
+            // Check if done
+            const checkResult = await hordeCheck(id);
+            if (!checkResult.done) continue;
+            
+            // Get result
+            const result = await hordeGetResult(id);
+            await Redis.del(key);
+            
+            if (result.faulted) {
+                if (pendingData.notify) {
+                    await bot.send(pendingData.notify, `❌ Generation <code>${id}</code> failed`);
+                }
+                continue;
+            }
+            
+            const generations = result.generations || [];
+            if (!generations.length) {
+                if (pendingData.notify) {
+                    await bot.send(pendingData.notify, `❌ No generations for <code>${id}</code>`);
+                }
+                continue;
+            }
+            
+            let success = false;
+            let needsRetry = false;
+            
+            for (const gen of generations) {
+                const workerId = gen.worker_id || "?";
+                const workerName = gen.worker_name || "?";
+                const censored = isCensored(gen);
+                
+                if (censored) {
+                    await addWorkerToBlacklist(env, workerId, workerName);
+                    needsRetry = true;
+                    
+                    if (pendingData.notify) {
+                        await bot.send(pendingData.notify, `🔴 Worker <code>${escapeHtml(workerName)}</code> returned censorship\nAdded to blacklist`);
+                    }
+                    continue;
+                }
+                
+                if (!gen.img) {
+                    if (pendingData.notify) {
+                        await bot.send(pendingData.notify, "❌ gen.img is empty");
+                    }
+                    continue;
+                }
+                
+                // Generate caption based on mode
+                let caption = "";
+                if (config.captionMode === 1) {
+                    caption = `🎨 <i>${escapeHtml(pendingData.prompt?.substring(0, 200) || "")}</i>`;
+                } else if (config.captionMode === 2) {
+                    caption = await generateAICaption(pendingData.prompt || "", gen.model || "", env);
+                }
+                // mode 0 = no caption
+                
+                const targetChat = pendingData.chatId;
+                const { sent, tooSmall } = await deliverImage(bot, targetChat, gen.img, caption, pendingData.notify);
+                
+                if (sent) {
+                    success = true;
+                } else if (tooSmall) {
+                    needsRetry = true;
+                    await addWorkerToBlacklist(env, workerId, workerName);
+                }
+            }
+            
+            // Retry if needed
+            if (needsRetry && !success && !pendingData.sfwTest) {
+                const retries = (pendingData.retries || 0) + 1;
+                
+                if (retries < 3) {
+                    const blacklist = (await Redis.get("worker_blacklist", "json") || []).map(w => w.id).filter(Boolean);
+                    
+                    try {
+                        const retryResult = await hordeSubmit(pendingData.prompt, config, env, { workerBlacklist: blacklist });
+                        
+                        if (retryResult.id) {
+                            await Redis.set(`pending:${retryResult.id}`, {
+                                ...pendingData,
+                                at: Date.now(),
+                                retries: retries
+                            }, { expirationTtl: 3600 });
+                            
+                            if (pendingData.notify) {
+                                await bot.send(pendingData.notify, `🔄 Retry ${retries}/3: <code>${retryResult.id}</code>\n🚫 Blacklist: ${blacklist.length} workers`);
+                            }
+                        }
+                    } catch (e) {
+                        console.error("[Retry] Error:", e.message);
+                    }
+                } else {
+                    if (pendingData.notify) {
+                        await bot.send(pendingData.notify, 
+                            "❌ <b>3 attempts — all placeholders/censored</b>\n\n" +
+                            "Possible reasons:\n" +
+                            "• Anonymous Horde key (NSFW won't work)\n" +
+                            "• Account flagged\n" +
+                            "• All workers censor this model\n\n" +
+                            "/clearworkerbl — clear blacklist"
+                        );
+                    }
+                }
+            }
+            
+        } catch (e) {
+            console.error(`[CRON] ${id}:`, e.message);
+        }
+    }
+    
+    // Auto-post if enabled
+    if (!config.enabled || !config.chatId || !config.generalPrompt) return;
+    
+    // Check if queue has items
+    const pendingCount = (await Redis.scan("pending:*")).keys.length;
+    if (pendingCount > 0) return;
+    
+    // Check interval
+    const lastPost = parseInt(await Redis.get("last_post_time") || "0", 10);
+    const now = Date.now();
+    
+    if (now - lastPost < config.interval * 60 * 1000) return;
+    
+    await Redis.set("last_post_time", String(now));
+    
+    // Generate new images
+    const blacklist = (await Redis.get("worker_blacklist", "json") || []).map(w => w.id).filter(Boolean);
+    
+    for (let i = 0; i < config.count; i++) {
+        try {
+            const prompt = await enhancePromptWithLLM(config.generalPrompt, env);
+            const result = await hordeSubmit(prompt, config, env, { workerBlacklist: blacklist });
+            
+            if (result.id) {
+                await Redis.set(`pending:${result.id}`, {
+                    chatId: config.chatId,
+                    prompt: prompt,
+                    at: now,
+                    notify: null,
+                    retries: 0
+                }, { expirationTtl: 3600 });
+            }
+        } catch (e) {
+            console.error("[CRON] auto:", e.message);
+        }
+    }
+}
+
+// Main handler
+export default {
+    async fetch(request, env) {
+        const url = new URL(request.url);
+        
+        // Webhook handler
+        if (url.pathname === "/webhook") {
+            if (request.method !== "POST") {
+                return new Response("POST only", { status: 405 });
+            }
+            
+            try {
+                const data = await request.json();
+                
+                if (data.message) {
+                    await handleCommand(data.message, env);
+                } else if (data.callback_query) {
+                    await handleCallback(data.callback_query, env);
+                }
+            } catch (e) {
+                console.error("[WH] Error:", e.message);
+            }
+            
+            return new Response("OK");
+        }
+        
+        // Setup webhook
+        if (url.pathname === "/setup") {
+            if (!env.TELEGRAM_BOT_TOKEN) {
+                return new Response("No TELEGRAM_BOT_TOKEN!", { status: 500 });
+            }
+            
+            const webhookUrl = `${url.origin}/webhook`;
+            const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    url: webhookUrl,
+                    allowed_updates: ["message", "callback_query"],
+                    drop_pending_updates: true
+                })
+            });
+            
+            const result = await response.json();
+            return new Response(`Webhook: ${webhookUrl}\n\n${JSON.stringify(result, null, 2)}`);
+        }
+        
+        // Root
+        if (url.pathname === "/") {
+            return new Response("🤖 Telegram Image Bot is running!\nVisit /setup to configure webhook.");
+        }
+        
+        return new Response("Not found", { status: 404 });
+    },
+    
+    async scheduled(event, env, ctx) {
+        try {
+            await processScheduled(env);
+        } catch (e) {
+            console.error("[CRON] CRASH:", e.message);
+        }
+    }
 };
