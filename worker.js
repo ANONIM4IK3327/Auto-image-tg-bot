@@ -2,20 +2,23 @@
 // Telegram Image Bot – Cloudflare Workers// AI Horde + OpenRouter
 // ============================================================
 //  • Кастомные кнопки и настройки вынесены в отдельный блок
-//  • База данных KV заменена на Upstash Redis (переменные
+//  • KV‑хранилище заменено на Upstash Redis (переменные
 //    UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)
-//  • Добавлен автопост в Telegram‑каналы с выбором канала/чата//  • LLM‑подсказки теперь используют формат `[…]` в промпте
+//  • Добавлен автопост в Telegram‑каналы с выбором канала/чата
+//  • LLM‑подсказки теперь используют формат `[…]` в промпте
 //  • Пере‑организованы функции доставки картинок и
 //    автопостинга, добавлена поддержка нескольких каналов
-//  • Весь код снабжён подробными комментариями для быстрого
-//    понимания и дальнейшего расширения
-// ============================================================// ---------------------------------------------------------------------
+//  • Весь код снабжён подробными комментариями
+// ============================================================
+
+// ---------------------------------------------------------------------
 // Константы и глобальные переменные
-// ---------------------------------------------------------------------const DEFAULT_CONFIG = {
+// ---------------------------------------------------------------------
+const DEFAULT_CONFIG = {
   enabled: false,
   chatId: null,
   adminId: null,
-  interval: 60,          // мин между автоматическими постами
+  interval: 60,          // минуты между автоматическими постами
   count: 1,              // сколько генераций делать за один запуск
   generalPrompt: "",
   model: "AlbedoBase XL (SDXL)",
@@ -90,7 +93,7 @@ class Telegram {
       new File([arrayBuffer], "image.webp", { type: "image/webp" })
     );
     if (caption) {
-      form.append("caption", caption.substring(0, 1024));
+      form.append("caption", caption.slice(0, 1024));
       form.append("parse_mode", "HTML");
     }
     const r = await fetch(`${this.base}/sendPhoto`, { method: "POST", body: form });
@@ -104,7 +107,7 @@ class Telegram {
       new File([arrayBuffer], "image.webp", { type: "image/webp" })
     );
     if (caption) {
-      form.append("caption", caption.substring(0, 1024));
+      form.append("caption", caption.slice(0, 1024));
       form.append("parse_mode", "HTML");
     }
     const r = await fetch(`${this.base}/sendDocument`, { method: "POST", body: form });
@@ -114,13 +117,14 @@ class Telegram {
     return this.api("sendPhoto", {
       chat_id: chatId,
       photo: url,
-      caption: caption.substring(0, 1024),
+      caption: caption.slice(0, 1024),
       parse_mode: "HTML",
     });
   }
 }
 
-// ---------------------------------------------------------------------// KV‑обертки (работают через Upstash Redis)
+// ---------------------------------------------------------------------
+// KV‑обертки (работают через Upstash Redis)
 // ---------------------------------------------------------------------
 const KV = {
   async get(env, key, type = "text") {
@@ -186,7 +190,9 @@ function isCensored(gen) {
   return false;
 }
 
-// ---------------------------------------------------------------------// API‑запросы к Horde// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// API‑запросы к Horde
+// ---------------------------------------------------------------------
 function getApiKey(env) {
   return (env.HORDE_API_KEY || "").trim() || "0000000000";
 }
@@ -241,8 +247,7 @@ async function hordeSubmit(prompt, config, env, opts = {}) {
     }));
   }
   const body = {
-    prompt: config.negativePrompt
-      ? `${prompt} ### ${config.negativePrompt}`
+    prompt: config.negativePrompt      ? `${prompt} ### ${config.negativePrompt}`
       : prompt,
     params,
     nsfw: true,
@@ -355,9 +360,7 @@ async function deliverImage(tg, chatId, imgData, caption, notifyChat) {
   if (notifyChat) {
     await tg.send(
       notifyChat,
-      `❌ Не удалось отправить изображение: ${escapeHtml(
-        res.description || "unknown error"
-      )}`
+      `❌ Не удалось отправить изображение: ${escapeHtml(res.description || "unknown error")}`
     );
   }
   return { sent: false, tooSmall: false, sizeKB };
@@ -365,7 +368,8 @@ async function deliverImage(tg, chatId, imgData, caption, notifyChat) {
 
 // ---------------------------------------------------------------------
 // Генерация промпта (LLM → OpenRouter)
-// ---------------------------------------------------------------------const P = {
+// ---------------------------------------------------------------------
+const P = {
   angle: [
     "from above",
     "low angle",
@@ -580,9 +584,9 @@ async function handleCommand(msg, env) {
       await tg.send(chatId, `❌ <b>Invalid key</b>\n${escapeHtml(info.err || "")}`);
       return;
     }
-    const status = info.anon      ? "🔴 <b>Anonymous key</b>\nNSFW will not work.\nRegister at stablehorde.net."
-      : info.flagged
-      ? "⚠️ Account flagged — censorship may happen"
+    const status = info.anon
+      ? "🔴 <b>Anonymous key</b>\nNSFW will not work.\nRegister at stablehorde.net."
+      : info.flagged      ? "⚠️ Account flagged — censorship may happen"
       : "✅ Key looks fine, NSFW should work";
 
     await tg.send(
@@ -591,7 +595,8 @@ async function handleCommand(msg, env) {
         `💎 Kudos: ${info.kudos || 0}\n` +
         `🛡 Trusted: ${info.trusted ? "yes" : "no"}\n` +
         `🚩 Flagged: ${info.flagged ? "yes" : "no"}\n\n` +
-        status    );
+        status
+    );
     return;
   }
 
@@ -611,8 +616,7 @@ async function handleCommand(msg, env) {
       const bufTest = await tg.sendPhoto(chatId, buf, "Buffer test");
       await tg.send(
         chatId,
-        bufTest.ok
-          ? "✅ Buffer photo works"
+        bufTest.ok          ? "✅ Buffer photo works"
           : `❌ Buffer test failed: ${escapeHtml(bufTest.description || "")}`
       );
     } catch (e) {
@@ -849,8 +853,7 @@ async function handleCommand(msg, env) {
       let txt = "📋 <b>Your LoRA:</b>\n\n";
       loras.forEach((l, i) => {
         txt += `${i + 1}. <code>${escapeHtml(l.name)}</code> (str: ${l.strength}, clip: ${l.clip})\n   ❌ /removelora ${escapeHtml(
-          l.name
-        )}\n\n`;
+          l.name        )}\n\n`;
       });
       await tg.send(chatId, txt);
       break;
@@ -1078,8 +1081,7 @@ async function handleCommand(msg, env) {
           const c = await hordeCheck(id);
           const state = c.done
             ? "✅ Ready"
-            : c.processing
-            ? "⚙️ Processing"
+            : c.processing            ? "⚙️ Processing"
             : `⏳ Queue #${c.queue_position || "?"}`;
           txt += `🔸 <code>${id}</code>\n   ${state} | ~${c.wait_time || 0}s\n\n`;
         } catch {
@@ -1124,8 +1126,7 @@ async function handleCommand(msg, env) {
 
 // ---------------------------------------------------------------------
 // Планировщик (cron) – автоматические генерации и автопосты
-// ---------------------------------------------------------------------
-async function processScheduled(env) {
+// ---------------------------------------------------------------------async function processScheduled(env) {
   if (!env.BOT_KV || !env.TELEGRAM_BOT_TOKEN) return;
   const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
   const config = await getConfig(env);
@@ -1139,7 +1140,8 @@ async function processScheduled(env) {
         await KV.del(env, key.name);
         continue;
       }
-      // timeout protection      if (Date.now() - data.at > 20 * 60 * 1000) {
+      // timeout protection
+      if (Date.now() - data.at > 20 * 60 * 1000) {
         await KV.del(env, key.name);
         if (data.notify) await tg.send(data.notify, `⏰ Generation timeout: <code>${id}</code>`);
         continue;
@@ -1164,8 +1166,7 @@ async function processScheduled(env) {
         const workerName = gen.worker_name || "?";
         const censored = isCensored(gen);
         if (data.debug && data.notify) {
-          const imgInfo = !gen.img
-            ? "null"
+          const imgInfo = !gen.img            ? "null"
             : isHttpUrl(gen.img)
             ? `URL (${gen.img.substring(0, 45)}...)`
             : `base64 (${gen.img.length} chars)`;
@@ -1345,7 +1346,9 @@ export default {
           drop_pending_updates: true,
         }),
       });
-      return new Response(`Webhook: ${webhook}\n\n${JSON.stringify(await r.json(), null, 2)}`);
+      return new Response(
+        `Webhook: ${webhook}\n\n${JSON.stringify(await r.json(), null, 2)}`
+      );
     }
 
     // ----- Главная страница -----------------------------------------------
