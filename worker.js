@@ -15,13 +15,13 @@ const DEFAULT_CONFIG = {
     sampler: "k_dpmpp_2m",
     nsfw: true,
     negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
-    llmModel: "google/gemma-2-9b-it:free",
+    llmModel: "meta-llama/llama-3.3-70b-instruct:free",
     clipSkip: 2,
     hiresFix: false,
     hiresFixDenoising: 0.65,
     karras: true,
     postProcessors: [],
-    captionMode: 1, // 0: Ничего, 1: Промпт, 2: AI Генерация
+    captionMode: 1,
     captionPrompt: "Опиши эту картинку для поста в Telegram-канале на русском языке, креативно и с эмодзи. Без лишних вступлений."
 };
 
@@ -37,9 +37,6 @@ function isHttpUrl(text) {
     return typeof text === "string" && /^https?:\/\//i.test(text);
 }
 
-// ----------------------------------------------------
-// TELEGRAM API
-// ----------------------------------------------------
 class Telegram {
     constructor(token) {
         this.base = `https://api.telegram.org/bot${token}`;
@@ -82,9 +79,6 @@ class Telegram {
     }
 }
 
-// ----------------------------------------------------
-// UPSTASH REDIS WRAPPER
-// ----------------------------------------------------
 const Redis = {
     async call(env, ...args) {
         if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) return null;
@@ -122,9 +116,6 @@ const Redis = {
 
 const KV = Redis;
 
-// ----------------------------------------------------
-// CONFIG & BLACKLIST HELPERS
-// ----------------------------------------------------
 async function getConfig(env) {
     const data = await KV.get(env, "config", "json");
     return { ...DEFAULT_CONFIG, ...(data || {}) };
@@ -160,9 +151,6 @@ function getApiKey(env) {
     return (env.HORDE_API_KEY || "").trim() || "0000000000";
 }
 
-// ----------------------------------------------------
-// AI HORDE API
-// ----------------------------------------------------
 async function hordeCheckKey(env) {
     const key = getApiKey(env);
     try {
@@ -238,9 +226,6 @@ async function hordeGetModels() {
     return (await fetch(`${HORDE_API}/status/models?type=image`, { headers: HORDE_HEADERS })).json();
 }
 
-// ----------------------------------------------------
-// IMAGE DELIVERY
-// ----------------------------------------------------
 async function downloadImage(url) {
     try {
         const res = await fetch(url);
@@ -285,7 +270,7 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId) {
 
     let r = await tg.sendPhoto(chatId, buffer, caption);
     if (r.ok) return { sent: true, tooSmall: false, sizeKB };
-    
+
     r = await tg.sendDocument(chatId, buffer, caption);
     if (r.ok || (isUrl && (await tg.sendPhotoUrl(chatId, imgData, caption)).ok)) {
         return { sent: true, tooSmall: false, sizeKB };
@@ -295,21 +280,18 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId) {
     return { sent: false, tooSmall: false, sizeKB };
 }
 
-// ----------------------------------------------------
-// LLM PROMPTS & CAPTIONS
-// ----------------------------------------------------
 async function generatePrompt(basePrompt, env, config) {
     let instruction = null;
     let cleanPrompt = basePrompt;
-    
-    const match = basePrompt.match(/\[(.*?)\]/);
+
+    const match = basePrompt.match(/\[([\s\S]*?)\]/);
     if (match) {
         instruction = match[1];
         cleanPrompt = basePrompt.replace(match[0], '').trim();
     }
 
     if (env.OPENROUTER_API_KEY) {
-        const llmModel = config.llmModel || env.LLM_MODEL || "google/gemma-2-9b-it:free";
+        const llmModel = config.llmModel || env.LLM_MODEL || "meta-llama/llama-3.3-70b-instruct:free";
         let sysPrompt, userPrompt;
 
         if (instruction) {
@@ -335,7 +317,7 @@ async function generatePrompt(basePrompt, env, config) {
                         { role: "system", content: sysPrompt },
                         { role: "user", content: userPrompt }
                     ],
-                    temperature: 1.1,
+                    temperature: 0.7,
                     max_tokens: 300
                 })
             });
@@ -343,7 +325,7 @@ async function generatePrompt(basePrompt, env, config) {
             const text = data.choices?.[0]?.message?.content?.trim();
             if (text && text.length > 5) return text.replace(/^["'`*]+|["'`*]+$/g, "");
         } catch (e) {
-            console.error("[LLM Prompt]", e.message);
+            console.error("[LLM Prompt Error]", e.message);
         }
     }
     return cleanPrompt + ", masterpiece, highly detailed, best quality";
@@ -356,10 +338,12 @@ async function generateAiCaption(imagePrompt, env, config) {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`
+                "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+                "HTTP-Referer": "https://t.me",
+                "X-Title": "TgImageBot"
             },
             body: JSON.stringify({
-                model: config.llmModel || "google/gemma-2-9b-it:free",
+                model: config.llmModel || "meta-llama/llama-3.3-70b-instruct:free",
                 messages: [
                     { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
                     { role: "user", content: `Промпт картинки: ${imagePrompt}` }
@@ -376,9 +360,6 @@ async function generateAiCaption(imagePrompt, env, config) {
     }
 }
 
-// ----------------------------------------------------
-// COMMAND HANDLER
-// ----------------------------------------------------
 async function handleCommand(msg, env) {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
@@ -443,7 +424,7 @@ async function handleCommand(msg, env) {
             config.captionMode = mode; await saveConfig(env, config);
             await tg.send(chatId, `✅ Режим подписи изменен на: ${mode}`);
             break;
-            
+
         case "/setcaptionprompt":
             if (!params.length) return await tg.send(chatId, "❌ /setcaptionprompt <инструкция для ИИ>");
             config.captionPrompt = params.join(" "); await saveConfig(env, config);
@@ -483,7 +464,7 @@ async function handleCommand(msg, env) {
                 await tg.send(chatId, text);
             } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
-            
+
         case "/searchmodel":
             const qm = params.join(" ").toLowerCase();
             if (!qm) return await tg.send(chatId, "❌ /searchmodel <запрос>");
@@ -527,7 +508,7 @@ async function handleCommand(msg, env) {
             lt += "\nОчистить список: /clearloras";
             await tg.send(chatId, lt);
             break;
-            
+
         case "/clearloras":
             config.loras = []; await saveConfig(env, config);
             await tg.send(chatId, "✅ Список LoRA очищен!");
@@ -593,7 +574,7 @@ async function handleCommand(msg, env) {
             if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт через /setprompt");
             await tg.send(chatId, `⏳ Генерирую ${config.count} фото...`);
             const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
-            
+
             for (let i = 0; i < config.count; i++) {
                 try {
                     const finalPrompt = await generatePrompt(config.generalPrompt, env, config);
@@ -613,8 +594,8 @@ async function handleCommand(msg, env) {
             let queueCount = 0;
             try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
-            
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Семплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
 
         case "/pending":
@@ -646,22 +627,18 @@ async function handleCommand(msg, env) {
     }
 }
 
-// ----------------------------------------------------
-// CRON / SCHEDULER
-// ----------------------------------------------------
 async function processScheduled(env) {
     if (!env.UPSTASH_REDIS_REST_URL || !env.TELEGRAM_BOT_TOKEN) return;
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
     const config = await getConfig(env);
-    
-    // 1. Проверка очереди генераций
+
     const pendingList = await KV.list(env, "pending:");
     for (const keyObj of pendingList.keys) {
         const id = keyObj.name.replace("pending:", "");
         try {
             const task = await KV.get(env, keyObj.name, "json");
             if (!task) { await KV.del(env, keyObj.name); continue; }
-            if (Date.now() - task.at > 1200000) { // 20 min timeout
+            if (Date.now() - task.at > 1200000) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
                 continue;
@@ -672,7 +649,7 @@ async function processScheduled(env) {
 
             const res = await hordeGetResult(id);
             await KV.del(env, keyObj.name);
-            
+
             if (res.faulted) {
                 if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации: <code>${id}</code>`);
                 continue;
@@ -698,7 +675,6 @@ async function processScheduled(env) {
 
                 if (!gen.img) continue;
 
-                // Генерация текста для поста
                 let captionText = "";
                 if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
                 else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
@@ -714,7 +690,6 @@ async function processScheduled(env) {
                 }
             }
 
-            // Retry logic
             if (censored && !success && !task.sfwTest) {
                 const retries = (task.retries || 0) + 1;
                 if (retries < 3) {
@@ -734,9 +709,8 @@ async function processScheduled(env) {
         }
     }
 
-    // 2. Автопостинг (создание новых тасков)
     if (!config.enabled || (!config.groupId && !config.channelId) || !config.generalPrompt) return;
-    if ((await KV.list(env, "pending:")).keys.length > 0) return; // Ждем пока очередь опустеет
+    if ((await KV.list(env, "pending:")).keys.length > 0) return;
 
     const lastPost = parseInt(await KV.get(env, "last_post_time") || "0", 10);
     const now = Date.now();
@@ -759,13 +733,10 @@ async function processScheduled(env) {
     }
 }
 
-// ----------------------------------------------------
-// MAIN EXPORT
-// ----------------------------------------------------
 export default {
     async fetch(req, env) {
         const url = new URL(req.url);
-        
+
         if (url.pathname === "/webhook") {
             if (req.method !== "POST") return new Response("POST only", { status: 405 });
             try {
@@ -774,7 +745,7 @@ export default {
             } catch (e) { console.error("[WH]", e.message); }
             return new Response("OK");
         }
-        
+
         if (url.pathname === "/setup") {
             if (!env.TELEGRAM_BOT_TOKEN) return new Response("No TELEGRAM_BOT_TOKEN!", { status: 500 });
             const webhookUrl = `${url.origin}/webhook`;
@@ -785,7 +756,7 @@ export default {
             });
             return new Response(`Webhook: ${webhookUrl}\n\n${JSON.stringify(await res.json(), null, 2)}`);
         }
-        
+
         return new Response("🤖 Бот запущен! Перейди на /setup для настройки вебхука.");
     },
 
