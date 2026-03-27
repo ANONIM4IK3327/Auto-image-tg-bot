@@ -1,28 +1,25 @@
 // ============================================================
-// Telegram Image Bot – Cloudflare Workers
-// AI Horde + OpenRouter
+// Telegram Image Bot – Cloudflare Workers// AI Horde + OpenRouter
 // ============================================================
 //  • Кастомные кнопки и настройки вынесены в отдельный блок
 //  • База данных KV заменена на Upstash Redis (переменные
 //    UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN)
-//  • Добавлен автопост в Telegram‑каналы с выбором канала/чата
-//  • LLM‑подсказки теперь используют формат `[…]` в промпте
+//  • Добавлен автопост в Telegram‑каналы с выбором канала/чата//  • LLM‑подсказки теперь используют формат `[…]` в промпте
 //  • Пере‑организованы функции доставки картинок и
 //    автопостинга, добавлена поддержка нескольких каналов
 //  • Весь код снабжён подробными комментариями для быстрого
 //    понимания и дальнейшего расширения
-// ============================================================
-
-// ----- Константы и глобальные переменные ---------------------------------
-const DEFAULT_CONFIG = {
+// ============================================================// ---------------------------------------------------------------------
+// Константы и глобальные переменные
+// ---------------------------------------------------------------------const DEFAULT_CONFIG = {
   enabled: false,
   chatId: null,
   adminId: null,
-  interval: 60,          // минуты между автоматическими постами
+  interval: 60,          // мин между автоматическими постами
   count: 1,              // сколько генераций делать за один запуск
-  generalPrompt: "",     // основной промпт
+  generalPrompt: "",
   model: "AlbedoBase XL (SDXL)",
-  loras: [],             // список LoRA‑моделей
+  loras: [],
   width: 1024,
   height: 1024,
   steps: 25,
@@ -31,7 +28,7 @@ const DEFAULT_CONFIG = {
   nsfw: true,
   negativePrompt:
     "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
-  llmModel: "",          // модель OpenRouter для генерации подсказок
+  llmModel: "",
   clipSkip: 2,
   hiresFix: false,
   hiresFixDenoising: 0.65,
@@ -41,11 +38,11 @@ const DEFAULT_CONFIG = {
 const HORDE_API = "https://stablehorde.net/api/v2";
 const HORDE_HEADERS = { "Client-Agent": "TgImageBot:14.0:tg" };
 const MAX_RETRIES = 3;
-const MIN_IMAGE_KB = 10;   // минимум KB, чтобы считать картинку «живой»
+const MIN_IMAGE_KB = 10;   // минимум KB, чтобы картинка считалась «живой»
 
-// -------------------------------------------------------------------------
-// Helper – escape HTML‑символов (для безопасного отправки сообщений)
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Вспомогательные функции
+// ---------------------------------------------------------------------
 function escapeHtml(text) {
   if (text == null) return "";
   return String(text)
@@ -53,10 +50,6 @@ function escapeHtml(text) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
-
-// -------------------------------------------------------------------------
-// Обрезка и ограничения
-// -------------------------------------------------------------------------
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
@@ -64,8 +57,9 @@ function isHttpUrl(v) {
   return typeof v === "string" && /^https?:\/\//i.test(v);
 }
 
-// -------------------------------------------------------------------------// Класс‑обёртка над Telegram Bot API
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Класс‑обёртка над Telegram‑Bot API
+// ---------------------------------------------------------------------
 class Telegram {
   constructor(token) {
     this.base = `https://api.telegram.org/bot${token}`;
@@ -126,9 +120,8 @@ class Telegram {
   }
 }
 
-// -------------------------------------------------------------------------
-// KV‑обертки (работают через Upstash Redis)
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------// KV‑обертки (работают через Upstash Redis)
+// ---------------------------------------------------------------------
 const KV = {
   async get(env, key, type = "text") {
     if (!env.BOT_KV) return null;
@@ -151,9 +144,9 @@ const KV = {
   },
 };
 
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // Конфигурация бота (читается/сохраняется в KV)
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 async function getConfig(env) {
   const stored = await KV.get(env, "config", "json");
   return { ...DEFAULT_CONFIG, ...(stored || {}) };
@@ -162,9 +155,9 @@ async function saveConfig(env, cfg) {
   await KV.put(env, "config", JSON.stringify(cfg));
 }
 
-// -------------------------------------------------------------------------
-// Black‑list воркеров (чтобы не обращать к «плохим» моделям)
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// Black‑list воркеров (чтобы не использовать «плохие» модели)
+// ---------------------------------------------------------------------
 async function getWorkerBlacklist(env) {
   return (await KV.get(env, "worker_blacklist", "json")) || [];
 }
@@ -182,9 +175,10 @@ async function clearWorkerBlacklist(env) {
   await KV.put(env, "worker_blacklist", "[]");
 }
 
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // Censorship detection в ответе Horde
-// -------------------------------------------------------------------------function isCensored(gen) {
+// ---------------------------------------------------------------------
+function isCensored(gen) {
   if (!gen) return false;
   if (gen.gen_metadata?.some((m) => m.type === "censorship")) return true;
   if (gen.censored === true) return true;
@@ -192,9 +186,7 @@ async function clearWorkerBlacklist(env) {
   return false;
 }
 
-// -------------------------------------------------------------------------
-// API‑запросы к Horde
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------// API‑запросы к Horde// ---------------------------------------------------------------------
 function getApiKey(env) {
   return (env.HORDE_API_KEY || "").trim() || "0000000000";
 }
@@ -296,9 +288,9 @@ async function hordeGetModels() {
   return r.json();
 }
 
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // Доставка изображения в Telegram (WebP → sendPhoto / sendDocument / sendPhotoUrl)
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 async function downloadImage(url) {
   try {
     const resp = await fetch(url);
@@ -371,9 +363,9 @@ async function deliverImage(tg, chatId, imgData, caption, notifyChat) {
   return { sent: false, tooSmall: false, sizeKB };
 }
 
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // Генерация промпта (LLM → OpenRouter)
-// -------------------------------------------------------------------------const P = {
+// ---------------------------------------------------------------------const P = {
   angle: [
     "from above",
     "low angle",
@@ -513,19 +505,19 @@ async function llmPrompt(instruction, apiKey, model) {
 }
 async function generatePrompt(instruction, env) {
   if (env.OPENROUTER_API_KEY) {
-    const config = await getConfig(env);
+    const cfg = await getConfig(env);
     return llmPrompt(
       instruction,
       env.OPENROUTER_API_KEY,
-      config.llmModel || env.LLM_MODEL || "meta-llama/llama-3.1-8b-instruct:free"
+      cfg.llmModel || env.LLM_MODEL || "meta-llama/llama-3.1-8b-instruct:free"
     );
   }
   return templatePrompt(instruction);
 }
 
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // Обработка команд от пользователя
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 async function handleCommand(msg, env) {
   const chatId = msg.chat.id;
   const userId = msg.from?.id;
@@ -588,8 +580,7 @@ async function handleCommand(msg, env) {
       await tg.send(chatId, `❌ <b>Invalid key</b>\n${escapeHtml(info.err || "")}`);
       return;
     }
-    const status = info.anon
-      ? "🔴 <b>Anonymous key</b>\nNSFW will not work.\nRegister at stablehorde.net."
+    const status = info.anon      ? "🔴 <b>Anonymous key</b>\nNSFW will not work.\nRegister at stablehorde.net."
       : info.flagged
       ? "⚠️ Account flagged — censorship may happen"
       : "✅ Key looks fine, NSFW should work";
@@ -600,8 +591,7 @@ async function handleCommand(msg, env) {
         `💎 Kudos: ${info.kudos || 0}\n` +
         `🛡 Trusted: ${info.trusted ? "yes" : "no"}\n` +
         `🚩 Flagged: ${info.flagged ? "yes" : "no"}\n\n` +
-        status
-    );
+        status    );
     return;
   }
 
@@ -611,7 +601,9 @@ async function handleCommand(msg, env) {
     const urlTest = await tg.sendPhotoUrl(chatId, "https://picsum.photos/512/512", "URL test");
     await tg.send(
       chatId,
-      urlTest.ok ? "✅ URL photo works" : `❌ URL test failed: ${escapeHtml(urlTest.description || "")}`
+      urlTest.ok
+        ? "✅ URL photo works"
+        : `❌ URL test failed: ${escapeHtml(urlTest.description || "")}`
     );
     try {
       const resp = await fetch("https://picsum.photos/256/256");
@@ -635,12 +627,12 @@ async function handleCommand(msg, env) {
       await tg.send(chatId, "❌ KV not bound!");
       return;
     }
-    const config = await getConfig(env);
+    const cfg = await getConfig(env);
     const sfwPrompt =
       "beautiful mountain landscape, crystal clear lake, sunset sky, orange and pink clouds, pine trees, snow capped peaks, nature photography, 4k, masterpiece, best quality, highly detailed, sharp focus";
     await tg.send(chatId, "🧪 Sending SFW test generation to Horde...");
     try {
-      const result = await hordeSubmit(sfwPrompt, config, env, { skipLoras: true });
+      const result = await hordeSubmit(sfwPrompt, cfg, env, { skipLoras: true });
       if (result.id) {
         await KV.put(
           env,
@@ -717,7 +709,6 @@ async function handleCommand(msg, env) {
       );
       break;
     }
-
     case "/setchat": {
       config.chatId = chatId;
       await saveConfig(env, config);
@@ -1131,13 +1122,15 @@ async function handleCommand(msg, env) {
   }
 }
 
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // Планировщик (cron) – автоматические генерации и автопосты
-// -------------------------------------------------------------------------async function processScheduled(env) {
+// ---------------------------------------------------------------------
+async function processScheduled(env) {
   if (!env.BOT_KV || !env.TELEGRAM_BOT_TOKEN) return;
   const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
   const config = await getConfig(env);
   const pendingList = await KV.list(env, "pending:");
+
   for (const key of pendingList.keys) {
     const id = key.name.replace("pending:", "");
     try {
@@ -1146,8 +1139,7 @@ async function handleCommand(msg, env) {
         await KV.del(env, key.name);
         continue;
       }
-      // timeout protection
-      if (Date.now() - data.at > 20 * 60 * 1000) {
+      // timeout protection      if (Date.now() - data.at > 20 * 60 * 1000) {
         await KV.del(env, key.name);
         if (data.notify) await tg.send(data.notify, `⏰ Generation timeout: <code>${id}</code>`);
         continue;
@@ -1217,7 +1209,8 @@ async function handleCommand(msg, env) {
           data.chatId,
           gen.img,
           caption,
-          data.notify        );
+          data.notify
+        );
         if (sent) anySent = true;
         else if (tooSmall) {
           anySmall = true;
@@ -1282,6 +1275,7 @@ async function handleCommand(msg, env) {
       console.error(`[CRON] ${id}:`, e.message);
     }
   }
+
   // Автопостинг, если включён
   if (!config.enabled || !config.chatId || !config.generalPrompt) return;
   if ((await KV.list(env, "pending:")).keys.length > 0) return;
@@ -1317,12 +1311,13 @@ async function handleCommand(msg, env) {
   }
 }
 
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 // Входная точка (HTTP‑endpoint + scheduled)
-// -------------------------------------------------------------------------
+// ---------------------------------------------------------------------
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
     // ----- Webhook -------------------------------------------------------
     if (url.pathname === "/webhook") {
       if (request.method !== "POST") return new Response("POST only", { status: 405 });
@@ -1334,6 +1329,7 @@ export default {
       }
       return new Response("OK");
     }
+
     // ----- /setup (установка webhook) ------------------------------------
     if (url.pathname === "/setup") {
       if (!env.TELEGRAM_BOT_TOKEN) {
@@ -1351,12 +1347,14 @@ export default {
       });
       return new Response(`Webhook: ${webhook}\n\n${JSON.stringify(await r.json(), null, 2)}`);
     }
+
     // ----- Главная страница -----------------------------------------------
     if (url.pathname === "/") {
       return new Response(
         "🤖 Telegram Image Bot is running!\nVisit /setup to configure webhook."
       );
     }
+
     return new Response("Not found", { status: 404 });
   },
 
