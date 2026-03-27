@@ -34,10 +34,6 @@ function escapeHtml(e) {
   return null == e ? "" : String(e).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function clamp(e, t, a) {
-  return Math.max(t, Math.min(a, e));
-}
-
 function isHttpUrl(e) {
   return "string" == typeof e && /^https?:\/\//i.test(e);
 }
@@ -442,269 +438,302 @@ async function handleCommand(e, t) {
   if (l.adminId === n) {
     switch (r) {
       case "/start":
-      case "/help":
+      case "/help": {
         await o.send(a, "🤖 <b>Image Bot</b>\n\n<b>Basics:</b>\n/setchat — set post chat\n/setprompt &lt;text&gt; — main theme\n/setinterval &lt;min&gt; — interval\n/setcount &lt;1-10&gt; — amount\n/enable | /disable — auto mode\n/generate — generate now\n\n<b>Model and LoRA:</b>\n/setmodel &lt;name&gt;\n/listmodels — top-40 models\n/searchlora &lt;query&gt;\n/addlora &lt;version_id&gt; [strength] [clip]\n/removelora &lt;id&gt; | /listloras\n\n<b>Params:</b>\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt;\n/setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setneg &lt;text&gt; | /setclipskip &lt;1-4&gt;\n/setllm &lt;model_id&gt;\n\n<b>Autopost captions + channel:</b>\n/setcaption none | prompt | ai\n/setcaptioninstr &lt;инструкция ИИ&gt;\n/setchannel &lt;@канал или ID&gt;\n/unsetchannel\n\n<b>Horde улучшайзеры (лица и т.д.):</b>\n/addpostproc GFPGAN\n/removepostproc GFPGAN\n/listpostproc\n\n<b>Management:</b>\n/status | /pending | /cancel\n/workerbl | /clearworkerbl\n/checkkey | /diagnostic | /testsfw | /testimg\n\nИспользуй /status — там удобные кнопки!");
         break;
-      case "/setchat":
+      }
+      case "/setchat": {
         l.chatId = a;
         await saveConfig(t, l);
         await o.send(a, `✅ Post chat set: <code>${a}</code>`);
         break;
-      case "/setprompt":
-        const e = c.join(" ");
-        if (!e) { await o.send(a, "❌ /setprompt &lt;theme&gt;"); break; }
-        l.generalPrompt = e;
+      }
+      case "/setprompt": {
+        const promptText = c.join(" ");
+        if (!promptText) { await o.send(a, "❌ /setprompt &lt;theme&gt;"); break; }
+        l.generalPrompt = promptText;
         await saveConfig(t, l);
-        await o.send(a, `✅ Prompt:\n<code>${escapeHtml(e)}</code>`);
+        await o.send(a, `✅ Prompt:\n<code>${escapeHtml(promptText)}</code>`);
         break;
-      case "/setinterval":
-        const e = parseInt(c[0], 10);
-        if (Number.isNaN(e) || e < 1) { await o.send(a, "❌ /setinterval &lt;minutes&gt; (min 1)"); break; }
-        l.interval = e;
+      }
+      case "/setinterval": {
+        const interval = parseInt(c[0], 10);
+        if (Number.isNaN(interval) || interval < 1) { await o.send(a, "❌ /setinterval &lt;minutes&gt; (min 1)"); break; }
+        l.interval = interval;
         await saveConfig(t, l);
-        await o.send(a, `✅ Interval: ${e} min`);
+        await o.send(a, `✅ Interval: ${interval} min`);
         break;
-      case "/setcount":
-        const e = parseInt(c[0], 10);
-        if (Number.isNaN(e) || e < 1 || e > 10) { await o.send(a, "❌ /setcount &lt;1-10&gt;"); break; }
-        l.count = e;
+      }
+      case "/setcount": {
+        const count = parseInt(c[0], 10);
+        if (Number.isNaN(count) || count < 1 || count > 10) { await o.send(a, "❌ /setcount &lt;1-10&gt;"); break; }
+        l.count = count;
         await saveConfig(t, l);
-        await o.send(a, `✅ Count: ${e}`);
+        await o.send(a, `✅ Count: ${count}`);
         break;
-      case "/setmodel":
-        const e = c.join(" ");
-        if (!e) { await o.send(a, "❌ /setmodel &lt;name&gt;\nUse /listmodels"); break; }
-        l.model = e;
+      }
+      case "/setmodel": {
+        const modelName = c.join(" ");
+        if (!modelName) { await o.send(a, "❌ /setmodel &lt;name&gt;\nUse /listmodels"); break; }
+        l.model = modelName;
         await saveConfig(t, l);
-        await o.send(a, `✅ Model: <code>${escapeHtml(e)}</code>`);
+        await o.send(a, `✅ Model: <code>${escapeHtml(modelName)}</code>`);
         break;
-      case "/listmodels":
+      }
+      case "/listmodels": {
         await o.send(a, "⏳ Loading model list...");
         try {
-          const e = await hordeGetModels();
-          const t = (Array.isArray(e) ? e : []).filter(e => e.count > 0).sort((e, t) => t.count - e.count).slice(0, 40);
-          let n = "📋 <b>Models (top-40 by workers):</b>\n\n";
-          for (const e of t) n += `${e.name?.includes("XL") || e.name?.includes("SDXL") ? "🟢" : "⚪"} <code>${escapeHtml(e.name || "?")}</code> (${e.count}w)\n`;
-          n += "\n🟢 = SDXL  ⚪ = SD1.5\nCopy name: /setmodel &lt;name&gt;";
-          await o.send(a, n);
-        } catch (e) {
-          await o.send(a, `❌ ${escapeHtml(e.message)}`);
+          const models = await hordeGetModels();
+          const filtered = (Array.isArray(models) ? models : []).filter(m => m.count > 0).sort((a, b) => b.count - a.count).slice(0, 40);
+          let text = "📋 <b>Models (top-40 by workers):</b>\n\n";
+          for (const m of filtered) text += `${m.name?.includes("XL") || m.name?.includes("SDXL") ? "🟢" : "⚪"} <code>${escapeHtml(m.name || "?")}</code> (${m.count}w)\n`;
+          text += "\n🟢 = SDXL  ⚪ = SD1.5\nCopy name: /setmodel &lt;name&gt;";
+          await o.send(a, text);
+        } catch (err) {
+          await o.send(a, `❌ ${escapeHtml(err.message)}`);
         }
         break;
-      case "/searchlora":
-        const e = c.join(" ");
-        if (!e) { await o.send(a, "❌ /searchlora &lt;query in English&gt;"); break; }
+      }
+      case "/searchlora": {
+        const query = c.join(" ");
+        if (!query) { await o.send(a, "❌ /searchlora &lt;query in English&gt;"); break; }
         await o.send(a, "🔍 Searching CivitAI...");
         try {
-          const t = `https://civitai.com/api/v1/models?types=LORA&query=${encodeURIComponent(e)}&limit=10&sort=Highest%20Rated&nsfw=true`;
-          const n = await (await fetch(t)).json();
-          if (!n.items?.length) { await o.send(a, "😕 Nothing found"); break; }
-          let s = `🔍 <b>LoRA: "${escapeHtml(e)}"</b>\n\n`;
-          for (const e of n.items.slice(0, 10)) {
-            const t = e.modelVersions?.[0];
-            const a = t?.id || "?";
-            s += `${e.nsfw ? "🔞" : "✅"} <b>${escapeHtml(e.name)}</b> [${escapeHtml(t?.baseModel || "?")}]\n`;
-            s += `   ➕ <code>/addlora ${a} 0.8</code>\n\n`;
+          const url = `https://civitai.com/api/v1/models?types=LORA&query=${encodeURIComponent(query)}&limit=10&sort=Highest%20Rated&nsfw=true`;
+          const data = await (await fetch(url)).json();
+          if (!data.items?.length) { await o.send(a, "😕 Nothing found"); break; }
+          let text = `🔍 <b>LoRA: "${escapeHtml(query)}"</b>\n\n`;
+          for (const item of data.items.slice(0, 10)) {
+            const version = item.modelVersions?.[0];
+            const id = version?.id || "?";
+            text += `${item.nsfw ? "🔞" : "✅"} <b>${escapeHtml(item.name)}</b> [${escapeHtml(version?.baseModel || "?")}]\n`;
+            text += `   ➕ <code>/addlora ${id} 0.8</code>\n\n`;
           }
-          await o.send(a, s);
-        } catch (e) {
-          await o.send(a, `❌ ${escapeHtml(e.message)}`);
+          await o.send(a, text);
+        } catch (err) {
+          await o.send(a, `❌ ${escapeHtml(err.message)}`);
         }
         break;
-      case "/addlora":
-        const e = c[0];
-        const n = parseFloat(c[1]) || 0.8;
-        const s = parseFloat(c[2]) || 1;
-        if (!e) { await o.send(a, "❌ /addlora &lt;civitai_version_id&gt; [strength=0.8] [clip=1]"); break; }
-        l.loras = (l.loras || []).filter(t => String(t.name) !== String(e));
-        l.loras.push({ name: e, strength: n, clip: s });
+      }
+      case "/addlora": {
+        const id = c[0];
+        const strength = parseFloat(c[1]) || 0.8;
+        const clip = parseFloat(c[2]) || 1;
+        if (!id) { await o.send(a, "❌ /addlora &lt;civitai_version_id&gt; [strength=0.8] [clip=1]"); break; }
+        l.loras = (l.loras || []).filter(lora => String(lora.name) !== String(id));
+        l.loras.push({ name: id, strength, clip });
         await saveConfig(t, l);
-        await o.send(a, `✅ LoRA <code>${escapeHtml(e)}</code> (strength: ${n}, clip: ${s})`);
+        await o.send(a, `✅ LoRA <code>${escapeHtml(id)}</code> (strength: ${strength}, clip: ${clip})`);
         break;
-      case "/removelora":
-        const e = c[0];
-        if (!e) { await o.send(a, "❌ /removelora &lt;id&gt;"); break; }
-        l.loras = (l.loras || []).filter(t => String(t.name) !== String(e));
+      }
+      case "/removelora": {
+        const id = c[0];
+        if (!id) { await o.send(a, "❌ /removelora &lt;id&gt;"); break; }
+        l.loras = (l.loras || []).filter(lora => String(lora.name) !== String(id));
         await saveConfig(t, l);
-        await o.send(a, `✅ LoRA <code>${escapeHtml(e)}</code> removed`);
+        await o.send(a, `✅ LoRA <code>${escapeHtml(id)}</code> removed`);
         break;
-      case "/listloras":
-        const e = l.loras || [];
-        if (!e.length) { await o.send(a, "📋 No LoRA yet. Use /searchlora"); break; }
-        let t = "📋 <b>Your LoRA:</b>\n\n";
-        e.forEach((e, a) => { t += `${a + 1}. <code>${escapeHtml(e.name)}</code> (str: ${e.strength}, clip: ${e.clip})\n   ❌ /removelora ${escapeHtml(e.name)}\n\n`; });
-        await o.send(a, t);
+      }
+      case "/listloras": {
+        const lorasList = l.loras || [];
+        if (!lorasList.length) { await o.send(a, "📋 No LoRA yet. Use /searchlora"); break; }
+        let text = "📋 <b>Your LoRA:</b>\n\n";
+        lorasList.forEach((lora, idx) => { text += `${idx + 1}. <code>${escapeHtml(lora.name)}</code> (str: ${lora.strength}, clip: ${lora.clip})\n   ❌ /removelora ${escapeHtml(lora.name)}\n\n`; });
+        await o.send(a, text);
         break;
-      case "/setsize":
-        let e = parseInt(c[0], 10);
-        let n = parseInt(c[1], 10);
-        if (Number.isNaN(e) || Number.isNaN(n) || e < 256 || n < 256 || e > 2048 || n > 2048) {
+      }
+      case "/setsize": {
+        let w = parseInt(c[0], 10);
+        let h = parseInt(c[1], 10);
+        if (Number.isNaN(w) || Number.isNaN(h) || w < 256 || h < 256 || w > 2048 || h > 2048) {
           await o.send(a, "❌ /setsize &lt;W&gt; &lt;H&gt; (256-2048, multiple of 64)\n\n<code>/setsize 1024 1024</code> — square\n<code>/setsize 832 1216</code> — portrait\n<code>/setsize 1216 832</code> — landscape");
           break;
         }
-        l.width = 64 * Math.round(e / 64);
-        l.height = 64 * Math.round(n / 64);
+        l.width = 64 * Math.round(w / 64);
+        l.height = 64 * Math.round(h / 64);
         await saveConfig(t, l);
         await o.send(a, `✅ Size: ${l.width}×${l.height}`);
         break;
-      case "/setsteps":
-        const e = parseInt(c[0], 10);
-        if (Number.isNaN(e) || e < 1 || e > 150) { await o.send(a, "❌ /setsteps &lt;1-150&gt;"); break; }
-        l.steps = e;
+      }
+      case "/setsteps": {
+        const steps = parseInt(c[0], 10);
+        if (Number.isNaN(steps) || steps < 1 || steps > 150) { await o.send(a, "❌ /setsteps &lt;1-150&gt;"); break; }
+        l.steps = steps;
         await saveConfig(t, l);
-        await o.send(a, `✅ Steps: ${e}`);
+        await o.send(a, `✅ Steps: ${steps}`);
         break;
-      case "/setcfg":
-        const e = parseFloat(c[0]);
-        if (Number.isNaN(e) || e < 1 || e > 30) { await o.send(a, "❌ /setcfg &lt;1-30&gt;"); break; }
-        l.cfgScale = e;
+      }
+      case "/setcfg": {
+        const cfg = parseFloat(c[0]);
+        if (Number.isNaN(cfg) || cfg < 1 || cfg > 30) { await o.send(a, "❌ /setcfg &lt;1-30&gt;"); break; }
+        l.cfgScale = cfg;
         await saveConfig(t, l);
-        await o.send(a, `✅ CFG: ${e}`);
+        await o.send(a, `✅ CFG: ${cfg}`);
         break;
-      case "/setsampler":
-        const e = ["k_euler", "k_euler_a", "k_lms", "k_heun", "k_dpm_2", "k_dpm_2_a", "k_dpmpp_2s_a", "k_dpmpp_2m", "k_dpmpp_sde", "DDIM"];
-        const n = c[0];
-        if (!n || !e.includes(n)) { await o.send(a, "❌ Available samplers:\n" + e.map(e => `<code>${e}</code>`).join("\n")); break; }
-        l.sampler = n;
+      }
+      case "/setsampler": {
+        const samplers = ["k_euler", "k_euler_a", "k_lms", "k_heun", "k_dpm_2", "k_dpm_2_a", "k_dpmpp_2s_a", "k_dpmpp_2m", "k_dpmpp_sde", "DDIM"];
+        const samplerName = c[0];
+        if (!samplerName || !samplers.includes(samplerName)) { await o.send(a, "❌ Available samplers:\n" + samplers.map(s => `<code>${s}</code>`).join("\n")); break; }
+        l.sampler = samplerName;
         await saveConfig(t, l);
-        await o.send(a, `✅ Sampler: ${n}`);
+        await o.send(a, `✅ Sampler: ${samplerName}`);
         break;
-      case "/setneg":
+      }
+      case "/setneg": {
         l.negativePrompt = c.join(" ") || DEFAULT_CONFIG.negativePrompt;
         await saveConfig(t, l);
         await o.send(a, `✅ Negative prompt:\n<code>${escapeHtml(l.negativePrompt)}</code>`);
         break;
-      case "/setclipskip":
-        const e = parseInt(c[0], 10);
-        if (Number.isNaN(e) || e < 1 || e > 4) { await o.send(a, "❌ /setclipskip &lt;1-4&gt;"); break; }
-        l.clipSkip = e;
+      }
+      case "/setclipskip": {
+        const clipSkipVal = parseInt(c[0], 10);
+        if (Number.isNaN(clipSkipVal) || clipSkipVal < 1 || clipSkipVal > 4) { await o.send(a, "❌ /setclipskip &lt;1-4&gt;"); break; }
+        l.clipSkip = clipSkipVal;
         await saveConfig(t, l);
-        await o.send(a, `✅ CLIP Skip: ${e}`);
+        await o.send(a, `✅ CLIP Skip: ${clipSkipVal}`);
         break;
-      case "/setllm":
-        const e = c.join(" ");
-        if (!e) {
+      }
+      case "/setllm": {
+        const llm = c.join(" ");
+        if (!llm) {
           await o.send(a, "❌ /setllm &lt;model_id&gt;\n\n<b>Free OpenRouter models:</b>\n<code>meta-llama/llama-3.1-8b-instruct:free</code>\n<code>google/gemma-2-9b-it:free</code>\n<code>mistralai/mistral-7b-instruct:free</code>\n<code>qwen/qwen-2-7b-instruct:free</code>");
           break;
         }
-        l.llmModel = e;
+        l.llmModel = llm;
         await saveConfig(t, l);
-        await o.send(a, `✅ LLM: <code>${escapeHtml(e)}</code>`);
+        await o.send(a, `✅ LLM: <code>${escapeHtml(llm)}</code>`);
         break;
-      case "/setcaption":
-        const e = c[0]?.toLowerCase() || "";
-        const n = "prompt" === e || "1" === e ? 1 : "ai" === e || "2" === e ? 2 : 0;
-        l.captionMode = n;
+      }
+      case "/setcaption": {
+        const modeStr = c[0]?.toLowerCase() || "";
+        const mode = "prompt" === modeStr || "1" === modeStr ? 1 : "ai" === modeStr || "2" === modeStr ? 2 : 0;
+        l.captionMode = mode;
         await saveConfig(t, l);
-        await o.send(a, `✅ Режим подписи: ${0 === n ? "без" : 1 === n ? "промпт" : "🤖 AI"}`);
+        await o.send(a, `✅ Режим подписи: ${0 === mode ? "без" : 1 === mode ? "промпт" : "🤖 AI"}`);
         break;
-      case "/setcaptioninstr":
-        const e = c.join(" ");
-        if (!e) { await o.send(a, "❌ /setcaptioninstr &lt;инструкция для ИИ&gt;"); break; }
-        l.captionInstruction = e;
+      }
+      case "/setcaptioninstr": {
+        const instr = c.join(" ");
+        if (!instr) { await o.send(a, "❌ /setcaptioninstr &lt;инструкция для ИИ&gt;"); break; }
+        l.captionInstruction = instr;
         await saveConfig(t, l);
         await o.send(a, `✅ Инструкция для AI-подписи обновлена`);
         break;
-      case "/setchannel":
-        const e = c[0];
-        if (!e) { await o.send(a, "❌ /setchannel &lt;@username или chat ID&gt;"); break; }
-        l.channelId = e;
+      }
+      case "/setchannel": {
+        const channel = c[0];
+        if (!channel) { await o.send(a, "❌ /setchannel &lt;@username или chat ID&gt;"); break; }
+        l.channelId = channel;
         await saveConfig(t, l);
-        await o.send(a, `✅ Канал для автопоста: <code>${escapeHtml(e)}</code>\nГруппа остаётся активной: <code>${l.chatId || "—"}</code>`);
+        await o.send(a, `✅ Канал для автопоста: <code>${escapeHtml(channel)}</code>\nГруппа остаётся активной: <code>${l.chatId || "—"}</code>`);
         break;
-      case "/unsetchannel":
+      }
+      case "/unsetchannel": {
         l.channelId = null;
         await saveConfig(t, l);
         await o.send(a, "✅ Канал отвязан (группа работает как раньше)");
         break;
-      case "/addpostproc":
-        const e = c[0];
-        if (!e) { await o.send(a, "❌ /addpostproc &lt;GFPGAN | CodeFormer&gt;"); break; }
+      }
+      case "/addpostproc": {
+        const proc = c[0];
+        if (!proc) { await o.send(a, "❌ /addpostproc &lt;GFPGAN | CodeFormer&gt;"); break; }
         l.postProcessing = l.postProcessing || [];
-        if (!l.postProcessing.includes(e)) l.postProcessing.push(e);
+        if (!l.postProcessing.includes(proc)) l.postProcessing.push(proc);
         await saveConfig(t, l);
-        await o.send(a, `✅ Post-processing <code>${escapeHtml(e)}</code> добавлен (улучшайзеры лиц и т.д.)`);
+        await o.send(a, `✅ Post-processing <code>${escapeHtml(proc)}</code> добавлен (улучшайзеры лиц и т.д.)`);
         break;
-      case "/removepostproc":
-        const e = c[0];
-        if (!e) { await o.send(a, "❌ /removepostproc &lt;name&gt;"); break; }
-        l.postProcessing = (l.postProcessing || []).filter(t => t !== e);
+      }
+      case "/removepostproc": {
+        const proc = c[0];
+        if (!proc) { await o.send(a, "❌ /removepostproc &lt;name&gt;"); break; }
+        l.postProcessing = (l.postProcessing || []).filter(p => p !== proc);
         await saveConfig(t, l);
-        await o.send(a, `✅ Post-processing <code>${escapeHtml(e)}</code> удалён`);
+        await o.send(a, `✅ Post-processing <code>${escapeHtml(proc)}</code> удалён`);
         break;
-      case "/listpostproc":
-        const e = l.postProcessing || [];
-        let t = "📋 <b>Post-processing (Horde улучшайзеры):</b>\n\n";
-        t += e.length ? e.map(e => `• <code>${escapeHtml(e)}</code> — /removepostproc ${escapeHtml(e)}`).join("\n") : "нет\n\nОбщие: GFPGAN (лица), CodeFormer (лучшие лица)";
-        await o.send(a, t);
+      }
+      case "/listpostproc": {
+        const procs = l.postProcessing || [];
+        let text = "📋 <b>Post-processing (Horde улучшайзеры):</b>\n\n";
+        text += procs.length ? procs.map(p => `• <code>${escapeHtml(p)}</code> — /removepostproc ${escapeHtml(p)}`).join("\n") : "нет\n\nОбщие: GFPGAN (лица), CodeFormer (лучшие лица)";
+        await o.send(a, text);
         break;
-      case "/enable":
+      }
+      case "/enable": {
         if (!l.chatId) { await o.send(a, "❌ First: /setchat"); break; }
         if (!l.generalPrompt) { await o.send(a, "❌ First: /setprompt"); break; }
         l.enabled = true;
         await saveConfig(t, l);
         await o.send(a, `🟢 Autoposting enabled!\nInterval: ${l.interval} min.\nCount: ${l.count}`);
         break;
-      case "/disable":
+      }
+      case "/disable": {
         l.enabled = false;
         await saveConfig(t, l);
         await o.send(a, "🔴 Autoposting disabled");
         break;
-      case "/status":
-        const { text: e, keyboard: n } = await getStatusResponse(l, t);
-        await o.send(a, e, { reply_markup: n });
+      }
+      case "/status": {
+        const { text: statusText, keyboard: kb } = await getStatusResponse(l, t);
+        await o.send(a, statusText, { reply_markup: kb });
         break;
-      case "/generate":
+      }
+      case "/generate": {
         if (!l.generalPrompt) { await o.send(a, "❌ First: /setprompt"); break; }
-        const e = l.chatId || a;
+        const targetChat = l.chatId || a;
         await o.send(a, `⏳ Generating ${l.count} images...`);
-        const n = (await getWorkerBlacklist(t)).map(e => e.id).filter(Boolean);
-        for (let s = 0; s < l.count; s++) {
+        const blacklist = (await getWorkerBlacklist(t)).map(w => w.id).filter(Boolean);
+        for (let i = 0; i < l.count; i++) {
           try {
-            const i = await generatePrompt(l.generalPrompt, t);
-            await o.send(a, `🎨 #${s + 1}:\n<code>${escapeHtml(i.substring(0, 300))}</code>`);
-            const r = await hordeSubmit(i, l, t, { workerBlacklist: n });
-            if (r.id) {
-              await KV.put(t, `pending:${r.id}`, JSON.stringify({ chatId: e, prompt: i, at: Date.now(), notify: a, retries: 0 }), { expirationTtl: 3600 });
-              await o.send(a, `📤 ID: <code>${r.id}</code>`);
-            } else await o.send(a, `❌ Horde: <code>${escapeHtml(JSON.stringify(r).substring(0, 300))}</code>`);
-          } catch (e) {
-            await o.send(a, `❌ ${escapeHtml(e.message)}`);
+            const prompt = await generatePrompt(l.generalPrompt, t);
+            await o.send(a, `🎨 #${i + 1}:\n<code>${escapeHtml(prompt.substring(0, 300))}</code>`);
+            const result = await hordeSubmit(prompt, l, t, { workerBlacklist: blacklist });
+            if (result.id) {
+              await KV.put(t, `pending:${result.id}`, JSON.stringify({ chatId: targetChat, prompt, at: Date.now(), notify: a, retries: 0 }), { expirationTtl: 3600 });
+              await o.send(a, `📤 ID: <code>${result.id}</code>`);
+            } else await o.send(a, `❌ Horde: <code>${escapeHtml(JSON.stringify(result).substring(0, 300))}</code>`);
+          } catch (err) {
+            await o.send(a, `❌ ${escapeHtml(err.message)}`);
           }
         }
         break;
-      case "/pending":
-        const e = await KV.list(t, "pending:");
-        if (!e.keys.length) { await o.send(a, "📋 Queue is empty"); break; }
-        let n = `📋 <b>In queue: ${e.keys.length}</b>\n\n`;
-        for (const t of e.keys.slice(0, 10)) {
-          const e = t.name.replace("pending:", "");
+      }
+      case "/pending": {
+        const pendingList = await KV.list(t, "pending:");
+        if (!pendingList.keys.length) { await o.send(a, "📋 Queue is empty"); break; }
+        let text = `📋 <b>In queue: ${pendingList.keys.length}</b>\n\n`;
+        for (const item of pendingList.keys.slice(0, 10)) {
+          const id = item.name.replace("pending:", "");
           try {
-            const t = await hordeCheck(e);
-            n += `🔸 <code>${e}</code>\n   ${t.done ? "✅ Ready" : t.processing ? "⚙️ Processing" : `⏳ Queue #${t.queue_position || "?"}`} | ~${t.wait_time || 0}s\n\n`;
+            const check = await hordeCheck(id);
+            text += `🔸 <code>${id}</code>\n   ${check.done ? "✅ Ready" : check.processing ? "⚙️ Processing" : `⏳ Queue #${check.queue_position || "?"}`} | ~${check.wait_time || 0}s\n\n`;
           } catch {
-            n += `🔸 <code>${e}</code> — failed to check\n\n`;
+            text += `🔸 <code>${id}</code> — failed to check\n\n`;
           }
         }
-        await o.send(a, n);
+        await o.send(a, text);
         break;
-      case "/cancel":
-        const e = await KV.list(t, "pending:");
-        await Promise.all(e.keys.map(e => KV.del(t, e.name)));
-        await o.send(a, `🗑 Removed from queue: ${e.keys.length}`);
+      }
+      case "/cancel": {
+        const pendingList = await KV.list(t, "pending:");
+        await Promise.all(pendingList.keys.map(item => KV.del(t, item.name)));
+        await o.send(a, `🗑 Removed from queue: ${pendingList.keys.length}`);
         break;
-      case "/workerbl":
-        const e = await getWorkerBlacklist(t);
-        if (!e.length) { await o.send(a, "📋 Worker blacklist is empty"); break; }
-        let n = `🚫 <b>Worker blacklist: ${e.length}</b>\n\n`;
-        for (const t of e) n += `• <code>${escapeHtml(t.name || "?")}</code>\n  ID: <code>${escapeHtml(t.id)}</code>\n  ${new Date(t.t).toISOString().slice(0, 10)}\n\n`;
-        n += "/clearworkerbl — clear blacklist";
-        await o.send(a, n);
+      }
+      case "/workerbl": {
+        const bl = await getWorkerBlacklist(t);
+        if (!bl.length) { await o.send(a, "📋 Worker blacklist is empty"); break; }
+        let text = `🚫 <b>Worker blacklist: ${bl.length}</b>\n\n`;
+        for (const w of bl) text += `• <code>${escapeHtml(w.name || "?")}</code>\n  ID: <code>${escapeHtml(w.id)}</code>\n  ${new Date(w.t).toISOString().slice(0, 10)}\n\n`;
+        text += "/clearworkerbl — clear blacklist";
+        await o.send(a, text);
         break;
-      case "/clearworkerbl":
+      }
+      case "/clearworkerbl": {
         await clearWorkerBlacklist(t);
         await o.send(a, "✅ Worker blacklist cleared");
         break;
+      }
       default:
         if (r.startsWith("/")) await o.send(a, "❓ Unknown command — /help");
     }
@@ -739,72 +768,72 @@ async function processScheduled(e) {
       }
       let c = false;
       let l = false;
-      for (const a of r) {
-        const n = a.worker_id || "?";
-        const s = a.worker_name || "?";
-        const i = isCensored(a);
+      for (const gen of r) {
+        const workerId = gen.worker_id || "?";
+        const workerName = gen.worker_name || "?";
+        const censored = isCensored(gen);
         if (o.debug && o.notify) {
-          const e = a.img ? isHttpUrl(a.img) ? `URL (${a.img.substring(0, 45)}...)` : `base64 (${a.img.length} chars)` : "null";
-          const r = a.gen_metadata?.length ? a.gen_metadata.map(e => `${e.type}:${e.value}`).join(", ") : "none";
-          await t.send(o.notify, `🔍 <b>Result</b>\ncensored: ${a.censored ? "yes" : "no"}\nstate: ${a.state || "ok"}\ngen_metadata: ${escapeHtml(r)}\nisCensored(): ${i ? "yes" : "no"}\nWorker: <code>${escapeHtml(s)}</code>\nWorker ID: <code>${escapeHtml(n)}</code>\nModel: <code>${escapeHtml(a.model || "?")}</code>\nImage: ${escapeHtml(e)}`);
+          const imgInfo = gen.img ? isHttpUrl(gen.img) ? `URL (${gen.img.substring(0, 45)}...)` : `base64 (${gen.img.length} chars)` : "null";
+          const meta = gen.gen_metadata?.length ? gen.gen_metadata.map(m => `${m.type}:${m.value}`).join(", ") : "none";
+          await t.send(o.notify, `🔍 <b>Result</b>\ncensored: ${gen.censored ? "yes" : "no"}\nstate: ${gen.state || "ok"}\ngen_metadata: ${escapeHtml(meta)}\nisCensored(): ${censored ? "yes" : "no"}\nWorker: <code>${escapeHtml(workerName)}</code>\nWorker ID: <code>${escapeHtml(workerId)}</code>\nModel: <code>${escapeHtml(gen.model || "?")}</code>\nImage: ${escapeHtml(imgInfo)}`);
         }
-        if (i) {
-          await addWorkerToBlacklist(e, n, s);
+        if (censored) {
+          await addWorkerToBlacklist(e, workerId, workerName);
           l = true;
-          o.notify && await t.send(o.notify, `🔴 Worker <code>${escapeHtml(s)}</code> returned censorship\nAdded to blacklist and retrying...`);
+          o.notify && await t.send(o.notify, `🔴 Worker <code>${escapeHtml(workerName)}</code> returned censorship\nAdded to blacklist and retrying...`);
           continue;
         }
-        if (!a.img) {
+        if (!gen.img) {
           o.notify && await t.send(o.notify, "❌ gen.img is empty");
           continue;
         }
-        const d = o.prompt || "";
-        const p = await getSendCaption(d, a, e);
-        const { sent: m, tooSmall: u, sizeKB: h } = await deliverImage(t, o.chatId, a.img, p, o.notify);
-        if (m) c = true;
-        if (u) {
+        const prompt = o.prompt || "";
+        const caption = await getSendCaption(prompt, a, e);
+        const { sent: sentOk, tooSmall: tooSmallFlag, sizeKB: size } = await deliverImage(t, o.chatId, gen.img, caption, o.notify);
+        if (sentOk) c = true;
+        if (tooSmallFlag) {
           l = true;
-          await addWorkerToBlacklist(e, n, s);
-          o.notify && await t.send(o.notify, `🚫 Worker <code>${escapeHtml(s)}</code> probably returned a placeholder (${h}KB)`);
+          await addWorkerToBlacklist(e, workerId, workerName);
+          o.notify && await t.send(o.notify, `🚫 Worker <code>${escapeHtml(workerName)}</code> probably returned a placeholder (${size}KB)`);
         }
         if (a.channelId) {
-          await deliverImage(t, a.channelId, a.img, p, null);
+          await deliverImage(t, a.channelId, gen.img, caption, null);
         }
       }
       if (l && !c && !o.sfwTest) {
-        const n = (o.retries || 0) + 1;
-        if (n < 3) {
+        const retries = (o.retries || 0) + 1;
+        if (retries < 3) {
           try {
-            const s = (await getWorkerBlacklist(e)).map(e => e.id).filter(Boolean);
-            const i = await hordeSubmit(o.prompt, a, e, { workerBlacklist: s });
-            if (i.id) {
-              await KV.put(e, `pending:${i.id}`, JSON.stringify({ ...o, at: Date.now(), retries: n }), { expirationTtl: 3600 });
-              o.notify && await t.send(o.notify, `🔄 Retry ${n}/3: <code>${i.id}</code>\n🚫 Blacklist: ${s.length} workers`);
+            const bl = (await getWorkerBlacklist(e)).map(w => w.id).filter(Boolean);
+            const retryResult = await hordeSubmit(o.prompt, a, e, { workerBlacklist: bl });
+            if (retryResult.id) {
+              await KV.put(e, `pending:${retryResult.id}`, JSON.stringify({ ...o, at: Date.now(), retries }), { expirationTtl: 3600 });
+              o.notify && await t.send(o.notify, `🔄 Retry ${retries}/3: <code>${retryResult.id}</code>\n🚫 Blacklist: ${bl.length} workers`);
             }
-          } catch (e) {
-            console.error("[CRON] retry:", e.message);
+          } catch (err) {
+            console.error("[CRON] retry:", err.message);
           }
         } else o.notify && await t.send(o.notify, "❌ <b>3 attempts — all placeholders/censored</b>\n\nPossible reasons:\n• Anonymous Horde key (NSFW will not work)\n• Account flagged\n• All available workers censor this model\n\n/clearworkerbl — clear blacklist and try again");
       }
       c && o.notify && o.notify !== o.chatId && await t.send(o.notify, "✅ Image sent");
-    } catch (e) {
-      console.error(`[CRON] ${n}:`, e.message);
+    } catch (err) {
+      console.error(`[CRON] ${n}:`, err.message);
     }
   }
   if (!a.enabled || !a.chatId || !a.generalPrompt) return;
   if ((await KV.list(e, "pending:")).keys.length > 0) return;
-  const s = parseInt(await KV.get(e, "last_post_time") || "0", 10);
-  const o = Date.now();
-  if (o - s < 60 * a.interval * 1e3) return;
-  await KV.put(e, "last_post_time", String(o));
-  const i = (await getWorkerBlacklist(e)).map(e => e.id).filter(Boolean);
-  for (let t = 0; t < a.count; t++) {
+  const lastTime = parseInt(await KV.get(e, "last_post_time") || "0", 10);
+  const now = Date.now();
+  if (now - lastTime < 60 * a.interval * 1e3) return;
+  await KV.put(e, "last_post_time", String(now));
+  const blacklist = (await getWorkerBlacklist(e)).map(w => w.id).filter(Boolean);
+  for (let i = 0; i < a.count; i++) {
     try {
-      const t = await generatePrompt(a.generalPrompt, e);
-      const n = await hordeSubmit(t, a, e, { workerBlacklist: i });
-      if (n.id) await KV.put(e, `pending:${n.id}`, JSON.stringify({ chatId: a.chatId, prompt: t, at: o, notify: null, retries: 0 }), { expirationTtl: 3600 });
-    } catch (e) {
-      console.error("[CRON] auto:", e.message);
+      const prompt = await generatePrompt(a.generalPrompt, e);
+      const result = await hordeSubmit(prompt, a, e, { workerBlacklist: blacklist });
+      if (result.id) await KV.put(e, `pending:${result.id}`, JSON.stringify({ chatId: a.chatId, prompt, at: now, notify: null, retries: 0 }), { expirationTtl: 3600 });
+    } catch (err) {
+      console.error("[CRON] auto:", err.message);
     }
   }
 }
@@ -818,8 +847,8 @@ export default {
         const a = await e.json();
         a.message?.text && await handleCommand(a.message, t);
         a.callback_query && await handleCallback(a.callback_query, t);
-      } catch (e) {
-        console.error("[WH]", e.message);
+      } catch (err) {
+        console.error("[WH]", err.message);
       }
       return new Response("OK");
     }
@@ -838,8 +867,8 @@ export default {
   async scheduled(e, t, a) {
     try {
       await processScheduled(t);
-    } catch (e) {
-      console.error("[CRON] CRASH:", e.message);
+    } catch (err) {
+      console.error("[CRON] CRASH:", err.message);
     }
   }
 };
