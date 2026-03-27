@@ -5,13 +5,10 @@
 //
 // Improvements:
 //  - Settings organized via buttons (/settings)
-//  - Enhanced model/LoRA list with search and pagination
-// - Added AI Horde enhancers (face fixer, upscalers, etc.) with selection
-//  - Prompt modification via [brackets] for LLM-driven prompt editing
- // - Auto-post modes: prompt hidden/shown/AI-generated post text
- // - Telegram channel/group auto-posting with independent control
-// - Preset saving/loading for quick configuration switching
- // - KV database migrated to Upstash Redis(using UPSTASH_REDIS_REST_URL/TOKEN)
+//  - Enhanced model/LoRA list with search and pagination//  - Added AI Horde enhancers (face fixer, upscalers, etc.) with selection
+//  - Prompt modification via [brackets] for LLM-driven prompt editing//  - Auto-post modes: prompt hidden/shown/AI-generated post text
+//  - Telegram channel/group auto-posting with independent control//  - Preset saving/loading for quick configuration switching
+//  - KV database migrated to Upstash Redis (using UPSTASH_REDIS_REST_URL/TOKEN)
 // ============================================================
 
 const DEFAULT_CONFIG = {
@@ -58,8 +55,10 @@ const UPSTASH_TOKEN = "UPSTASH_REDIS_REST_TOKEN";
 
 // ============================================================
 // Upstash Redis KV Helper
-// ============================================================const KV = {
-  async get(env, key, type = "text") {
+// ============================================================
+const KV = {
+  async get(env, key, type) {
+    if (type === undefined) type = "text";
     const url = env[UPSTASH_URL];
     const token = env[UPSTASH_TOKEN];
     if (!url || !token) return null;
@@ -189,7 +188,8 @@ function isHttpUrl(v) {
 }
 
 // ============================================================
-// Telegram// ============================================================
+// Telegram
+// ============================================================
 
 class Telegram {
   constructor(token) {
@@ -289,7 +289,9 @@ async function clearWorkerBlacklist(env) {
 
 // ============================================================
 // Horde Censorship Detection
-// ============================================================function isCensored(gen) {
+// ============================================================
+
+function isCensored(gen) {
   if (!gen) return false;
   if (gen.gen_metadata?.some((m) => m.type === "censorship")) return true;
   if (gen.censored === true) return true;
@@ -428,9 +430,7 @@ async function hordeGetModels() {
 
 // ============================================================
 // Image Delivery
-// ============================================================
-
-async function downloadImage(url) {
+// ============================================================async function downloadImage(url) {
   try {
     const resp = await fetch(url);
     if (!resp.ok) return null;
@@ -608,8 +608,7 @@ function templatePrompt(base) {
 }
 
 function processPromptBrackets(text) {
-  // Find all [content] blocks
-  const bracketMatches = text.match(/\[([^\]]+)\]/g);
+  // Find all [content] blocks  const bracketMatches = text.match(/\[([^\]]+)\]/g);
   if (!bracketMatches) return text;
 
   let processed = text;
@@ -807,8 +806,7 @@ async function handleCommand(msg, env) {
         `💎 Kudos: ${info.kudos || 0}\n` +
         `🛡 Trusted: ${info.trusted ? "yes" : "no"}\n` +
         `🚩 Flagged: ${info.flagged ? "yes" : "no"}\n\n` +
-        status
-    );
+        status    );
     return;
   }
 
@@ -1816,7 +1814,8 @@ async function processScheduled(env) {
         workerBlacklist: blIds,
       });
       if (result.id) {
-        // Determine target chats for auto-post        const targetChats = [];
+        // Determine target chats for auto-post
+        const targetChats = [];
         if (config.useChannel && config.channelId) targetChats.push(config.channelId);
         if (config.useGroup && config.groupId) targetChats.push(config.groupId);
         if (!targetChats.length) targetChats.push(config.chatId);
@@ -1843,8 +1842,7 @@ async function processScheduled(env) {
 }
 
 // ============================================================
-// Entry point
-// ============================================================
+// Entry point// ============================================================
 
 export default {
   async fetch(request, env) {
