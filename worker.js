@@ -707,7 +707,7 @@ async function processScheduled(env) {
             const task = await KV.get(env, keyObj.name, "json");
             if (!task) { await KV.del(env, keyObj.name); continue; }
 
-            if (Date.now() - task.at > 1200000) {
+            if (Date.now() - task.at > 3600000) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
                 continue;
