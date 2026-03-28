@@ -183,7 +183,6 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.post_processing = config.postProcessors;
     }
 
-    // FIX: is_version: false — пользователи добавляют model ID, а не version ID
     if (!extra.skipLoras && config.loras?.length > 0) {
         params.loras = config.loras.map(l => ({
             name: String(l.name),
@@ -207,7 +206,6 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         allow_downgrade: true
     };
 
-    // FIX: передаём весь список воркеров в ЧС, не только 5
     if (extra.workerBlacklist?.length > 0) {
         payload.workers = extra.workerBlacklist;
         payload.worker_blacklist = true;
@@ -297,7 +295,6 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId) {
     return { sent: false, tooSmall: false, sizeKB };
 }
 
-// FIX: убраны захардкоженные фразы, добавлен retry при сбое LLM
 async function callOpenRouter(env, model, messages, maxTokens = 700, retries = 2) {
     let lastErr = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -390,6 +387,9 @@ async function handleCommand(msg, env) {
 
     if (!env.TELEGRAM_BOT_TOKEN) return;
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
+
+    // FIX: Реагируем только на команды, чтобы бот не лез в обычные разговоры и проверки админа
+    if (!text.startsWith("/")) return;
 
     const args = text.split(/\s+/);
     const cmd = args[0].split("@")[0].toLowerCase();
@@ -537,7 +537,6 @@ async function handleCommand(msg, env) {
             if (config.loras.find(l => String(l.name) === String(loraId))) {
                 return await tg.send(chatId, `⚠️ LoRA <code>${loraId}</code> уже в списке`);
             }
-            // Проверяем совместимость с текущей моделью через CivitAI
             let compatMsg = "";
             try {
                 const civRes = await fetch(`https://civitai.com/api/v1/models/${loraId}`);
@@ -745,7 +744,6 @@ async function processScheduled(env) {
 
                 if (!gen.img) continue;
 
-                // Проверяем пропущенные LoRA в метаданных
                 if (gen.gen_metadata?.length && task.notify && config.loras?.length) {
                     const skipped = gen.gen_metadata.filter(m => m.type === "lora_skipped" || m.type === "lora");
                     if (skipped.length) {
@@ -814,16 +812,21 @@ async function processScheduled(env) {
 }
 
 export default {
-    async fetch(req, env) {
+    // FIX: Добавил ctx, чтобы иметь возможность обрабатывать скрипт в фоне после ответа
+    async fetch(req, env, ctx) {
         const url = new URL(req.url);
 
         if (url.pathname === "/webhook") {
             if (req.method !== "POST") return new Response("POST only", { status: 405 });
             try {
                 const body = await req.json();
-                if (body.message?.text) await handleCommand(body.message, env);
+                // FIX: Передаем задачу в ctx.waitUntil()
+                // Это позволяет мгновенно вернуть 200 OK телеграму, чтобы он не спамил ретраями
+                if (body.message?.text && body.message.text.startsWith("/")) {
+                    ctx.waitUntil(handleCommand(body.message, env));
+                }
             } catch (e) { console.error("[WH]", e.message); }
-            return new Response("OK");
+            return new Response("OK", { status: 200 });
         }
 
         if (url.pathname === "/setup") {
