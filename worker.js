@@ -298,7 +298,7 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId) {
 }
 
 // FIX: убраны захардкоженные фразы, добавлен retry при сбое LLM
-async function callOpenRouter(env, model, messages, maxTokens = 400, retries = 2) {
+async function callOpenRouter(env, model, messages, maxTokens = 700, retries = 2) {
     let lastErr = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
@@ -514,8 +514,15 @@ async function handleCommand(msg, env) {
                 const res = await fetch(`https://civitai.com/api/v1/models?query=${encodeURIComponent(ql)}&types=LORA&limit=15`);
                 const data = await res.json();
                 if (!data.items?.length) return await tg.send(chatId, "😕 Ничего не найдено");
-                let txt = "🔍 <b>Найдено LoRA (используй ID для /addlora):</b>\n\n";
-                data.items.forEach(m => txt += `<code>${m.id}</code> — ${escapeHtml(m.name)}\n`);
+                const isXL = config.model?.toLowerCase().includes("xl");
+                let txt = `🔍 <b>Найдено LoRA</b> (текущая модель: ${isXL ? "SDXL" : "SD 1.5"}):\n\n`;
+                data.items.forEach(m => {
+                    const base = m.modelVersions?.[0]?.baseModel || "?";
+                    const compat = isXL ? base.toLowerCase().includes("xl") : !base.toLowerCase().includes("xl");
+                    const icon = compat ? "✅" : "⚠️";
+                    txt += `${icon} <code>${m.id}</code> — ${escapeHtml(m.name)} [${base}]\n`;
+                });
+                txt += `\n<i>✅ = совместима с текущей моделью, ⚠️ = несовместима</i>`;
                 await tg.send(chatId, txt);
             } catch (e) { await tg.send(chatId, "❌ Ошибка поиска: " + e.message); }
             break;
@@ -530,9 +537,27 @@ async function handleCommand(msg, env) {
             if (config.loras.find(l => String(l.name) === String(loraId))) {
                 return await tg.send(chatId, `⚠️ LoRA <code>${loraId}</code> уже в списке`);
             }
+            // Проверяем совместимость с текущей моделью через CivitAI
+            let compatMsg = "";
+            try {
+                const civRes = await fetch(`https://civitai.com/api/v1/models/${loraId}`);
+                if (civRes.ok) {
+                    const civData = await civRes.json();
+                    const base = civData.modelVersions?.[0]?.baseModel || "";
+                    const loraName = civData.name || loraId;
+                    const isXL = config.model?.toLowerCase().includes("xl");
+                    const loraIsXL = base.toLowerCase().includes("xl");
+                    if (base) compatMsg = `\n📦 <b>${escapeHtml(loraName)}</b> [${base}]`;
+                    if (isXL !== loraIsXL) {
+                        compatMsg += `\n⚠️ <b>Внимание:</b> LoRA обучена на <b>${base}</b>, а текущая модель — <b>${isXL ? "SDXL" : "SD 1.5"}</b>. Скорее всего не применится!`;
+                    } else {
+                        compatMsg += `\n✅ Совместима с текущей моделью`;
+                    }
+                }
+            } catch (_) {}
             config.loras.push({ name: loraId, strength: loraStr, clip: loraClip });
             await saveConfig(env, config);
-            await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена (str: ${loraStr}, clip: ${loraClip})`);
+            await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена (str: ${loraStr}, clip: ${loraClip})${compatMsg}`);
             break;
         }
 
@@ -719,6 +744,15 @@ async function processScheduled(env) {
                 }
 
                 if (!gen.img) continue;
+
+                // Проверяем пропущенные LoRA в метаданных
+                if (gen.gen_metadata?.length && task.notify && config.loras?.length) {
+                    const skipped = gen.gen_metadata.filter(m => m.type === "lora_skipped" || m.type === "lora");
+                    if (skipped.length) {
+                        const names = skipped.map(m => m.ref || m.id || "?").join(", ");
+                        await tg.send(task.notify, `⚠️ <b>LoRA пропущена воркером!</b>\nID: <code>${names}</code>\n<i>Причина: воркер не поддерживает или несовместима с моделью</i>`);
+                    }
+                }
 
                 let captionText = "";
                 if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
