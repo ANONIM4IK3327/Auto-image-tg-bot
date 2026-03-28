@@ -195,7 +195,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         nsfw: config.nsfw,
         censor_nsfw: false,
         trusted_workers: false,
-        replacement_filter: true,
+        replacement_filter: false,
         models: [config.model],
         r2: true,
         shared: false,
