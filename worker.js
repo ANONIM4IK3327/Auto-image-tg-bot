@@ -15,7 +15,7 @@ const DEFAULT_CONFIG = {
     sampler: "k_dpmpp_2m",
     nsfw: true,
     negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
-    llmModel: "meta-llama/llama-3.3-70b-instruct:free",
+    llmModel: "mistralai/mistral-7b-instruct:free",
     clipSkip: 2,
     hiresFix: false,
     hiresFixDenoising: 0.65,
@@ -100,9 +100,7 @@ const Redis = {
     async put(env, key, value, opts = {}) {
         const val = typeof value === "string" ? value : JSON.stringify(value);
         const args = ["SET", key, val];
-        if (opts.expirationTtl) {
-            args.push("EX", opts.expirationTtl);
-        }
+        if (opts.expirationTtl) args.push("EX", opts.expirationTtl);
         await this.call(env, ...args);
     },
     async del(env, key) {
@@ -134,7 +132,7 @@ async function addWorkerToBlacklist(env, id, name) {
     const list = await getWorkerBlacklist(env);
     if (!list.find(w => w.id === id)) {
         list.push({ id, name: name || "?", t: Date.now() });
-        if (list.length > 30) list.shift();
+        if (list.length > 50) list.shift();
         await KV.put(env, "worker_blacklist", JSON.stringify(list));
     }
 }
@@ -181,18 +179,25 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.hires_fix_denoising_strength = config.hiresFixDenoising || 0.65;
     }
 
-    if (config.postProcessors && config.postProcessors.length > 0) {
+    if (config.postProcessors?.length > 0) {
         params.post_processing = config.postProcessors;
     }
 
+    // FIX: is_version: false — пользователи добавляют model ID, а не version ID
     if (!extra.skipLoras && config.loras?.length > 0) {
-        params.loras = config.loras.map(l => ({ name: String(l.name), model: l.strength ?? 1, clip: l.clip ?? 1, inject_trigger: "any", is_version: true }));
+        params.loras = config.loras.map(l => ({
+            name: String(l.name),
+            model: l.strength ?? 1,
+            clip: l.clip ?? 1,
+            inject_trigger: "any",
+            is_version: false
+        }));
     }
 
     const payload = {
         prompt: config.negativePrompt ? `${prompt} ### ${config.negativePrompt}` : prompt,
         params,
-        nsfw: config.nsfw,
+        nsfw: config.nsfw !== false,
         censor_nsfw: false,
         trusted_workers: false,
         replacement_filter: false,
@@ -202,16 +207,25 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         allow_downgrade: true
     };
 
+    // FIX: передаём весь список воркеров в ЧС, не только 5
     if (extra.workerBlacklist?.length > 0) {
-        payload.workers = extra.workerBlacklist.slice(0, 5);
+        payload.workers = extra.workerBlacklist;
         payload.worker_blacklist = true;
     }
 
-    return (await fetch(`${HORDE_API}/generate/async`, {
+    const res = await fetch(`${HORDE_API}/generate/async`, {
         method: "POST",
         headers: { "Content-Type": "application/json", apikey: key, ...HORDE_HEADERS },
         body: JSON.stringify(payload)
-    })).json();
+    });
+
+    if (!res.ok) {
+        const errText = await res.text();
+        console.error("[Horde Submit Error]", res.status, errText.substring(0, 300));
+        return { error: errText, status: res.status };
+    }
+
+    return res.json();
 }
 
 async function hordeCheck(id) {
@@ -272,36 +286,21 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId) {
     if (r.ok) return { sent: true, tooSmall: false, sizeKB };
 
     r = await tg.sendDocument(chatId, buffer, caption);
-    if (r.ok || (isUrl && (await tg.sendPhotoUrl(chatId, imgData, caption)).ok)) {
-        return { sent: true, tooSmall: false, sizeKB };
+    if (r.ok) return { sent: true, tooSmall: false, sizeKB };
+
+    if (isUrl) {
+        r = await tg.sendPhotoUrl(chatId, imgData, caption);
+        if (r.ok) return { sent: true, tooSmall: false, sizeKB };
     }
 
-    if (notifyId) await tg.send(notifyId, `❌ Не удалось отправить изображение: ${escapeHtml(r.description)}`);
+    if (notifyId) await tg.send(notifyId, `❌ Не удалось отправить изображение: ${escapeHtml(r?.description || "unknown error")}`);
     return { sent: false, tooSmall: false, sizeKB };
 }
 
-async function generatePrompt(basePrompt, env, config) {
-    let instruction = null;
-    let cleanPrompt = basePrompt;
-
-    const match = basePrompt.match(/\[([\s\S]*?)\]/);
-    if (match) {
-        instruction = match[1];
-        cleanPrompt = basePrompt.replace(match[0], '').trim();
-    }
-
-    if (env.OPENROUTER_API_KEY) {
-        const llmModel = config.llmModel || env.LLM_MODEL || "meta-llama/llama-3.3-70b-instruct:free";
-        let sysPrompt, userPrompt;
-
-        if (instruction) {
-            sysPrompt = "You are an expert Stable Diffusion prompt engineer. Output ONLY comma-separated descriptive phrases. Modify the user's prompt strictly according to their explicit instruction. No explanations, no markdown.";
-            userPrompt = `Base prompt: ${cleanPrompt}\nInstruction to apply: ${instruction}`;
-        } else {
-            sysPrompt = "You are an expert Stable Diffusion prompt engineer. Output ONLY comma-separated descriptive phrases. No explanations.";
-            userPrompt = `Create a unique highly detailed image generation prompt based on this theme: ${cleanPrompt}. Add nice lighting and camera angles.`;
-        }
-
+// FIX: убраны захардкоженные фразы, добавлен retry при сбое LLM
+async function callOpenRouter(env, model, messages, maxTokens = 400, retries = 2) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
         try {
             const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
                 method: "POST",
@@ -311,53 +310,77 @@ async function generatePrompt(basePrompt, env, config) {
                     "HTTP-Referer": "https://t.me",
                     "X-Title": "TgImageBot"
                 },
-                body: JSON.stringify({
-                    model: llmModel,
-                    messages: [
-                        { role: "system", content: sysPrompt },
-                        { role: "user", content: userPrompt }
-                    ],
-                    temperature: 0.7,
-                    max_tokens: 300
-                })
+                body: JSON.stringify({ model, messages, temperature: 0.8, max_tokens: maxTokens })
             });
+
+            if (!res.ok) {
+                const errBody = await res.text();
+                lastErr = `HTTP ${res.status}: ${errBody.substring(0, 200)}`;
+                console.error(`[LLM] Attempt ${attempt + 1} failed:`, lastErr);
+                if (res.status === 429 || res.status >= 500) {
+                    await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+                    continue;
+                }
+                break;
+            }
+
             const data = await res.json();
+            if (data.error) {
+                lastErr = data.error.message || JSON.stringify(data.error);
+                console.error(`[LLM] API error:`, lastErr);
+                continue;
+            }
+
             const text = data.choices?.[0]?.message?.content?.trim();
-            if (text && text.length > 5) return text.replace(/^["'`*]+|["'`*]+$/g, "");
+            if (text && text.length > 3) return text;
+
+            lastErr = "Empty response from model";
         } catch (e) {
-            console.error("[LLM Prompt Error]", e.message);
+            lastErr = e.message;
+            console.error(`[LLM] Attempt ${attempt + 1} exception:`, e.message);
+            if (attempt < retries) await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
         }
     }
-    return cleanPrompt + ", masterpiece, highly detailed, best quality";
+    console.error("[LLM] All attempts failed:", lastErr);
+    return null;
+}
+
+async function generatePrompt(basePrompt, env, config) {
+    if (!env.OPENROUTER_API_KEY) return basePrompt;
+
+    const llmModel = config.llmModel || "mistralai/mistral-7b-instruct:free";
+
+    let sysPrompt, userPrompt;
+    const match = basePrompt.match(/\[([\s\S]*?)\]/);
+
+    if (match) {
+        const instruction = match[1];
+        const cleanPrompt = basePrompt.replace(match[0], "").trim();
+        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. No explanations, no markdown, no quotes.";
+        userPrompt = `Base prompt: ${cleanPrompt}\nInstruction: ${instruction}`;
+    } else {
+        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. No explanations, no markdown, no quotes.";
+        userPrompt = `Create a detailed image generation prompt based on this theme: ${basePrompt}`;
+    }
+
+    const result = await callOpenRouter(env, llmModel, [
+        { role: "system", content: sysPrompt },
+        { role: "user", content: userPrompt }
+    ], 400);
+
+    if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
+    return basePrompt;
 }
 
 async function generateAiCaption(imagePrompt, env, config) {
     if (!env.OPENROUTER_API_KEY) return `🎨 <i>${escapeHtml(imagePrompt)}</i>`;
-    try {
-        const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-                "HTTP-Referer": "https://t.me",
-                "X-Title": "TgImageBot"
-            },
-            body: JSON.stringify({
-                model: config.llmModel || "meta-llama/llama-3.3-70b-instruct:free",
-                messages: [
-                    { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
-                    { role: "user", content: `Промпт картинки: ${imagePrompt}` }
-                ],
-                temperature: 0.8,
-                max_tokens: 250
-            })
-        });
-        const data = await res.json();
-        const text = data.choices?.[0]?.message?.content?.trim();
-        return text ? text : `🎨 <i>${escapeHtml(imagePrompt)}</i>`;
-    } catch (e) {
-        return `🎨 <i>${escapeHtml(imagePrompt)}</i>`;
-    }
+
+    const result = await callOpenRouter(env, config.llmModel || "mistralai/mistral-7b-instruct:free", [
+        { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
+        { role: "user", content: `Промпт картинки: ${imagePrompt}` }
+    ], 300);
+
+    return result ? result : `🎨 <i>${escapeHtml(imagePrompt)}</i>`;
 }
 
 async function handleCommand(msg, env) {
@@ -391,63 +414,69 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot (Upgraded)</b>\n\n<b>Куда постить:</b>\n/setgroup — привязать текущую группу\n/setchannel &lt;@name&gt; — привязать канал\n/ungroup | /unchannel\n\n<b>Базовые:</b>\n/setprompt &lt;текст&gt; — тема (можно юзать [команды для LLM])\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt;\n/enable | /disable | /generate\n\n<b>Подписи и ИИ (Caption):</b>\n/setcaptionmode &lt;0|1|2&gt; (0-ничего, 1-промпт, 2-AI текст)\n/setcaptionprompt &lt;инструкция для AI текста&gt;\n\n<b>Модели, LoRA, Фильтры:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/searchlora &lt;запрос&gt; | /addlora &lt;id&gt; | /listloras | /clearloras\n/setenhancer &lt;FaceFix|Upscale|clear&gt;\n\n<b>Параметры:</b>\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt;\n/setsampler &lt;name&gt; | /setneg &lt;text&gt; | /setllm &lt;model&gt;\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Куда постить:</b>\n/setgroup — привязать текущую группу\n/setchannel &lt;@name&gt; — привязать канал\n/ungroup | /unchannel\n\n<b>Базовые:</b>\n/setprompt &lt;текст&gt; — тема (можно юзать [инструкция для LLM])\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt;\n/enable | /disable | /generate\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; (0-ничего, 1-промпт, 2-AI)\n/setcaptionprompt &lt;инструкция для AI подписи&gt;\n\n<b>Модели, LoRA, Фильтры:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/searchlora &lt;запрос&gt; | /addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix|Upscale|clear&gt;\n\n<b>Параметры:</b>\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt;\n/setsampler &lt;name&gt; | /setneg &lt;text&gt; | /setllm &lt;model&gt;\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
 
         case "/setgroup":
             config.groupId = chatId; await saveConfig(env, config);
-            await tg.send(chatId, `✅ Группа для автопостов установлена: <code>${chatId}</code>`);
+            await tg.send(chatId, `✅ Группа установлена: <code>${chatId}</code>`);
             break;
+
         case "/setchannel":
-            if (!params[0]) return await tg.send(chatId, "❌ /setchannel &lt;@channel_username&gt; или ID");
+            if (!params[0]) return await tg.send(chatId, "❌ /setchannel &lt;@username&gt; или ID");
             config.channelId = params[0]; await saveConfig(env, config);
-            await tg.send(chatId, `✅ Канал для автопостов установлен: <code>${params[0]}</code>`);
+            await tg.send(chatId, `✅ Канал установлен: <code>${params[0]}</code>`);
             break;
+
         case "/ungroup":
             config.groupId = null; await saveConfig(env, config);
             await tg.send(chatId, "✅ Группа отвязана");
             break;
+
         case "/unchannel":
             config.channelId = null; await saveConfig(env, config);
             await tg.send(chatId, "✅ Канал отвязан");
             break;
 
         case "/setprompt":
-            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема&gt; (Можно использовать [сделай так-то] для LLM)");
+            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема&gt;\nМожно юзать [инструкция] для LLM");
             config.generalPrompt = params.join(" "); await saveConfig(env, config);
             await tg.send(chatId, `✅ Промпт:\n<code>${escapeHtml(config.generalPrompt)}</code>`);
             break;
 
-        case "/setcaptionmode":
+        case "/setcaptionmode": {
             const mode = parseInt(params[0]);
-            if (![0, 1, 2].includes(mode)) return await tg.send(chatId, "❌ /setcaptionmode <0|1|2>\n0 - Без текста\n1 - Промпт\n2 - AI Генерация текста");
+            if (![0, 1, 2].includes(mode)) return await tg.send(chatId, "❌ /setcaptionmode &lt;0|1|2&gt;\n0 - Без текста\n1 - Промпт\n2 - AI");
             config.captionMode = mode; await saveConfig(env, config);
-            await tg.send(chatId, `✅ Режим подписи изменен на: ${mode}`);
+            await tg.send(chatId, `✅ Режим подписи: ${mode}`);
             break;
+        }
 
         case "/setcaptionprompt":
-            if (!params.length) return await tg.send(chatId, "❌ /setcaptionprompt <инструкция для ИИ>");
+            if (!params.length) return await tg.send(chatId, "❌ /setcaptionprompt &lt;инструкция&gt;");
             config.captionPrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ Инструкция для подписей обновлена!`);
+            await tg.send(chatId, "✅ Инструкция для подписей обновлена");
             break;
 
-        case "/setenhancer":
+        case "/setenhancer": {
             const enh = params[0]?.toLowerCase();
+            if (!enh) return await tg.send(chatId, "❌ /setenhancer &lt;FaceFix|Upscale|clear&gt;");
             if (enh === "clear") {
-                config.postProcessors = []; await tg.send(chatId, "✅ Улучшайзеры сброшены");
+                config.postProcessors = [];
+                await tg.send(chatId, "✅ Улучшайзеры сброшены");
             } else if (enh === "facefix") {
-                config.postProcessors = ["GFPGAN"]; await tg.send(chatId, "✅ Включен FaceFix (GFPGAN)");
+                config.postProcessors = ["GFPGAN"];
+                await tg.send(chatId, "✅ FaceFix (GFPGAN) включён");
             } else if (enh === "upscale") {
-                config.postProcessors = ["RealESRGAN_x4plus"]; await tg.send(chatId, "✅ Включен Upscale (RealESRGAN_x4plus)");
+                config.postProcessors = ["RealESRGAN_x4plus"];
+                await tg.send(chatId, "✅ Upscale (RealESRGAN_x4plus) включён");
             } else {
-                if (enh && !["facefix", "upscale", "clear"].includes(enh)) {
-                    config.postProcessors = [params[0]]; await tg.send(chatId, `✅ Включен кастомный улучшайзер: ${params[0]}`);
-                } else {
-                    await tg.send(chatId, "❌ /setenhancer <FaceFix | Upscale | clear>");
-                }
+                config.postProcessors = [params[0]];
+                await tg.send(chatId, `✅ Кастомный улучшайзер: ${params[0]}`);
             }
             await saveConfig(env, config);
             break;
+        }
 
         case "/setmodel":
             if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;");
@@ -459,110 +488,127 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, "⏳ Загружаю топ-40 моделей...");
             try {
                 const models = (await hordeGetModels() || []).filter(m => m.count > 0).sort((a, b) => b.count - a.count).slice(0, 40);
-                let text = "📋 <b>Модели (топ-40):</b>\n\n";
-                models.forEach(m => text += `${m.name?.includes("XL") ? "🟢" : "⚪"} <code>${escapeHtml(m.name)}</code> (${m.count}w)\n`);
-                await tg.send(chatId, text);
+                let txt = "📋 <b>Модели (топ-40):</b>\n\n";
+                models.forEach(m => txt += `${m.name?.includes("XL") ? "🟢" : "⚪"} <code>${escapeHtml(m.name)}</code> (${m.count}w)\n`);
+                await tg.send(chatId, txt);
             } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
 
-        case "/searchmodel":
+        case "/searchmodel": {
             const qm = params.join(" ").toLowerCase();
-            if (!qm) return await tg.send(chatId, "❌ /searchmodel <запрос>");
+            if (!qm) return await tg.send(chatId, "❌ /searchmodel &lt;запрос&gt;");
             try {
                 const models = (await hordeGetModels() || []).filter(m => m.name.toLowerCase().includes(qm)).sort((a, b) => b.count - a.count).slice(0, 20);
                 if (!models.length) return await tg.send(chatId, "😕 Ничего не найдено");
-                let text = `🔍 <b>Найдено (${models.length}):</b>\n\n`;
-                models.forEach(m => text += `<code>${escapeHtml(m.name)}</code> (${m.count}w)\n`);
-                await tg.send(chatId, text);
+                let txt = `🔍 <b>Найдено (${models.length}):</b>\n\n`;
+                models.forEach(m => txt += `<code>${escapeHtml(m.name)}</code> (${m.count}w)\n`);
+                await tg.send(chatId, txt);
             } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
+        }
 
-        case "/searchlora":
+        case "/searchlora": {
             const ql = params.join(" ");
-            if (!ql) return await tg.send(chatId, "❌ /searchlora <запрос>");
+            if (!ql) return await tg.send(chatId, "❌ /searchlora &lt;запрос&gt;");
             try {
-                const res = await fetch(`https://civitai.com/api/v1/models?query=${encodeURIComponent(ql)}&limit=10`);
+                const res = await fetch(`https://civitai.com/api/v1/models?query=${encodeURIComponent(ql)}&types=LORA&limit=15`);
                 const data = await res.json();
-                if (!data.items || !data.items.length) return await tg.send(chatId, "😕 Ничего не найдено");
-                let text = `🔍 <b>Найдено LoRA:</b>\n\n`;
-                data.items.forEach(m => text += `<code>${m.id}</code> - ${escapeHtml(m.name)}\n`);
-                await tg.send(chatId, text);
+                if (!data.items?.length) return await tg.send(chatId, "😕 Ничего не найдено");
+                let txt = "🔍 <b>Найдено LoRA (используй ID для /addlora):</b>\n\n";
+                data.items.forEach(m => txt += `<code>${m.id}</code> — ${escapeHtml(m.name)}\n`);
+                await tg.send(chatId, txt);
             } catch (e) { await tg.send(chatId, "❌ Ошибка поиска: " + e.message); }
             break;
+        }
 
-        case "/addlora":
-            if (!params.length) return await tg.send(chatId, "❌ /addlora <ID> [strength=1] [clip=1]");
+        case "/addlora": {
+            if (!params.length) return await tg.send(chatId, "❌ /addlora &lt;ID&gt; [strength=1] [clip=1]");
             const loraId = params[0];
-            const loraStr = parseFloat(params[1] || 1);
-            const loraClip = parseFloat(params[2] || 1);
+            const loraStr = parseFloat(params[1]) || 1;
+            const loraClip = parseFloat(params[2]) || 1;
             if (!config.loras) config.loras = [];
+            if (config.loras.find(l => String(l.name) === String(loraId))) {
+                return await tg.send(chatId, `⚠️ LoRA <code>${loraId}</code> уже в списке`);
+            }
             config.loras.push({ name: loraId, strength: loraStr, clip: loraClip });
             await saveConfig(env, config);
-            await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена!`);
+            await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена (str: ${loraStr}, clip: ${loraClip})`);
             break;
+        }
 
         case "/listloras":
-            if (!config.loras || !config.loras.length) return await tg.send(chatId, "📋 Список LoRA пуст. Добавь через /addlora.");
+            if (!config.loras?.length) return await tg.send(chatId, "📋 Список LoRA пуст. Добавь через /addlora.");
             let lt = "📋 <b>Активные LoRA:</b>\n\n";
             config.loras.forEach((l, i) => lt += `${i + 1}. ID: <code>${l.name}</code> (str: ${l.strength}, clip: ${l.clip})\n`);
-            lt += "\nОчистить список: /clearloras";
+            lt += "\nОчистить: /clearloras";
             await tg.send(chatId, lt);
             break;
 
         case "/clearloras":
             config.loras = []; await saveConfig(env, config);
-            await tg.send(chatId, "✅ Список LoRA очищен!");
+            await tg.send(chatId, "✅ Список LoRA очищен");
             break;
 
         case "/setsampler":
-            if (!params[0]) return await tg.send(chatId, "❌ /setsampler <имя>");
+            if (!params[0]) return await tg.send(chatId, "❌ /setsampler &lt;имя&gt;");
             config.sampler = params[0]; await saveConfig(env, config);
             await tg.send(chatId, `✅ Sampler: ${config.sampler}`);
             break;
 
         case "/setcfg":
-            if (!params[0]) return await tg.send(chatId, "❌ /setcfg <число>");
+            if (!params[0]) return await tg.send(chatId, "❌ /setcfg &lt;число&gt;");
             config.cfgScale = parseFloat(params[0]); await saveConfig(env, config);
             await tg.send(chatId, `✅ CFG: ${config.cfgScale}`);
             break;
 
         case "/setsteps":
-            if (!params[0]) return await tg.send(chatId, "❌ /setsteps <число>");
+            if (!params[0]) return await tg.send(chatId, "❌ /setsteps &lt;число&gt;");
             config.steps = parseInt(params[0]); await saveConfig(env, config);
             await tg.send(chatId, `✅ Steps: ${config.steps}`);
             break;
 
         case "/setneg":
-            if (!params.length) return await tg.send(chatId, "❌ /setneg <текст>");
+            if (!params.length) return await tg.send(chatId, "❌ /setneg &lt;текст&gt;");
             config.negativePrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ Негативный промпт сохранён`);
+            await tg.send(chatId, "✅ Негативный промпт сохранён");
             break;
 
         case "/setllm":
-            if (!params.length) return await tg.send(chatId, "❌ /setllm <модель>");
+            if (!params.length) return await tg.send(chatId, "❌ /setllm &lt;модель&gt;\nПример: mistralai/mistral-7b-instruct:free");
             config.llmModel = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ LLM Модель: <code>${config.llmModel}</code>`);
+            await tg.send(chatId, `✅ LLM: <code>${config.llmModel}</code>`);
             break;
 
-        case "/setinterval":
+        case "/setinterval": {
             const inv = parseInt(params[0]);
             if (inv > 0) { config.interval = inv; await saveConfig(env, config); await tg.send(chatId, `✅ Интервал: ${inv} мин`); }
+            else await tg.send(chatId, "❌ /setinterval &lt;минуты&gt;");
             break;
+        }
 
-        case "/setcount":
+        case "/setcount": {
             const cnt = parseInt(params[0]);
             if (cnt > 0 && cnt <= 10) { config.count = cnt; await saveConfig(env, config); await tg.send(chatId, `✅ Количество: ${cnt}`); }
+            else await tg.send(chatId, "❌ /setcount &lt;1-10&gt;");
             break;
+        }
 
-        case "/setsize":
+        case "/setsize": {
             const w = parseInt(params[0]); const h = parseInt(params[1]);
-            if (w > 255 && h > 255) { config.width = 64 * Math.round(w/64); config.height = 64 * Math.round(h/64); await saveConfig(env, config); await tg.send(chatId, `✅ Размер: ${config.width}x${config.height}`); }
+            if (w > 255 && h > 255) {
+                config.width = 64 * Math.round(w / 64);
+                config.height = 64 * Math.round(h / 64);
+                await saveConfig(env, config);
+                await tg.send(chatId, `✅ Размер: ${config.width}x${config.height}`);
+            } else await tg.send(chatId, "❌ /setsize &lt;W&gt; &lt;H&gt; (оба > 255)");
             break;
+        }
 
         case "/enable":
             if (!config.groupId && !config.channelId) return await tg.send(chatId, "❌ Сначала привяжи группу (/setgroup) или канал (/setchannel)");
+            if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт (/setprompt)");
             config.enabled = true; await saveConfig(env, config);
-            await tg.send(chatId, `🟢 Автопостинг включен!`);
+            await tg.send(chatId, "🟢 Автопостинг включён!");
             break;
 
         case "/disable":
@@ -571,32 +617,33 @@ async function handleCommand(msg, env) {
             break;
 
         case "/generate":
-            if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт через /setprompt");
+            if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт (/setprompt)");
             await tg.send(chatId, `⏳ Генерирую ${config.count} фото...`);
-            const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
-
-            for (let i = 0; i < config.count; i++) {
-                try {
-                    const finalPrompt = await generatePrompt(config.generalPrompt, env, config);
-                    await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 300))}</code>`);
-                    const res = await hordeSubmit(finalPrompt, config, env, { workerBlacklist: bl });
-                    if (res.id) {
-                        await KV.put(env, `pending:${res.id}`, { targets: [chatId], prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0 }, { expirationTtl: 3600 });
-                        await tg.send(chatId, `📤 ID: <code>${res.id}</code>`);
-                    } else {
-                        await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
-                    }
-                } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+            {
+                const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
+                for (let i = 0; i < config.count; i++) {
+                    try {
+                        const finalPrompt = await generatePrompt(config.generalPrompt, env, config);
+                        await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 300))}</code>`);
+                        const res = await hordeSubmit(finalPrompt, config, env, { workerBlacklist: bl });
+                        if (res.id) {
+                            await KV.put(env, `pending:${res.id}`, { targets: [chatId], prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0 }, { expirationTtl: 3600 });
+                            await tg.send(chatId, `📤 ID: <code>${res.id}</code>`);
+                        } else {
+                            await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
+                        }
+                    } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+                }
             }
             break;
 
-        case "/status":
+        case "/status": {
             let queueCount = 0;
             try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
-
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Семплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
+        }
 
         case "/pending":
             try {
@@ -609,10 +656,7 @@ async function handleCommand(msg, env) {
             try {
                 const plist = await KV.list(env, "pending:");
                 let canceled = 0;
-                for (let k of plist.keys) {
-                    await KV.del(env, k.name);
-                    canceled++;
-                }
+                for (const k of plist.keys) { await KV.del(env, k.name); canceled++; }
                 await tg.send(chatId, `✅ Очередь очищена. Удалено задач: ${canceled}`);
             } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
@@ -638,6 +682,7 @@ async function processScheduled(env) {
         try {
             const task = await KV.get(env, keyObj.name, "json");
             if (!task) { await KV.del(env, keyObj.name); continue; }
+
             if (Date.now() - task.at > 1200000) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
@@ -679,8 +724,7 @@ async function processScheduled(env) {
                 if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
                 else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
 
-                const targets = task.targets || [];
-                for (const tId of targets) {
+                for (const tId of (task.targets || [])) {
                     const { sent, tooSmall } = await deliverImage(tg, tId, gen.img, captionText, task.notify);
                     if (sent) success = true;
                     if (tooSmall) {
@@ -696,11 +740,11 @@ async function processScheduled(env) {
                     const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
                     const newRes = await hordeSubmit(task.prompt, config, env, { workerBlacklist: bl });
                     if (newRes.id) {
-                        await KV.put(env, `pending:${newRes.id}`, { ...task, at: Date.now(), retries });
+                        await KV.put(env, `pending:${newRes.id}`, { ...task, at: Date.now(), retries }, { expirationTtl: 3600 });
                         if (task.notify) await tg.send(task.notify, `🔄 Ретрай ${retries}/3...`);
                     }
                 } else if (task.notify) {
-                    await tg.send(task.notify, "❌ 3 попытки неудачны. Возможно стоит анонимный ключ (NSFW запрещен) или модель цензурит этот промпт.");
+                    await tg.send(task.notify, "❌ 3 попытки неудачны. Скорее всего анонимный ключ (NSFW запрещён) или модель цензурит промпт.");
                 }
             }
 
@@ -726,6 +770,8 @@ async function processScheduled(env) {
             const res = await hordeSubmit(prmpt, config, env, { workerBlacklist: bl });
             if (res.id) {
                 await KV.put(env, `pending:${res.id}`, { targets, prompt: prmpt, at: now, notify: config.adminId, retries: 0 }, { expirationTtl: 3600 });
+            } else {
+                console.error("[CRON] Horde submit failed:", JSON.stringify(res));
             }
         } catch (e) {
             console.error("[CRON] Auto-post error:", e.message);
