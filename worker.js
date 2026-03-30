@@ -25,12 +25,11 @@ const DEFAULT_CONFIG = {
     captionPrompt: "Опиши эту картинку для поста в Telegram-канале на русском языке, креативно и с эмодзи. Без лишних вступлений.",
     useSpoiler: false,
     ratingEnabled: false,
-    ratingType: "buttons",
-    useLoraTriggers: false
+    ratingType: "buttons"
 };
 
 const HORDE_API = "https://stablehorde.net/api/v2";
-const HORDE_HEADERS = { "Client-Agent": "TgImageBot:16.0:tg" };
+const HORDE_HEADERS = { "Client-Agent": "TgImageBot:16.1:tg" };
 const MIN_IMAGE_KB = 10;
 
 function escapeHtml(text) {
@@ -193,8 +192,6 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.post_processing = config.postProcessors;
     }
 
-    let finalPrompt = prompt;
-
     if (!extra.skipLoras && config.loras?.length > 0) {
         params.loras = config.loras.map(l => ({
             name: String(l.name),
@@ -203,16 +200,10 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
             inject_trigger: "any",
             is_version: false
         }));
-        if (config.useLoraTriggers) {
-            const allTriggers = config.loras.map(l => l.triggers).filter(Boolean).join(", ");
-            if (allTriggers) {
-                finalPrompt = `${allTriggers}, ${finalPrompt}`;
-            }
-        }
     }
 
     const payload = {
-        prompt: config.negativePrompt ? `${finalPrompt} ### ${config.negativePrompt}` : finalPrompt,
+        prompt: config.negativePrompt ? `${prompt} ### ${config.negativePrompt}` : prompt,
         params,
         nsfw: config.nsfw !== false,
         censor_nsfw: false,
@@ -330,7 +321,7 @@ async function callOpenRouter(env, model, messages, maxTokens = 2048, retries = 
                     "HTTP-Referer": "https://t.me",
                     "X-Title": "TgImageBot"
                 },
-                body: JSON.stringify({ model, messages, temperature: 0.8, max_tokens: maxTokens })
+                body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: maxTokens })
             });
 
             if (!res.ok) {
@@ -374,10 +365,10 @@ async function generatePrompt(basePrompt, env, config) {
     if (match) {
         const instruction = match[1];
         const cleanPrompt = basePrompt.replace(match[0], "").trim();
-        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. No explanations, no markdown, no quotes.";
+        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. No explanations, no markdown. CRITICAL: Ensure the output is complete and NEVER cut off mid-sentence.";
         userPrompt = `Base prompt: ${cleanPrompt}\nInstruction: ${instruction}`;
     } else {
-        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. No explanations, no markdown, no quotes.";
+        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. No explanations, no markdown. CRITICAL: Ensure the output is complete and NEVER cut off mid-sentence.";
         userPrompt = `Create a detailed image generation prompt based on this theme: ${basePrompt}`;
     }
 
@@ -441,7 +432,7 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;текст&gt; | /setneg &lt;текст&gt;\n/setloratriggers &lt;on|off&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix|Upscale|AnimeUpscale|CodeFormers|clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n\n<b>Оценки и Статистика:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;текст&gt; | /setneg &lt;текст&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n\n<b>Оценки и Статистика:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
 
         case "/setgroup":
@@ -486,26 +477,27 @@ async function handleCommand(msg, env) {
             break;
 
         case "/setenhancer": {
-            const enh = params[0]?.toLowerCase();
-            if (!enh) return await tg.send(chatId, "❌ /setenhancer <FaceFix|Upscale|AnimeUpscale|CodeFormers|clear>");
-            if (enh === "clear") {
+            if (!params.length) return await tg.send(chatId, "❌ /setenhancer <FaceFix|Upscale|AnimeUpscale|CodeFormers|clear>\nМожно перечислить несколько через пробел.");
+            if (params[0].toLowerCase() === "clear") {
                 config.postProcessors = [];
                 await tg.send(chatId, "✅ Улучшайзеры сброшены");
-            } else if (enh === "facefix") {
-                config.postProcessors = ["GFPGAN"];
-                await tg.send(chatId, "✅ FaceFix (GFPGAN) включён");
-            } else if (enh === "upscale") {
-                config.postProcessors = ["RealESRGAN_x4plus"];
-                await tg.send(chatId, "✅ Upscale (RealESRGAN_x4plus) включён");
-            } else if (enh === "animeupscale") {
-                config.postProcessors = ["RealESRGAN_x4plus_anime_6B"];
-                await tg.send(chatId, "✅ Anime Upscale включён");
-            } else if (enh === "codeformers") {
-                config.postProcessors = ["CodeFormers"];
-                await tg.send(chatId, "✅ CodeFormers включён");
             } else {
-                config.postProcessors = [params[0]];
-                await tg.send(chatId, `✅ Кастомный улучшайзер: ${params[0]}`);
+                const map = {
+                    facefix: "GFPGAN",
+                    upscale: "RealESRGAN_x4plus",
+                    animeupscale: "RealESRGAN_x4plus_anime_6B",
+                    codeformers: "CodeFormers"
+                };
+                const argsClean = params.join(" ").split(/[\s,]+/);
+                const newPps = [];
+                for (const arg of argsClean) {
+                    if (!arg) continue;
+                    const key = arg.toLowerCase();
+                    if (map[key]) newPps.push(map[key]);
+                    else newPps.push(arg);
+                }
+                config.postProcessors = [...new Set(newPps)];
+                await tg.send(chatId, `✅ Улучшайзеры: ${config.postProcessors.join(", ")}`);
             }
             await saveConfig(env, config);
             break;
@@ -550,23 +542,21 @@ async function handleCommand(msg, env) {
                 return await tg.send(chatId, `⚠️ LoRA <code>${loraId}</code> уже в списке`);
             }
             let compatMsg = "";
-            let triggers = "";
+            let loraTitle = loraId;
             try {
                 const civRes = await fetch(`https://civitai.com/api/v1/models/${loraId}`);
                 if (civRes.ok) {
                     const civData = await civRes.json();
                     const base = civData.modelVersions?.[0]?.baseModel || "";
-                    const trainedWords = civData.modelVersions?.[0]?.trainedWords || [];
-                    triggers = trainedWords.join(", ");
-                    const loraName = civData.name || loraId;
+                    loraTitle = civData.name || loraId;
                     const isXL = config.model?.toLowerCase().includes("xl");
                     const loraIsXL = base.toLowerCase().includes("xl");
-                    if (base) compatMsg = `\n📦 <b>${escapeHtml(loraName)}</b> [${base}]`;
+                    if (base) compatMsg = `\n📦 <b>${escapeHtml(loraTitle)}</b> [${base}]`;
                     if (isXL !== loraIsXL) compatMsg += `\n⚠️ <b>Внимание:</b> LoRA обучена на <b>${base}</b>. Скорее всего не применится!`;
                     else compatMsg += `\n✅ Совместима с текущей моделью`;
                 }
             } catch (_) {}
-            config.loras.push({ name: loraId, strength: loraStr, clip: loraClip, triggers });
+            config.loras.push({ name: loraId, title: loraTitle, strength: loraStr, clip: loraClip });
             await saveConfig(env, config);
             await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена (str: ${loraStr}, clip: ${loraClip})${compatMsg}`);
             break;
@@ -576,8 +566,8 @@ async function handleCommand(msg, env) {
             if (!config.loras?.length) return await tg.send(chatId, "📋 Список LoRA пуст.");
             let lt = "📋 <b>Активные LoRA:</b>\n\n";
             config.loras.forEach((l, i) => {
-                lt += `${i + 1}. ID: <code>${l.name}</code> (str: ${l.strength}, clip: ${l.clip})\n`;
-                if (l.triggers) lt += `   🔑 Triggers: <i>${escapeHtml(l.triggers)}</i>\n`;
+                const nameStr = l.title && l.title !== l.name ? `${escapeHtml(l.title)} (ID: ${l.name})` : l.name;
+                lt += `${i + 1}. <b>${nameStr}</b> (str: ${l.strength}, clip: ${l.clip})\n`;
             });
             await tg.send(chatId, lt);
             break;
@@ -585,13 +575,6 @@ async function handleCommand(msg, env) {
         case "/clearloras":
             config.loras = []; await saveConfig(env, config);
             await tg.send(chatId, "✅ Список LoRA очищен");
-            break;
-
-        case "/setloratriggers":
-            if (!params[0]) return await tg.send(chatId, "❌ /setloratriggers <on|off>");
-            config.useLoraTriggers = params[0].toLowerCase() === "on";
-            await saveConfig(env, config);
-            await tg.send(chatId, `✅ Авто-добавление LoRA Trigger Words: ${config.useLoraTriggers ? "ВКЛ" : "ВЫКЛ"}`);
             break;
 
         case "/setsampler":
@@ -648,7 +631,7 @@ async function handleCommand(msg, env) {
         case "/analytics": {
             const histList = await KV.list(env, "hist:");
             if (!histList.keys.length) return await tg.send(chatId, "📊 Нет данных для аналитики.");
-            
+
             const entries = [];
             for (const k of histList.keys) {
                 const data = await KV.get(env, k.name, "json");
@@ -656,7 +639,7 @@ async function handleCommand(msg, env) {
             }
             entries.sort((a, b) => b.time - a.time);
             const recent = entries.slice(0, 15);
-            
+
             let text = "📊 <b>Последние генерации:</b>\n\n";
             for (const e of recent) {
                 const scoreData = await KV.get(env, `score:${e.chatId}:${e.msgId}`, "json") || { up: 0, down: 0 };
@@ -717,10 +700,7 @@ async function handleCommand(msg, env) {
                         const res = await hordeSubmit(finalPrompt, config, env, { workerBlacklist: bl });
                         if (res.id) {
                             await KV.put(env, `pending:${res.id}`, { targets: [chatId], prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0 }, { expirationTtl: 3600 });
-                            const checkData = await hordeCheck(res.id);
-                            const waitTime = checkData.wait_time ? Math.round(checkData.wait_time) : "?";
-                            const qPos = checkData.queue_position !== undefined ? checkData.queue_position : "?";
-                            await tg.send(chatId, `📤 ID: <code>${res.id}</code>\n⏱ Ожидание: ~${waitTime} сек\n👥 В очереди: ${qPos}`);
+                            await tg.send(chatId, `📤 ID: <code>${res.id}</code>\n⏳ Отправлено в очередь.`);
                         } else {
                             await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
                         }
@@ -733,14 +713,34 @@ async function handleCommand(msg, env) {
             let queueCount = 0;
             try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n<b>Рейтинги:</b> ${config.ratingEnabled ? "🟢" : "🔴"} (${config.ratingType})\n<b>LoRA Auto-Triggers:</b> ${config.useLoraTriggers ? "🟢" : "🔴"}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n<b>Рейтинги:</b> ${config.ratingEnabled ? "🟢" : "🔴"} (${config.ratingType})\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
         case "/pending":
             try {
                 const pendList = await KV.list(env, "pending:");
-                await tg.send(chatId, `⏳ В очереди: ${pendList.keys.length} генераций`);
+                if (!pendList.keys.length) {
+                    return await tg.send(chatId, `⏳ В очереди: 0 генераций`);
+                }
+                
+                await tg.send(chatId, `⏳ <b>В очереди: ${pendList.keys.length} генераций</b>\nПроверяю статус серверов...`);
+
+                let count = 0;
+                let statusTxt = "";
+                for (const k of pendList.keys) {
+                    if (count >= 5) {
+                        statusTxt += `\n<i>...и еще ${pendList.keys.length - 5}</i>`;
+                        break;
+                    }
+                    const id = k.name.replace("pending:", "");
+                    const checkData = await hordeCheck(id);
+                    const waitTime = checkData.wait_time ? Math.round(checkData.wait_time) : "?";
+                    const qPos = checkData.queue_position !== undefined ? checkData.queue_position : "?";
+                    statusTxt += `🔹 ID: <code>${id.substring(0,8)}...</code> | Ожидание: ~${waitTime} сек | Перед вами: ${qPos}\n`;
+                    count++;
+                }
+                await tg.send(chatId, `📊 <b>Статус очереди:</b>\n\n${statusTxt}`);
             } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
 
@@ -770,21 +770,21 @@ async function handleCallback(cb, env) {
     const chatId = cb.message.chat.id;
     const userId = cb.from.id;
     const rateKey = `usr_rate:${msgId}:${userId}`;
-    
+
     const hasRated = await KV.get(env, rateKey);
     if (hasRated) {
         await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Вы уже проголосовали!" });
         return;
     }
-    
+
     await KV.put(env, rateKey, "1", { expirationTtl: 14 * 24 * 3600 });
     const isUp = cb.data === "rate_up";
     const scoreKey = `score:${chatId}:${msgId}`;
     let currentScore = await KV.get(env, scoreKey, "json") || { up: 0, down: 0 };
-    
+
     if (isUp) currentScore.up++; else currentScore.down++;
     await KV.put(env, scoreKey, currentScore, { expirationTtl: 14 * 24 * 3600 });
-    
+
     const markup = { inline_keyboard: [[{ text: `👍 ${currentScore.up}`, callback_data: "rate_up" }, { text: `👎 ${currentScore.down}`, callback_data: "rate_down" }]] };
     await tg.api("editMessageReplyMarkup", { chat_id: chatId, message_id: msgId, reply_markup: markup });
     await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Голос учтён!" });
@@ -812,59 +812,58 @@ async function processScheduled(env) {
             if (!check.done) continue;
 
             const res = await hordeGetResult(id);
-            await KV.del(env, keyObj.name);
 
             if (res.faulted) {
+                await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации: <code>${id}</code>`);
                 continue;
             }
 
             const gens = res.generations || [];
-            if (!gens.length) continue;
+            if (!gens.length) {
+                await KV.del(env, keyObj.name);
+                continue;
+            }
 
             let success = false;
             let censored = false;
 
-            for (const gen of gens) {
-                const wId = gen.worker_id || "?";
-                const wName = gen.worker_name || "?";
-                const isCens = isCensored(gen);
+            try {
+                for (const gen of gens) {
+                    const wId = gen.worker_id || "?";
+                    const wName = gen.worker_name || "?";
+                    const isCens = isCensored(gen);
 
-                if (isCens) {
-                    await addWorkerToBlacklist(env, wId, wName);
-                    censored = true;
-                    if (task.notify) await tg.send(task.notify, `🔴 Воркер <code>${wName}</code> выдал цензуру. Добавлен в ЧС.`);
-                    continue;
-                }
-
-                if (!gen.img) continue;
-
-                if (gen.gen_metadata?.length && task.notify && config.loras?.length) {
-                    const skipped = gen.gen_metadata.filter(m => m.type === "lora_skipped" || m.type === "lora");
-                    if (skipped.length) {
-                        const names = skipped.map(m => m.ref || m.id || "?").join(", ");
-                        await tg.send(task.notify, `⚠️ <b>LoRA пропущена воркером!</b>\nID: <code>${names}</code>\n<i>Причина: несовместима с моделью</i>`);
+                    if (isCens) {
+                        await addWorkerToBlacklist(env, wId, wName);
+                        censored = true;
+                        if (task.notify) await tg.send(task.notify, `🔴 Воркер <code>${wName}</code> выдал цензуру. Добавлен в ЧС.`);
+                        continue;
                     }
-                }
 
-                let captionText = "";
-                if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
-                else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
+                    if (!gen.img) continue;
 
-                for (const tId of (task.targets || [])) {
-                    const { sent, tooSmall, msgId } = await deliverImage(tg, tId, gen.img, captionText, task.notify, config);
-                    if (sent) {
-                        success = true;
-                        if (msgId) {
-                            const histObj = { msgId, chatId: tId, time: Date.now() };
-                            await KV.put(env, `hist:${Date.now()}_${Math.random().toString(36).substring(2,7)}`, histObj, { expirationTtl: 14 * 24 * 3600 });
+                    let captionText = "";
+                    if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
+                    else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
+
+                    for (const tId of (task.targets || [])) {
+                        const { sent, tooSmall, msgId } = await deliverImage(tg, tId, gen.img, captionText, task.notify, config);
+                        if (sent) {
+                            success = true;
+                            if (msgId) {
+                                const histObj = { msgId, chatId: tId, time: Date.now() };
+                                await KV.put(env, `hist:${Date.now()}_${Math.random().toString(36).substring(2,7)}`, histObj, { expirationTtl: 14 * 24 * 3600 });
+                            }
+                        }
+                        if (tooSmall) {
+                            censored = true;
+                            await addWorkerToBlacklist(env, wId, wName);
                         }
                     }
-                    if (tooSmall) {
-                        censored = true;
-                        await addWorkerToBlacklist(env, wId, wName);
-                    }
                 }
+            } catch (err) {
+                console.error(`[PROCESS] Внутренняя ошибка обработки ${id}:`, err.message);
             }
 
             if (censored && !success && !task.sfwTest) {
@@ -879,6 +878,9 @@ async function processScheduled(env) {
                 } else if (task.notify) {
                     await tg.send(task.notify, "❌ 3 попытки неудачны. Скорее всего анонимный ключ или модель цензурит промпт.");
                 }
+                await KV.del(env, keyObj.name); 
+            } else {
+                await KV.del(env, keyObj.name); 
             }
         } catch (e) {
             console.error(`[CRON] Ошибка обработки ${id}:`, e.message);
