@@ -60,7 +60,6 @@ class Telegram {
     async sendPhoto(chatId, buffer, caption = "", extra = {}) {
         const form = new FormData();
         form.append("chat_id", String(chatId));
-        // Используем Blob вместо File для большей совместимости в Cloudflare Workers
         form.append("photo", new Blob([buffer], { type: "image/webp" }), "image.webp");
         if (caption) {
             form.append("caption", caption.substring(0, 1024));
@@ -310,7 +309,6 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
     return { sent: false, tooSmall: false, sizeKB };
 }
 
-// Контекстное окно увеличено до 6000
 async function callOpenRouter(env, model, messages, maxTokens = 6000, retries = 2) {
     let lastErr = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -377,7 +375,7 @@ async function generatePrompt(basePrompt, env, config) {
     const result = await callOpenRouter(env, llmModel, [
         { role: "system", content: sysPrompt },
         { role: "user", content: userPrompt }
-    ], 6000); // 6k tokens
+    ], 6000);
 
     if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
 
@@ -393,7 +391,7 @@ async function generateAiCaption(imagePrompt, env, config) {
     const result = await callOpenRouter(env, config.llmModel || "openrouter/free", [
         { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
         { role: "user", content: `Промпт картинки: ${imagePrompt.substring(0, 1000)}` }
-    ], 6000); // 6k tokens
+    ], 6000);
 
     if (!result || result.trim().length === 0 || result.includes("HTTP ")) {
         return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
@@ -737,7 +735,7 @@ async function handleCommand(msg, env) {
                     }
                     const id = k.name.replace("pending:", "");
                     const checkData = await hordeCheck(id);
-                    
+
                     let status = "Ожидание";
                     let waitTime = checkData.wait_time ? Math.round(checkData.wait_time) : "?";
                     let qPos = checkData.queue_position !== undefined ? checkData.queue_position : "?";
@@ -826,7 +824,6 @@ async function processScheduled(env) {
 
             const res = await hordeGetResult(id);
 
-            // Если пришла ошибка с сервера
             if (res.faulted || res.message) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации или время ожидания на сервере истекло: <code>${id}</code>`);
@@ -834,8 +831,7 @@ async function processScheduled(env) {
             }
 
             const gens = res.generations || [];
-            
-            // Если арт не получен (уже удален с сервера Horde из-за долгого простоя)
+
             if (!gens.length) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `⚠️ Изображение <code>${id}</code> не найдено на сервере. Возможно, бот не забрал его вовремя.`);
@@ -897,7 +893,6 @@ async function processScheduled(env) {
                 }
                 await KV.del(env, keyObj.name); 
             } else if (!success) {
-                // Если произошла другая непредвиденная ошибка
                 await KV.del(env, keyObj.name); 
                 if (task.notify) await tg.send(task.notify, `❌ Не удалось отправить арт <code>${id}</code>. Задача удалена из очереди.`);
             } else {
@@ -914,10 +909,10 @@ async function processScheduled(env) {
     const lastPost = parseInt(await KV.get(env, "last_post_time") || "0", 10);
     const now = Date.now();
     if (now - lastPost < config.interval * 60 * 1000) return;
-    await KV.put(env, "last_post_time", String(now));
 
     const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
     const targets = [config.groupId, config.channelId].filter(Boolean);
+    let queuedCount = 0;
 
     for (let i = 0; i < config.count; i++) {
         try {
@@ -925,12 +920,19 @@ async function processScheduled(env) {
             const res = await hordeSubmit(prmpt, config, env, { workerBlacklist: bl });
             if (res.id) {
                 await KV.put(env, `pending:${res.id}`, { targets, prompt: prmpt, at: now, notify: config.adminId, retries: 0 }, { expirationTtl: 3600 });
+                queuedCount++;
             } else {
-                console.error("[CRON] Horde submit failed:", JSON.stringify(res));
+                if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
             }
         } catch (e) {
-            console.error("[CRON] Auto-post error:", e.message);
+            if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
         }
+    }
+
+    if (queuedCount > 0) {
+        await KV.put(env, "last_post_time", String(now));
+    } else {
+        await KV.put(env, "last_post_time", String(now - (config.interval * 60 * 1000) + 120000));
     }
 }
 
@@ -947,9 +949,7 @@ export default {
                 } else if (body.callback_query) {
                     ctx.waitUntil(handleCallback(body.callback_query, env));
                 }
-                
-                // Запускаем обработчик очереди на любой входящий вебхук 
-                // Это спасет, если Cron-триггер работает с перебоями
+
                 ctx.waitUntil(processScheduled(env));
             } catch (e) { console.error("[WH]", e.message); }
             return new Response("OK", { status: 200 });
