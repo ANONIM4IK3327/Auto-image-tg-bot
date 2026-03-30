@@ -309,7 +309,7 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
     return { sent: false, tooSmall: false, sizeKB };
 }
 
-async function callOpenRouter(env, model, messages, maxTokens = 2048, retries = 2) {
+async function callOpenRouter(env, model, messages, maxTokens = 4096, retries = 2) {
     let lastErr = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
