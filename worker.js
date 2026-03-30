@@ -15,7 +15,7 @@ const DEFAULT_CONFIG = {
     sampler: "k_dpmpp_2m",
     nsfw: true,
     negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
-    llmModel: "openrouter/free", // [FIX] Заменена дефолтная модель
+    llmModel: "openrouter/free",
     clipSkip: 2,
     hiresFix: false,
     hiresFixDenoising: 0.65,
@@ -23,11 +23,14 @@ const DEFAULT_CONFIG = {
     postProcessors: [],
     captionMode: 1,
     captionPrompt: "Опиши эту картинку для поста в Telegram-канале на русском языке, креативно и с эмодзи. Без лишних вступлений.",
-    useSpoiler: false // [NEW] Поддержка спойлеров
+    useSpoiler: false,
+    ratingEnabled: false,
+    ratingType: "buttons",
+    useLoraTriggers: false
 };
 
 const HORDE_API = "https://stablehorde.net/api/v2";
-const HORDE_HEADERS = { "Client-Agent": "TgImageBot:15.0:tg" };
+const HORDE_HEADERS = { "Client-Agent": "TgImageBot:16.0:tg" };
 const MIN_IMAGE_KB = 10;
 
 function escapeHtml(text) {
@@ -55,8 +58,7 @@ class Telegram {
     send(chatId, text, extra = {}) {
         return this.api("sendMessage", { chat_id: chatId, text, parse_mode: "HTML", ...extra });
     }
-    // [FIX] Добавлена поддержка hasSpoiler
-    async sendPhoto(chatId, buffer, caption = "", hasSpoiler = false) {
+    async sendPhoto(chatId, buffer, caption = "", extra = {}) {
         const form = new FormData();
         form.append("chat_id", String(chatId));
         form.append("photo", new File([buffer], "image.webp", { type: "image/webp" }));
@@ -64,12 +66,11 @@ class Telegram {
             form.append("caption", caption.substring(0, 1024));
             form.append("parse_mode", "HTML");
         }
-        if (hasSpoiler) {
-            form.append("has_spoiler", "true"); // FormData требует строку
-        }
+        if (extra.hasSpoiler) form.append("has_spoiler", "true");
+        if (extra.replyMarkup) form.append("reply_markup", JSON.stringify(extra.replyMarkup));
         return (await fetch(`${this.base}/sendPhoto`, { method: "POST", body: form })).json();
     }
-    async sendDocument(chatId, buffer, caption = "") {
+    async sendDocument(chatId, buffer, caption = "", extra = {}) {
         const form = new FormData();
         form.append("chat_id", String(chatId));
         form.append("document", new File([buffer], "image.webp", { type: "image/webp" }));
@@ -77,17 +78,14 @@ class Telegram {
             form.append("caption", caption.substring(0, 1024));
             form.append("parse_mode", "HTML");
         }
+        if (extra.replyMarkup) form.append("reply_markup", JSON.stringify(extra.replyMarkup));
         return (await fetch(`${this.base}/sendDocument`, { method: "POST", body: form })).json();
     }
-    // [FIX] Добавлена поддержка hasSpoiler
-    sendPhotoUrl(chatId, url, caption = "", hasSpoiler = false) {
-        return this.api("sendPhoto", { 
-            chat_id: chatId, 
-            photo: url, 
-            caption: caption.substring(0, 1024), 
-            parse_mode: "HTML",
-            has_spoiler: hasSpoiler // В JSON передается как boolean
-        });
+    sendPhotoUrl(chatId, url, caption = "", extra = {}) {
+        const payload = { chat_id: chatId, photo: url, caption: caption.substring(0, 1024), parse_mode: "HTML" };
+        if (extra.hasSpoiler) payload.has_spoiler = true;
+        if (extra.replyMarkup) payload.reply_markup = extra.replyMarkup;
+        return this.api("sendPhoto", payload);
     }
 }
 
@@ -195,6 +193,8 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.post_processing = config.postProcessors;
     }
 
+    let finalPrompt = prompt;
+
     if (!extra.skipLoras && config.loras?.length > 0) {
         params.loras = config.loras.map(l => ({
             name: String(l.name),
@@ -203,10 +203,16 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
             inject_trigger: "any",
             is_version: false
         }));
+        if (config.useLoraTriggers) {
+            const allTriggers = config.loras.map(l => l.triggers).filter(Boolean).join(", ");
+            if (allTriggers) {
+                finalPrompt = `${allTriggers}, ${finalPrompt}`;
+            }
+        }
     }
 
     const payload = {
-        prompt: config.negativePrompt ? `${prompt} ### ${config.negativePrompt}` : prompt,
+        prompt: config.negativePrompt ? `${finalPrompt} ### ${config.negativePrompt}` : finalPrompt,
         params,
         nsfw: config.nsfw !== false,
         censor_nsfw: false,
@@ -266,8 +272,7 @@ function base64ToBuffer(b64) {
     } catch { return null; }
 }
 
-// [FIX] Прокидываем useSpoiler
-async function deliverImage(tg, chatId, imgData, caption, notifyId, useSpoiler = false) {
+async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
     if (!imgData) {
         if (notifyId) await tg.send(notifyId, "❌ Нет данных картинки от воркера");
         return { sent: false, tooSmall: false, sizeKB: 0 };
@@ -275,12 +280,17 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, useSpoiler =
 
     const isUrl = isHttpUrl(imgData);
     let buffer = null;
+    const extra = { hasSpoiler: config.useSpoiler };
+
+    if (config.ratingEnabled && config.ratingType === "buttons") {
+        extra.replyMarkup = { inline_keyboard: [[{ text: "👍 0", callback_data: "rate_up" }, { text: "👎 0", callback_data: "rate_down" }]] };
+    }
 
     if (isUrl) {
         buffer = await downloadImage(imgData);
         if (!buffer) {
-            const r = await tg.sendPhotoUrl(chatId, imgData, caption, useSpoiler);
-            return { sent: r.ok, tooSmall: false, sizeKB: 0 };
+            const r = await tg.sendPhotoUrl(chatId, imgData, caption, extra);
+            return { sent: r.ok, tooSmall: false, sizeKB: 0, msgId: r.result?.message_id };
         }
     } else {
         buffer = base64ToBuffer(imgData);
@@ -293,22 +303,22 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, useSpoiler =
         return { sent: false, tooSmall: true, sizeKB };
     }
 
-    let r = await tg.sendPhoto(chatId, buffer, caption, useSpoiler);
-    if (r.ok) return { sent: true, tooSmall: false, sizeKB };
+    let r = await tg.sendPhoto(chatId, buffer, caption, extra);
+    if (r.ok) return { sent: true, tooSmall: false, sizeKB, msgId: r.result?.message_id };
 
-    r = await tg.sendDocument(chatId, buffer, caption);
-    if (r.ok) return { sent: true, tooSmall: false, sizeKB };
+    r = await tg.sendDocument(chatId, buffer, caption, extra);
+    if (r.ok) return { sent: true, tooSmall: false, sizeKB, msgId: r.result?.message_id };
 
     if (isUrl) {
-        r = await tg.sendPhotoUrl(chatId, imgData, caption, useSpoiler);
-        if (r.ok) return { sent: true, tooSmall: false, sizeKB };
+        r = await tg.sendPhotoUrl(chatId, imgData, caption, extra);
+        if (r.ok) return { sent: true, tooSmall: false, sizeKB, msgId: r.result?.message_id };
     }
 
     if (notifyId) await tg.send(notifyId, `❌ Не удалось отправить изображение: ${escapeHtml(r?.description || "unknown error")}`);
     return { sent: false, tooSmall: false, sizeKB };
 }
 
-async function callOpenRouter(env, model, messages, maxTokens = 700, retries = 2) {
+async function callOpenRouter(env, model, messages, maxTokens = 2048, retries = 2) {
     let lastErr = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
@@ -357,9 +367,7 @@ async function callOpenRouter(env, model, messages, maxTokens = 700, retries = 2
 
 async function generatePrompt(basePrompt, env, config) {
     if (!env.OPENROUTER_API_KEY) return basePrompt;
-
     const llmModel = config.llmModel || "openrouter/free";
-
     let sysPrompt, userPrompt;
     const match = basePrompt.match(/\[([\s\S]*?)\]/);
 
@@ -376,33 +384,27 @@ async function generatePrompt(basePrompt, env, config) {
     const result = await callOpenRouter(env, llmModel, [
         { role: "system", content: sysPrompt },
         { role: "user", content: userPrompt }
-    ], 400);
+    ], 2048);
 
     if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
 
-    // [FIX] Не игнорируем инструкцию в скобках. Если API легло, выбрасываем ошибку для ретрая или отчета.
     if (match) {
         console.error("[LLM] OpenRouter API failed to process prompt instruction.");
         throw new Error("Не удалось обработать инструкцию для промпта через OpenRouter. Повторите позже.");
     }
-
     return basePrompt;
 }
 
 async function generateAiCaption(imagePrompt, env, config) {
     if (!env.OPENROUTER_API_KEY) return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
-
     const result = await callOpenRouter(env, config.llmModel || "openrouter/free", [
         { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
         { role: "user", content: `Промпт картинки: ${imagePrompt.substring(0, 1000)}` }
-    ], 300);
+    ], 2048);
 
-    // [FIX] Стабилизированный фоллбек, если LLM не отвечает или выдает мусор
     if (!result || result.trim().length === 0 || result.includes("HTTP ")) {
-        console.error("[LLM] generateAiCaption failed, using fallback");
         return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
     }
-
     return result;
 }
 
@@ -439,7 +441,7 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Куда постить:</b>\n/setgroup — привязать текущую группу\n/setchannel &lt;@name&gt; — привязать канал\n/ungroup | /unchannel\n\n<b>Базовые:</b>\n/setprompt &lt;текст&gt; — тема (можно юзать [инструкция для LLM])\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt;\n/enable | /disable | /generate\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; (0-ничего, 1-промпт, 2-AI)\n/setcaptionprompt &lt;инструкция для AI подписи&gt;\n\n<b>Модели, LoRA, Фильтры:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix|Upscale|AnimeUpscale|CodeFormers|clear&gt;\n\n<b>Параметры:</b>\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt;\n/setsampler &lt;name&gt; | /setneg &lt;text&gt; | /setllm &lt;model&gt;\n/setspoiler &lt;on|off&gt;\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;текст&gt; | /setneg &lt;текст&gt;\n/setloratriggers &lt;on|off&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix|Upscale|AnimeUpscale|CodeFormers|clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n\n<b>Оценки и Статистика:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
 
         case "/setgroup":
@@ -464,14 +466,14 @@ async function handleCommand(msg, env) {
             break;
 
         case "/setprompt":
-            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема&gt;\nМожно юзать [инструкция] для LLM");
+            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема&gt;");
             config.generalPrompt = params.join(" "); await saveConfig(env, config);
             await tg.send(chatId, `✅ Промпт:\n<code>${escapeHtml(config.generalPrompt)}</code>`);
             break;
 
         case "/setcaptionmode": {
             const mode = parseInt(params[0]);
-            if (![0, 1, 2].includes(mode)) return await tg.send(chatId, "❌ /setcaptionmode &lt;0|1|2&gt;\n0 - Без текста\n1 - Промпт\n2 - AI");
+            if (![0, 1, 2].includes(mode)) return await tg.send(chatId, "❌ /setcaptionmode &lt;0|1|2&gt;");
             config.captionMode = mode; await saveConfig(env, config);
             await tg.send(chatId, `✅ Режим подписи: ${mode}`);
             break;
@@ -483,7 +485,6 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, "✅ Инструкция для подписей обновлена");
             break;
 
-        // [NEW] Поддержка новых энхансеров
         case "/setenhancer": {
             const enh = params[0]?.toLowerCase();
             if (!enh) return await tg.send(chatId, "❌ /setenhancer <FaceFix|Upscale|AnimeUpscale|CodeFormers|clear>");
@@ -539,8 +540,6 @@ async function handleCommand(msg, env) {
             break;
         }
 
-        // Удалена команда /searchlora
-
         case "/addlora": {
             if (!params.length) return await tg.send(chatId, "❌ /addlora &lt;ID&gt; [strength=1] [clip=1]");
             const loraId = params[0];
@@ -551,39 +550,48 @@ async function handleCommand(msg, env) {
                 return await tg.send(chatId, `⚠️ LoRA <code>${loraId}</code> уже в списке`);
             }
             let compatMsg = "";
+            let triggers = "";
             try {
                 const civRes = await fetch(`https://civitai.com/api/v1/models/${loraId}`);
                 if (civRes.ok) {
                     const civData = await civRes.json();
                     const base = civData.modelVersions?.[0]?.baseModel || "";
+                    const trainedWords = civData.modelVersions?.[0]?.trainedWords || [];
+                    triggers = trainedWords.join(", ");
                     const loraName = civData.name || loraId;
                     const isXL = config.model?.toLowerCase().includes("xl");
                     const loraIsXL = base.toLowerCase().includes("xl");
                     if (base) compatMsg = `\n📦 <b>${escapeHtml(loraName)}</b> [${base}]`;
-                    if (isXL !== loraIsXL) {
-                        compatMsg += `\n⚠️ <b>Внимание:</b> LoRA обучена на <b>${base}</b>, а текущая модель — <b>${isXL ? "SDXL" : "SD 1.5"}</b>. Скорее всего не применится!`;
-                    } else {
-                        compatMsg += `\n✅ Совместима с текущей моделью`;
-                    }
+                    if (isXL !== loraIsXL) compatMsg += `\n⚠️ <b>Внимание:</b> LoRA обучена на <b>${base}</b>. Скорее всего не применится!`;
+                    else compatMsg += `\n✅ Совместима с текущей моделью`;
                 }
             } catch (_) {}
-            config.loras.push({ name: loraId, strength: loraStr, clip: loraClip });
+            config.loras.push({ name: loraId, strength: loraStr, clip: loraClip, triggers });
             await saveConfig(env, config);
             await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена (str: ${loraStr}, clip: ${loraClip})${compatMsg}`);
             break;
         }
 
         case "/listloras":
-            if (!config.loras?.length) return await tg.send(chatId, "📋 Список LoRA пуст. Добавь через /addlora.");
+            if (!config.loras?.length) return await tg.send(chatId, "📋 Список LoRA пуст.");
             let lt = "📋 <b>Активные LoRA:</b>\n\n";
-            config.loras.forEach((l, i) => lt += `${i + 1}. ID: <code>${l.name}</code> (str: ${l.strength}, clip: ${l.clip})\n`);
-            lt += "\nОчистить: /clearloras";
+            config.loras.forEach((l, i) => {
+                lt += `${i + 1}. ID: <code>${l.name}</code> (str: ${l.strength}, clip: ${l.clip})\n`;
+                if (l.triggers) lt += `   🔑 Triggers: <i>${escapeHtml(l.triggers)}</i>\n`;
+            });
             await tg.send(chatId, lt);
             break;
 
         case "/clearloras":
             config.loras = []; await saveConfig(env, config);
             await tg.send(chatId, "✅ Список LoRA очищен");
+            break;
+
+        case "/setloratriggers":
+            if (!params[0]) return await tg.send(chatId, "❌ /setloratriggers <on|off>");
+            config.useLoraTriggers = params[0].toLowerCase() === "on";
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ Авто-добавление LoRA Trigger Words: ${config.useLoraTriggers ? "ВКЛ" : "ВЫКЛ"}`);
             break;
 
         case "/setsampler":
@@ -611,18 +619,54 @@ async function handleCommand(msg, env) {
             break;
 
         case "/setllm":
-            if (!params.length) return await tg.send(chatId, "❌ /setllm &lt;модель&gt;\nПример: openrouter/free");
+            if (!params.length) return await tg.send(chatId, "❌ /setllm &lt;модель&gt;");
             config.llmModel = params.join(" "); await saveConfig(env, config);
             await tg.send(chatId, `✅ LLM: <code>${config.llmModel}</code>`);
             break;
 
-        // [NEW] Команда для управления спойлером
         case "/setspoiler":
             if (!params[0]) return await tg.send(chatId, "❌ /setspoiler <on|off>");
             config.useSpoiler = params[0].toLowerCase() === "on";
             await saveConfig(env, config);
             await tg.send(chatId, `✅ Спойлер: ${config.useSpoiler ? "ВКЛ" : "ВЫКЛ"}`);
             break;
+
+        case "/setratings":
+            if (!params[0]) return await tg.send(chatId, "❌ /setratings <on|off>");
+            config.ratingEnabled = params[0].toLowerCase() === "on";
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ Рейтинги: ${config.ratingEnabled ? "ВКЛ" : "ВЫКЛ"}`);
+            break;
+
+        case "/setratingtype":
+            if (!params[0] || !["button", "emoji"].includes(params[0].toLowerCase())) return await tg.send(chatId, "❌ /setratingtype <button|emoji>");
+            config.ratingType = params[0].toLowerCase() === "button" ? "buttons" : "reactions";
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ Тип рейтинга: ${config.ratingType}`);
+            break;
+
+        case "/analytics": {
+            const histList = await KV.list(env, "hist:");
+            if (!histList.keys.length) return await tg.send(chatId, "📊 Нет данных для аналитики.");
+            
+            const entries = [];
+            for (const k of histList.keys) {
+                const data = await KV.get(env, k.name, "json");
+                if (data) entries.push(data);
+            }
+            entries.sort((a, b) => b.time - a.time);
+            const recent = entries.slice(0, 15);
+            
+            let text = "📊 <b>Последние генерации:</b>\n\n";
+            for (const e of recent) {
+                const scoreData = await KV.get(env, `score:${e.chatId}:${e.msgId}`, "json") || { up: 0, down: 0 };
+                const net = scoreData.up - scoreData.down;
+                const link = `t.me/c/${String(e.chatId).replace("-100", "")}/${e.msgId}`;
+                text += `🔗 <a href="${link}">Post</a> | ⭐️ Score: ${net > 0 ? "+"+net : net} (👍${scoreData.up}/👎${scoreData.down})\n`;
+            }
+            await tg.send(chatId, text, { disable_web_page_preview: true });
+            break;
+        }
 
         case "/setinterval": {
             const inv = parseInt(params[0]);
@@ -645,7 +689,7 @@ async function handleCommand(msg, env) {
                 config.height = 64 * Math.round(h / 64);
                 await saveConfig(env, config);
                 await tg.send(chatId, `✅ Размер: ${config.width}x${config.height}`);
-            } else await tg.send(chatId, "❌ /setsize &lt;W&gt; &lt;H&gt; (оба > 255)");
+            } else await tg.send(chatId, "❌ /setsize &lt;W&gt; &lt;H&gt;");
             break;
         }
 
@@ -673,11 +717,14 @@ async function handleCommand(msg, env) {
                         const res = await hordeSubmit(finalPrompt, config, env, { workerBlacklist: bl });
                         if (res.id) {
                             await KV.put(env, `pending:${res.id}`, { targets: [chatId], prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0 }, { expirationTtl: 3600 });
-                            await tg.send(chatId, `📤 ID: <code>${res.id}</code>`);
+                            const checkData = await hordeCheck(res.id);
+                            const waitTime = checkData.wait_time ? Math.round(checkData.wait_time) : "?";
+                            const qPos = checkData.queue_position !== undefined ? checkData.queue_position : "?";
+                            await tg.send(chatId, `📤 ID: <code>${res.id}</code>\n⏱ Ожидание: ~${waitTime} сек\n👥 В очереди: ${qPos}`);
                         } else {
                             await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
                         }
-                    } catch (e) { await tg.send(chatId, `❌ Ошибка генерации промпта: ${e.message}`); } // [FIX] Обрабатываем выброшенную ошибку LLM
+                    } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
                 }
             }
             break;
@@ -686,7 +733,7 @@ async function handleCommand(msg, env) {
             let queueCount = 0;
             try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n<b>Рейтинги:</b> ${config.ratingEnabled ? "🟢" : "🔴"} (${config.ratingType})\n<b>LoRA Auto-Triggers:</b> ${config.useLoraTriggers ? "🟢" : "🔴"}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -714,6 +761,33 @@ async function handleCommand(msg, env) {
         default:
             if (cmd.startsWith("/")) await tg.send(chatId, "❓ Неизвестная команда. Введи /help");
     }
+}
+
+async function handleCallback(cb, env) {
+    if (!cb.data.startsWith("rate_")) return;
+    const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
+    const msgId = cb.message.message_id;
+    const chatId = cb.message.chat.id;
+    const userId = cb.from.id;
+    const rateKey = `usr_rate:${msgId}:${userId}`;
+    
+    const hasRated = await KV.get(env, rateKey);
+    if (hasRated) {
+        await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Вы уже проголосовали!" });
+        return;
+    }
+    
+    await KV.put(env, rateKey, "1", { expirationTtl: 14 * 24 * 3600 });
+    const isUp = cb.data === "rate_up";
+    const scoreKey = `score:${chatId}:${msgId}`;
+    let currentScore = await KV.get(env, scoreKey, "json") || { up: 0, down: 0 };
+    
+    if (isUp) currentScore.up++; else currentScore.down++;
+    await KV.put(env, scoreKey, currentScore, { expirationTtl: 14 * 24 * 3600 });
+    
+    const markup = { inline_keyboard: [[{ text: `👍 ${currentScore.up}`, callback_data: "rate_up" }, { text: `👎 ${currentScore.down}`, callback_data: "rate_down" }]] };
+    await tg.api("editMessageReplyMarkup", { chat_id: chatId, message_id: msgId, reply_markup: markup });
+    await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Голос учтён!" });
 }
 
 async function processScheduled(env) {
@@ -769,7 +843,7 @@ async function processScheduled(env) {
                     const skipped = gen.gen_metadata.filter(m => m.type === "lora_skipped" || m.type === "lora");
                     if (skipped.length) {
                         const names = skipped.map(m => m.ref || m.id || "?").join(", ");
-                        await tg.send(task.notify, `⚠️ <b>LoRA пропущена воркером!</b>\nID: <code>${names}</code>\n<i>Причина: воркер не поддерживает или несовместима с моделью</i>`);
+                        await tg.send(task.notify, `⚠️ <b>LoRA пропущена воркером!</b>\nID: <code>${names}</code>\n<i>Причина: несовместима с моделью</i>`);
                     }
                 }
 
@@ -778,9 +852,14 @@ async function processScheduled(env) {
                 else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
 
                 for (const tId of (task.targets || [])) {
-                    // [FIX] Прокидываем конфиг спойлера при доставке
-                    const { sent, tooSmall } = await deliverImage(tg, tId, gen.img, captionText, task.notify, config.useSpoiler);
-                    if (sent) success = true;
+                    const { sent, tooSmall, msgId } = await deliverImage(tg, tId, gen.img, captionText, task.notify, config);
+                    if (sent) {
+                        success = true;
+                        if (msgId) {
+                            const histObj = { msgId, chatId: tId, time: Date.now() };
+                            await KV.put(env, `hist:${Date.now()}_${Math.random().toString(36).substring(2,7)}`, histObj, { expirationTtl: 14 * 24 * 3600 });
+                        }
+                    }
                     if (tooSmall) {
                         censored = true;
                         await addWorkerToBlacklist(env, wId, wName);
@@ -798,10 +877,9 @@ async function processScheduled(env) {
                         if (task.notify) await tg.send(task.notify, `🔄 Ретрай ${retries}/3...`);
                     }
                 } else if (task.notify) {
-                    await tg.send(task.notify, "❌ 3 попытки неудачны. Скорее всего анонимный ключ (NSFW запрещён) или модель цензурит промпт.");
+                    await tg.send(task.notify, "❌ 3 попытки неудачны. Скорее всего анонимный ключ или модель цензурит промпт.");
                 }
             }
-
         } catch (e) {
             console.error(`[CRON] Ошибка обработки ${id}:`, e.message);
         }
@@ -843,6 +921,8 @@ export default {
                 const body = await req.json();
                 if (body.message?.text && body.message.text.startsWith("/")) {
                     ctx.waitUntil(handleCommand(body.message, env));
+                } else if (body.callback_query) {
+                    ctx.waitUntil(handleCallback(body.callback_query, env));
                 }
             } catch (e) { console.error("[WH]", e.message); }
             return new Response("OK", { status: 200 });
@@ -854,7 +934,7 @@ export default {
             const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url: webhookUrl, allowed_updates: ["message"], drop_pending_updates: true })
+                body: JSON.stringify({ url: webhookUrl, allowed_updates: ["message", "callback_query"], drop_pending_updates: true })
             });
             return new Response(`Webhook: ${webhookUrl}\n\n${JSON.stringify(await res.json(), null, 2)}`);
         }
