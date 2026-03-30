@@ -60,7 +60,8 @@ class Telegram {
     async sendPhoto(chatId, buffer, caption = "", extra = {}) {
         const form = new FormData();
         form.append("chat_id", String(chatId));
-        form.append("photo", new File([buffer], "image.webp", { type: "image/webp" }));
+        // Используем Blob вместо File для большей совместимости в Cloudflare Workers
+        form.append("photo", new Blob([buffer], { type: "image/webp" }), "image.webp");
         if (caption) {
             form.append("caption", caption.substring(0, 1024));
             form.append("parse_mode", "HTML");
@@ -72,7 +73,7 @@ class Telegram {
     async sendDocument(chatId, buffer, caption = "", extra = {}) {
         const form = new FormData();
         form.append("chat_id", String(chatId));
-        form.append("document", new File([buffer], "image.webp", { type: "image/webp" }));
+        form.append("document", new Blob([buffer], { type: "image/webp" }), "image.webp");
         if (caption) {
             form.append("caption", caption.substring(0, 1024));
             form.append("parse_mode", "HTML");
@@ -309,7 +310,8 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
     return { sent: false, tooSmall: false, sizeKB };
 }
 
-async function callOpenRouter(env, model, messages, maxTokens = 4096, retries = 2) {
+// Контекстное окно увеличено до 6000
+async function callOpenRouter(env, model, messages, maxTokens = 6000, retries = 2) {
     let lastErr = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
@@ -375,7 +377,7 @@ async function generatePrompt(basePrompt, env, config) {
     const result = await callOpenRouter(env, llmModel, [
         { role: "system", content: sysPrompt },
         { role: "user", content: userPrompt }
-    ], 2048);
+    ], 6000); // 6k tokens
 
     if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
 
@@ -391,7 +393,7 @@ async function generateAiCaption(imagePrompt, env, config) {
     const result = await callOpenRouter(env, config.llmModel || "openrouter/free", [
         { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
         { role: "user", content: `Промпт картинки: ${imagePrompt.substring(0, 1000)}` }
-    ], 2048);
+    ], 6000); // 6k tokens
 
     if (!result || result.trim().length === 0 || result.includes("HTTP ")) {
         return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
@@ -448,7 +450,7 @@ async function handleCommand(msg, env) {
 
         case "/ungroup":
             config.groupId = null; await saveConfig(env, config);
-            await tg.send(chatId, "✅ Группа отвязана");
+            await tg.send(chatId, "✅ Группа отвязанa");
             break;
 
         case "/unchannel":
@@ -723,7 +725,7 @@ async function handleCommand(msg, env) {
                 if (!pendList.keys.length) {
                     return await tg.send(chatId, `⏳ В очереди: 0 генераций`);
                 }
-                
+
                 await tg.send(chatId, `⏳ <b>В очереди: ${pendList.keys.length} генераций</b>\nПроверяю статус серверов...`);
 
                 let count = 0;
@@ -735,9 +737,20 @@ async function handleCommand(msg, env) {
                     }
                     const id = k.name.replace("pending:", "");
                     const checkData = await hordeCheck(id);
-                    const waitTime = checkData.wait_time ? Math.round(checkData.wait_time) : "?";
-                    const qPos = checkData.queue_position !== undefined ? checkData.queue_position : "?";
-                    statusTxt += `🔹 ID: <code>${id.substring(0,8)}...</code> | Ожидание: ~${waitTime} сек | Перед вами: ${qPos}\n`;
+                    
+                    let status = "Ожидание";
+                    let waitTime = checkData.wait_time ? Math.round(checkData.wait_time) : "?";
+                    let qPos = checkData.queue_position !== undefined ? checkData.queue_position : "?";
+
+                    if (checkData.done) {
+                        status = "✅ Готово (Забираю)";
+                        waitTime = 0;
+                        qPos = 0;
+                    } else if (checkData.faulted || checkData.message) {
+                        status = "❌ Ошибка/Удалено";
+                    }
+
+                    statusTxt += `🔹 ID: <code>${id.substring(0,8)}...</code> | ${status}: ~${waitTime} сек | Перед вами: ${qPos}\n`;
                     count++;
                 }
                 await tg.send(chatId, `📊 <b>Статус очереди:</b>\n\n${statusTxt}`);
@@ -813,15 +826,19 @@ async function processScheduled(env) {
 
             const res = await hordeGetResult(id);
 
-            if (res.faulted) {
+            // Если пришла ошибка с сервера
+            if (res.faulted || res.message) {
                 await KV.del(env, keyObj.name);
-                if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации: <code>${id}</code>`);
+                if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации или время ожидания на сервере истекло: <code>${id}</code>`);
                 continue;
             }
 
             const gens = res.generations || [];
+            
+            // Если арт не получен (уже удален с сервера Horde из-за долгого простоя)
             if (!gens.length) {
                 await KV.del(env, keyObj.name);
+                if (task.notify) await tg.send(task.notify, `⚠️ Изображение <code>${id}</code> не найдено на сервере. Возможно, бот не забрал его вовремя.`);
                 continue;
             }
 
@@ -879,6 +896,10 @@ async function processScheduled(env) {
                     await tg.send(task.notify, "❌ 3 попытки неудачны. Скорее всего анонимный ключ или модель цензурит промпт.");
                 }
                 await KV.del(env, keyObj.name); 
+            } else if (!success) {
+                // Если произошла другая непредвиденная ошибка
+                await KV.del(env, keyObj.name); 
+                if (task.notify) await tg.send(task.notify, `❌ Не удалось отправить арт <code>${id}</code>. Задача удалена из очереди.`);
             } else {
                 await KV.del(env, keyObj.name); 
             }
@@ -926,6 +947,10 @@ export default {
                 } else if (body.callback_query) {
                     ctx.waitUntil(handleCallback(body.callback_query, env));
                 }
+                
+                // Запускаем обработчик очереди на любой входящий вебхук 
+                // Это спасет, если Cron-триггер работает с перебоями
+                ctx.waitUntil(processScheduled(env));
             } catch (e) { console.error("[WH]", e.message); }
             return new Response("OK", { status: 200 });
         }
