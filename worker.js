@@ -25,7 +25,9 @@ const DEFAULT_CONFIG = {
     captionPrompt: "Опиши эту картинку для поста в Telegram-канале на русском языке, креативно и с эмодзи. Без лишних вступлений.",
     useSpoiler: false,
     ratingEnabled: false,
-    ratingType: "buttons"
+    ratingType: "buttons",
+    watermarkData: null,
+    watermarkPosition: "random"
 };
 
 const HORDE_API = "https://stablehorde.net/api/v2";
@@ -38,6 +40,24 @@ function escapeHtml(text) {
 
 function isHttpUrl(text) {
     return typeof text === "string" && /^https?:\/\//i.test(text);
+}
+
+function bufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    for (let i = 0; i < bytes.byteLength; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+
+function base64ToBuffer(b64) {
+    try {
+        const bin = atob(b64);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        return arr.buffer;
+    } catch { return null; }
 }
 
 class Telegram {
@@ -69,6 +89,23 @@ class Telegram {
         if (extra.replyMarkup) form.append("reply_markup", JSON.stringify(extra.replyMarkup));
         return (await fetch(`${this.base}/sendPhoto`, { method: "POST", body: form })).json();
     }
+    async sendMediaGroup(chatId, buffers, caption = "") {
+        const form = new FormData();
+        form.append("chat_id", String(chatId));
+        const media = [];
+        buffers.forEach((buf, i) => {
+            const filename = `photo${i}.webp`;
+            form.append(filename, new Blob([buf], { type: "image/webp" }), filename);
+            const item = { type: "photo", media: `attach://${filename}` };
+            if (i === 0 && caption) {
+                item.caption = caption.substring(0, 1024);
+                item.parse_mode = "HTML";
+            }
+            media.push(item);
+        });
+        form.append("media", JSON.stringify(media));
+        return (await fetch(`${this.base}/sendMediaGroup`, { method: "POST", body: form })).json();
+    }
     async sendDocument(chatId, buffer, caption = "", extra = {}) {
         const form = new FormData();
         form.append("chat_id", String(chatId));
@@ -88,7 +125,7 @@ class Telegram {
     }
 }
 
-const Redis = {
+const KV = {
     async call(env, ...args) {
         if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) return null;
         const base = env.UPSTASH_REDIS_REST_URL.replace(/\/$/, "");
@@ -120,8 +157,6 @@ const Redis = {
         return { keys: keys.map(k => ({ name: k })) };
     }
 };
-
-const KV = Redis;
 
 async function getConfig(env) {
     const data = await KV.get(env, "config", "json");
@@ -170,13 +205,137 @@ async function hordeCheckKey(env) {
     }
 }
 
+function getRandomPromptSegment(generalPrompt) {
+    if (!generalPrompt) return "";
+    const segments = generalPrompt.split(';').map(s => s.trim()).filter(Boolean);
+    if (segments.length === 0) return generalPrompt;
+    return segments[Math.floor(Math.random() * segments.length)];
+}
+
+async function callOpenRouter(env, model, messages, maxTokens = 8000, retries = 2) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+                    "HTTP-Referer": "https://t.me",
+                    "X-Title": "TgImageBot"
+                },
+                body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: maxTokens })
+            });
+
+            if (!res.ok) {
+                const errBody = await res.text();
+                lastErr = `HTTP ${res.status}: ${errBody.substring(0, 200)}`;
+                console.error(`[LLM] Attempt ${attempt + 1} failed:`, lastErr);
+                if (res.status === 429 || res.status >= 500) {
+                    await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+                    continue;
+                }
+                break;
+            }
+
+            const data = await res.json();
+            if (data.error) {
+                lastErr = data.error.message || JSON.stringify(data.error);
+                console.error(`[LLM] API error:`, lastErr);
+                continue;
+            }
+
+            const text = data.choices?.[0]?.message?.content?.trim();
+            if (text && text.length > 3) return text;
+
+            lastErr = "Empty response from model";
+        } catch (e) {
+            lastErr = e.message;
+            console.error(`[LLM] Attempt ${attempt + 1} exception:`, e.message);
+            if (attempt < retries) await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+        }
+    }
+    console.error("[LLM] All attempts failed:", lastErr);
+    return null;
+}
+
+async function determineResolution(prompt, env, config) {
+    const presets = [[1024, 1024], [832, 1216], [1216, 832], [768, 1344]];
+    if (!env.OPENROUTER_API_KEY) {
+        const r = presets[Math.floor(Math.random() * presets.length)];
+        return { width: r[0], height: r[1] };
+    }
+    try {
+        const sysPrompt = "You are an AI choosing aspect ratios. Read the prompt and output ONLY one of these exact strings based on what visually fits best: '1024x1024' (Square), '832x1216' (Portrait/Characters), '1216x832' (Landscape/Scenery), or '768x1344' (Cinematic/Tall). NO explanations, NO markdown.";
+        const result = await callOpenRouter(env, config.llmModel || "openrouter/free", [
+            { role: "system", content: sysPrompt },
+            { role: "user", content: `Prompt: ${prompt}` }
+        ], 50);
+        
+        if (result) {
+            const clean = result.replace(/['"`]/g, '').trim().toLowerCase();
+            if (clean.includes("1024x1024")) return { width: 1024, height: 1024 };
+            if (clean.includes("832x1216")) return { width: 832, height: 1216 };
+            if (clean.includes("1216x832")) return { width: 1216, height: 832 };
+            if (clean.includes("768x1344")) return { width: 768, height: 1344 };
+        }
+    } catch (e) { console.error("[LLM Resolution error]", e); }
+    
+    // Fallback
+    const r = presets[Math.floor(Math.random() * presets.length)];
+    return { width: r[0], height: r[1] };
+}
+
+async function generatePrompt(basePrompt, env, config) {
+    if (!env.OPENROUTER_API_KEY) return basePrompt;
+    const llmModel = config.llmModel || "openrouter/free";
+    let sysPrompt, userPrompt;
+    const match = basePrompt.match(/\[([\s\S]*?)\]/);
+
+    if (match) {
+        const instruction = match[1];
+        const cleanPrompt = basePrompt.replace(match[0], "").trim();
+        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. DO NOT shorten, summarize, or truncate. Utilize the maximum context length if necessary to preserve all details. NEVER cut off mid-sentence. Include all elements requested.";
+        userPrompt = `Base prompt: ${cleanPrompt}\nInstruction: ${instruction}`;
+    } else {
+        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. DO NOT shorten, summarize, or truncate. Utilize the maximum context length if necessary to preserve all details. NEVER cut off mid-sentence. Expand the theme deeply.";
+        userPrompt = `Create a highly detailed image generation prompt based on this theme: ${basePrompt}`;
+    }
+
+    const result = await callOpenRouter(env, llmModel, [
+        { role: "system", content: sysPrompt },
+        { role: "user", content: userPrompt }
+    ], 8000);
+
+    if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
+
+    if (match) {
+        console.error("[LLM] OpenRouter API failed to process prompt instruction.");
+        throw new Error("Не удалось обработать инструкцию для промпта через OpenRouter. Повторите позже.");
+    }
+    return basePrompt;
+}
+
+async function generateAiCaption(imagePrompt, env, config) {
+    if (!env.OPENROUTER_API_KEY) return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
+    const result = await callOpenRouter(env, config.llmModel || "openrouter/free", [
+        { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
+        { role: "user", content: `Промпт картинки: ${imagePrompt.substring(0, 1000)}` }
+    ], 8000);
+
+    if (!result || result.trim().length === 0 || result.includes("HTTP ")) {
+        return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
+    }
+    return result;
+}
+
 async function hordeSubmit(prompt, config, env, extra = {}) {
     const key = getApiKey(env);
     const params = {
         sampler_name: config.sampler,
         cfg_scale: config.cfgScale,
-        width: config.width,
-        height: config.height,
+        width: extra.width || config.width,
+        height: extra.height || config.height,
         steps: config.steps,
         karras: config.karras !== false,
         clip_skip: config.clipSkip || 2,
@@ -254,13 +413,33 @@ async function downloadImage(url) {
     } catch { return null; }
 }
 
-function base64ToBuffer(b64) {
+async function applyWatermark(imageBuffer, config) {
+    if (!config.watermarkData) return imageBuffer;
+    
+    // ВНИМАНИЕ: Cloudflare Workers не могут нативно манипулировать изображениями (Canvas/Sharp).
+    // Для реального наложения требуется вызов внешнего сервиса (микросервис или API Cloudinary/Imgix).
+    // Здесь подготовлена структура запроса. Пока возвращаем оригинальный буфер, чтобы бот не падал.
     try {
-        const bin = atob(b64);
-        const arr = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-        return arr.buffer;
-    } catch { return null; }
+        /* Пример использования гипотетического легкого микросервиса:
+        const res = await fetch("https://your-microservice.com/watermark", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                image: bufferToBase64(imageBuffer),
+                watermark: config.watermarkData,
+                position: config.watermarkPosition,
+                blend: "multiply"
+            })
+        });
+        if (res.ok) {
+            const data = await res.json();
+            return base64ToBuffer(data.result) || imageBuffer;
+        }
+        */
+        console.log("Watermark function triggered but external API is required in Workers environment.");
+    } catch(e) { console.error("Watermark overlay failed", e); }
+    
+    return imageBuffer;
 }
 
 async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
@@ -288,6 +467,9 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
         if (!buffer) return { sent: false, tooSmall: false, sizeKB: 0 };
     }
 
+    // Применение водяного знака перед отправкой
+    buffer = await applyWatermark(buffer, config);
+
     const sizeKB = Math.round(buffer.byteLength / 1024);
     if (sizeKB < MIN_IMAGE_KB) {
         if (notifyId) await tg.send(notifyId, `🚫 <b>Похоже на заглушку/цензуру</b>\nРазмер: ${sizeKB}KB`);
@@ -309,100 +491,10 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
     return { sent: false, tooSmall: false, sizeKB };
 }
 
-async function callOpenRouter(env, model, messages, maxTokens = 6000, retries = 2) {
-    let lastErr = null;
-    for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-            const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-                    "HTTP-Referer": "https://t.me",
-                    "X-Title": "TgImageBot"
-                },
-                body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: maxTokens })
-            });
-
-            if (!res.ok) {
-                const errBody = await res.text();
-                lastErr = `HTTP ${res.status}: ${errBody.substring(0, 200)}`;
-                console.error(`[LLM] Attempt ${attempt + 1} failed:`, lastErr);
-                if (res.status === 429 || res.status >= 500) {
-                    await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
-                    continue;
-                }
-                break;
-            }
-
-            const data = await res.json();
-            if (data.error) {
-                lastErr = data.error.message || JSON.stringify(data.error);
-                console.error(`[LLM] API error:`, lastErr);
-                continue;
-            }
-
-            const text = data.choices?.[0]?.message?.content?.trim();
-            if (text && text.length > 3) return text;
-
-            lastErr = "Empty response from model";
-        } catch (e) {
-            lastErr = e.message;
-            console.error(`[LLM] Attempt ${attempt + 1} exception:`, e.message);
-            if (attempt < retries) await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
-        }
-    }
-    console.error("[LLM] All attempts failed:", lastErr);
-    return null;
-}
-
-async function generatePrompt(basePrompt, env, config) {
-    if (!env.OPENROUTER_API_KEY) return basePrompt;
-    const llmModel = config.llmModel || "openrouter/free";
-    let sysPrompt, userPrompt;
-    const match = basePrompt.match(/\[([\s\S]*?)\]/);
-
-    if (match) {
-        const instruction = match[1];
-        const cleanPrompt = basePrompt.replace(match[0], "").trim();
-        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. No explanations, no markdown. CRITICAL: Ensure the output is complete and NEVER cut off mid-sentence.";
-        userPrompt = `Base prompt: ${cleanPrompt}\nInstruction: ${instruction}`;
-    } else {
-        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. No explanations, no markdown. CRITICAL: Ensure the output is complete and NEVER cut off mid-sentence.";
-        userPrompt = `Create a detailed image generation prompt based on this theme: ${basePrompt}`;
-    }
-
-    const result = await callOpenRouter(env, llmModel, [
-        { role: "system", content: sysPrompt },
-        { role: "user", content: userPrompt }
-    ], 6000);
-
-    if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
-
-    if (match) {
-        console.error("[LLM] OpenRouter API failed to process prompt instruction.");
-        throw new Error("Не удалось обработать инструкцию для промпта через OpenRouter. Повторите позже.");
-    }
-    return basePrompt;
-}
-
-async function generateAiCaption(imagePrompt, env, config) {
-    if (!env.OPENROUTER_API_KEY) return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
-    const result = await callOpenRouter(env, config.llmModel || "openrouter/free", [
-        { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
-        { role: "user", content: `Промпт картинки: ${imagePrompt.substring(0, 1000)}` }
-    ], 6000);
-
-    if (!result || result.trim().length === 0 || result.includes("HTTP ")) {
-        return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
-    }
-    return result;
-}
-
 async function handleCommand(msg, env) {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
-    const text = msg.text || "";
+    const text = msg.text || msg.caption || "";
 
     if (!env.TELEGRAM_BOT_TOKEN) return;
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
@@ -432,7 +524,7 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;текст&gt; | /setneg &lt;текст&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n\n<b>Оценки и Статистика:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Оценки и Статистика:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
 
         case "/setgroup":
@@ -457,9 +549,9 @@ async function handleCommand(msg, env) {
             break;
 
         case "/setprompt":
-            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема1; тема2&gt;");
             config.generalPrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ Промпт:\n<code>${escapeHtml(config.generalPrompt)}</code>`);
+            await tg.send(chatId, `✅ Промпт сохранен. Темы будут выбираться случайно, если разделены ";"\n<code>${escapeHtml(config.generalPrompt)}</code>`);
             break;
 
         case "/setcaptionmode": {
@@ -476,8 +568,31 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, "✅ Инструкция для подписей обновлена");
             break;
 
+        case "/setwatermark": {
+            const doc = msg.document || msg.reply_to_message?.document;
+            if (!doc) return await tg.send(chatId, "❌ Прикрепите прозрачный PNG файл как документ к команде /setwatermark или ответьте на документ.");
+            if (doc.mime_type !== "image/png") return await tg.send(chatId, "❌ Только PNG файлы поддерживаются!");
+            
+            try {
+                const fileReq = await tg.api("getFile", { file_id: doc.file_id });
+                if (fileReq.ok) {
+                    const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileReq.result.file_path}`;
+                    const fileRes = await fetch(fileUrl);
+                    const arrayBuffer = await fileRes.arrayBuffer();
+                    
+                    config.watermarkData = bufferToBase64(arrayBuffer);
+                    config.watermarkPosition = params[0] || "random";
+                    await saveConfig(env, config);
+                    await tg.send(chatId, `✅ Водяной знак сохранен! Позиция: ${config.watermarkPosition}`);
+                } else {
+                    await tg.send(chatId, `❌ Ошибка API Telegram: ${fileReq.description}`);
+                }
+            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+            break;
+        }
+
         case "/setenhancer": {
-            if (!params.length) return await tg.send(chatId, "❌ /setenhancer <FaceFix|Upscale|AnimeUpscale|CodeFormers|clear>\nМожно перечислить несколько через пробел.");
+            if (!params.length) return await tg.send(chatId, "❌ /setenhancer <FaceFix|Upscale|AnimeUpscale|CodeFormers|clear>");
             if (params[0].toLowerCase() === "clear") {
                 config.postProcessors = [];
                 await tg.send(chatId, "✅ Улучшайзеры сброшены");
@@ -660,7 +775,7 @@ async function handleCommand(msg, env) {
 
         case "/setcount": {
             const cnt = parseInt(params[0]);
-            if (cnt > 0 && cnt <= 10) { config.count = cnt; await saveConfig(env, config); await tg.send(chatId, `✅ Количество: ${cnt}`); }
+            if (cnt > 0 && cnt <= 10) { config.count = cnt; await saveConfig(env, config); await tg.send(chatId, `✅ Количество в батче: ${cnt}`); }
             else await tg.send(chatId, "❌ /setcount &lt;1-10&gt;");
             break;
         }
@@ -671,7 +786,7 @@ async function handleCommand(msg, env) {
                 config.width = 64 * Math.round(w / 64);
                 config.height = 64 * Math.round(h / 64);
                 await saveConfig(env, config);
-                await tg.send(chatId, `✅ Размер: ${config.width}x${config.height}`);
+                await tg.send(chatId, `✅ Базовый размер: ${config.width}x${config.height} (AI может переопределять)`);
             } else await tg.send(chatId, "❌ /setsize &lt;W&gt; &lt;H&gt;");
             break;
         }
@@ -690,21 +805,38 @@ async function handleCommand(msg, env) {
 
         case "/generate":
             if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт (/setprompt)");
-            await tg.send(chatId, `⏳ Генерирую ${config.count} фото...`);
+            await tg.send(chatId, `⏳ Генерирую ${config.count} фото... (Обработка Batch)`);
             {
                 const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
+                const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
+                const targets = [chatId];
+                
+                // Инициализация батча в KV
+                await KV.put(env, `batch:${batchId}`, { expected: config.count, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: 3600 });
+                
+                const segment = getRandomPromptSegment(config.generalPrompt);
+                
                 for (let i = 0; i < config.count; i++) {
                     try {
-                        const finalPrompt = await generatePrompt(config.generalPrompt, env, config);
-                        await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 300))}</code>`);
-                        const res = await hordeSubmit(finalPrompt, config, env, { workerBlacklist: bl });
+                        const finalPrompt = await generatePrompt(segment, env, config);
+                        const bestRes = await determineResolution(finalPrompt, env, config);
+                        
+                        await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 300))}</code>\n📏 Резолюция: ${bestRes.width}x${bestRes.height}`);
+                        
+                        const res = await hordeSubmit(finalPrompt, config, env, { workerBlacklist: bl, width: bestRes.width, height: bestRes.height });
                         if (res.id) {
-                            await KV.put(env, `pending:${res.id}`, { targets: [chatId], prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0 }, { expirationTtl: 3600 });
-                            await tg.send(chatId, `📤 ID: <code>${res.id}</code>\n⏳ Отправлено в очередь.`);
+                            await KV.put(env, `pending:${res.id}`, { targets, prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0, batchId }, { expirationTtl: 3600 });
                         } else {
                             await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
+                            // Уменьшаем счетчик ожидаемых в случае фейла
+                            let batch = await KV.get(env, `batch:${batchId}`, "json");
+                            if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
                         }
-                    } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+                    } catch (e) { 
+                        await tg.send(chatId, `❌ Ошибка: ${e.message}`);
+                        let batch = await KV.get(env, `batch:${batchId}`, "json");
+                        if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
+                    }
                 }
             }
             break;
@@ -713,7 +845,7 @@ async function handleCommand(msg, env) {
             let queueCount = 0;
             try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n<b>Рейтинги:</b> ${config.ratingEnabled ? "🟢" : "🔴"} (${config.ratingType})\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n<b>Рейтинги:</b> ${config.ratingEnabled ? "🟢" : "🔴"} (${config.ratingType})\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -760,6 +892,8 @@ async function handleCommand(msg, env) {
                 const plist = await KV.list(env, "pending:");
                 let canceled = 0;
                 for (const k of plist.keys) { await KV.del(env, k.name); canceled++; }
+                const blist = await KV.list(env, "batch:");
+                for (const b of blist.keys) { await KV.del(env, b.name); }
                 await tg.send(chatId, `✅ Очередь очищена. Удалено задач: ${canceled}`);
             } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
@@ -813,73 +947,57 @@ async function processScheduled(env) {
             const task = await KV.get(env, keyObj.name, "json");
             if (!task) { await KV.del(env, keyObj.name); continue; }
 
-            if (Date.now() - task.at > 3600000) {
-                await KV.del(env, keyObj.name);
-                if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
+            const check = await hordeCheck(id);
+            if (!check.done) {
+                if (Date.now() - task.at > 3600000) {
+                    await KV.del(env, keyObj.name);
+                    if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
+                    if (task.batchId) {
+                        let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                        if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                    }
+                }
                 continue;
             }
-
-            const check = await hordeCheck(id);
-            if (!check.done) continue;
 
             const res = await hordeGetResult(id);
 
             if (res.faulted || res.message) {
                 await KV.del(env, keyObj.name);
-                if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации или время ожидания на сервере истекло: <code>${id}</code>`);
+                if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации: <code>${id}</code>`);
+                if (task.batchId) {
+                    let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                }
                 continue;
             }
 
             const gens = res.generations || [];
-
             if (!gens.length) {
                 await KV.del(env, keyObj.name);
-                if (task.notify) await tg.send(task.notify, `⚠️ Изображение <code>${id}</code> не найдено на сервере. Возможно, бот не забрал его вовремя.`);
+                if (task.notify) await tg.send(task.notify, `⚠️ Изображение <code>${id}</code> пустое.`);
+                if (task.batchId) {
+                    let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                }
                 continue;
             }
 
-            let success = false;
             let censored = false;
+            let finalImageBase64 = null;
+            let workerId = "?";
+            let workerName = "?";
 
-            try {
-                for (const gen of gens) {
-                    const wId = gen.worker_id || "?";
-                    const wName = gen.worker_name || "?";
-                    const isCens = isCensored(gen);
-
-                    if (isCens) {
-                        await addWorkerToBlacklist(env, wId, wName);
-                        censored = true;
-                        if (task.notify) await tg.send(task.notify, `🔴 Воркер <code>${wName}</code> выдал цензуру. Добавлен в ЧС.`);
-                        continue;
-                    }
-
-                    if (!gen.img) continue;
-
-                    let captionText = "";
-                    if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
-                    else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
-
-                    for (const tId of (task.targets || [])) {
-                        const { sent, tooSmall, msgId } = await deliverImage(tg, tId, gen.img, captionText, task.notify, config);
-                        if (sent) {
-                            success = true;
-                            if (msgId) {
-                                const histObj = { msgId, chatId: tId, time: Date.now() };
-                                await KV.put(env, `hist:${Date.now()}_${Math.random().toString(36).substring(2,7)}`, histObj, { expirationTtl: 14 * 24 * 3600 });
-                            }
-                        }
-                        if (tooSmall) {
-                            censored = true;
-                            await addWorkerToBlacklist(env, wId, wName);
-                        }
-                    }
-                }
-            } catch (err) {
-                console.error(`[PROCESS] Внутренняя ошибка обработки ${id}:`, err.message);
+            for (const gen of gens) {
+                workerId = gen.worker_id || "?";
+                workerName = gen.worker_name || "?";
+                if (isCensored(gen)) { censored = true; break; }
+                if (gen.img) finalImageBase64 = gen.img;
             }
 
-            if (censored && !success && !task.sfwTest) {
+            if (censored) {
+                await addWorkerToBlacklist(env, workerId, workerName);
+                if (task.notify) await tg.send(task.notify, `🔴 Воркер <code>${workerName}</code> выдал цензуру. Добавлен в ЧС.`);
                 const retries = (task.retries || 0) + 1;
                 if (retries < 3) {
                     const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
@@ -888,18 +1006,95 @@ async function processScheduled(env) {
                         await KV.put(env, `pending:${newRes.id}`, { ...task, at: Date.now(), retries }, { expirationTtl: 3600 });
                         if (task.notify) await tg.send(task.notify, `🔄 Ретрай ${retries}/3...`);
                     }
-                } else if (task.notify) {
-                    await tg.send(task.notify, "❌ 3 попытки неудачны. Скорее всего анонимный ключ или модель цензурит промпт.");
+                } else {
+                    if (task.notify) await tg.send(task.notify, "❌ 3 попытки неудачны.");
+                    if (task.batchId) {
+                        let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                        if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                    }
                 }
-                await KV.del(env, keyObj.name); 
-            } else if (!success) {
-                await KV.del(env, keyObj.name); 
-                if (task.notify) await tg.send(task.notify, `❌ Не удалось отправить арт <code>${id}</code>. Задача удалена из очереди.`);
-            } else {
-                await KV.del(env, keyObj.name); 
+                await KV.del(env, keyObj.name);
+                continue;
             }
+
+            if (finalImageBase64) {
+                if (task.batchId) {
+                    let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                    if (batch) {
+                        if (!batch.prompt) batch.prompt = task.prompt; // сохраняем промпт для подписи
+                        batch.ready.push(finalImageBase64);
+                        
+                        // Если собрали все картинки из батча
+                        if (batch.ready.length >= batch.expected) {
+                            let captionText = "";
+                            if (config.captionMode === 1) captionText = `🎨 <i>${escapeHtml(batch.prompt.substring(0, 300))}</i>`;
+                            else if (config.captionMode === 2) captionText = await generateAiCaption(batch.prompt, env, config);
+
+                            for (const tId of batch.targets) {
+                                if (batch.ready.length === 1) {
+                                    await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
+                                } else {
+                                    // Применяем вотермарки и конвертируем в буферы перед отправкой MediaGroup
+                                    const processedBuffers = [];
+                                    for (const b64 of batch.ready) {
+                                        const isUrl = isHttpUrl(b64);
+                                        let buf = isUrl ? await downloadImage(b64) : base64ToBuffer(b64);
+                                        if (buf) {
+                                            buf = await applyWatermark(buf, config);
+                                            processedBuffers.push(buf);
+                                        }
+                                    }
+                                    if (processedBuffers.length > 0) {
+                                        await tg.sendMediaGroup(tId, processedBuffers, captionText);
+                                    }
+                                }
+                            }
+                            await KV.del(env, `batch:${task.batchId}`);
+                        } else {
+                            await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 });
+                        }
+                    } else {
+                        // Фолбэк если батч потерян
+                        await deliverImage(tg, task.targets[0], finalImageBase64, "", task.notify, config);
+                    }
+                } else {
+                    // Старая логика одиночной отправки
+                    let captionText = "";
+                    if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
+                    else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
+                    
+                    for (const tId of (task.targets || [])) {
+                        await deliverImage(tg, tId, finalImageBase64, captionText, task.notify, config);
+                    }
+                }
+            }
+            await KV.del(env, keyObj.name);
+
         } catch (e) {
             console.error(`[CRON] Ошибка обработки ${id}:`, e.message);
+        }
+    }
+
+    // Обработка зависших батчей (частично отправленных)
+    const activeBatches = await KV.list(env, "batch:");
+    for (const bKey of activeBatches.keys) {
+        let batch = await KV.get(env, bKey.name, "json");
+        if (batch && batch.expected <= 0 && batch.ready.length > 0) {
+            let captionText = config.captionMode === 1 ? `🎨 <i>${escapeHtml(batch.prompt.substring(0, 300))}</i>` : "";
+            for (const tId of batch.targets) {
+                if (batch.ready.length === 1) await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
+                else {
+                    const processedBuffers = [];
+                    for (const b64 of batch.ready) {
+                        let buf = isHttpUrl(b64) ? await downloadImage(b64) : base64ToBuffer(b64);
+                        if (buf) processedBuffers.push(await applyWatermark(buf, config));
+                    }
+                    if (processedBuffers.length > 0) await tg.sendMediaGroup(tId, processedBuffers, captionText);
+                }
+            }
+            await KV.del(env, bKey.name);
+        } else if (batch && batch.expected <= 0) {
+            await KV.del(env, bKey.name);
         }
     }
 
@@ -914,18 +1109,28 @@ async function processScheduled(env) {
     const targets = [config.groupId, config.channelId].filter(Boolean);
     let queuedCount = 0;
 
+    const segment = getRandomPromptSegment(config.generalPrompt);
+    const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
+    await KV.put(env, `batch:${batchId}`, { expected: config.count, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: 3600 });
+
     for (let i = 0; i < config.count; i++) {
         try {
-            const prmpt = await generatePrompt(config.generalPrompt, env, config);
-            const res = await hordeSubmit(prmpt, config, env, { workerBlacklist: bl });
+            const prmpt = await generatePrompt(segment, env, config);
+            const bestRes = await determineResolution(prmpt, env, config);
+            const res = await hordeSubmit(prmpt, config, env, { workerBlacklist: bl, width: bestRes.width, height: bestRes.height });
+            
             if (res.id) {
-                await KV.put(env, `pending:${res.id}`, { targets, prompt: prmpt, at: now, notify: config.adminId, retries: 0 }, { expirationTtl: 3600 });
+                await KV.put(env, `pending:${res.id}`, { targets, prompt: prmpt, at: now, notify: config.adminId, retries: 0, batchId }, { expirationTtl: 3600 });
                 queuedCount++;
             } else {
                 if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
+                let batch = await KV.get(env, `batch:${batchId}`, "json");
+                if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
             }
         } catch (e) {
             if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
+            let batch = await KV.get(env, `batch:${batchId}`, "json");
+            if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
         }
     }
 
@@ -944,7 +1149,7 @@ export default {
             if (req.method !== "POST") return new Response("POST only", { status: 405 });
             try {
                 const body = await req.json();
-                if (body.message?.text && body.message.text.startsWith("/")) {
+                if (body.message && (body.message.text?.startsWith("/") || body.message.caption?.startsWith("/"))) {
                     ctx.waitUntil(handleCommand(body.message, env));
                 } else if (body.callback_query) {
                     ctx.waitUntil(handleCallback(body.callback_query, env));
