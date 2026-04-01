@@ -281,7 +281,6 @@ async function determineResolution(prompt, env, config) {
         }
     } catch (e) { console.error("[LLM Resolution error]", e); }
     
-    // Fallback
     const r = presets[Math.floor(Math.random() * presets.length)];
     return { width: r[0], height: r[1] };
 }
@@ -295,17 +294,18 @@ async function generatePrompt(basePrompt, env, config) {
     if (match) {
         const instruction = match[1];
         const cleanPrompt = basePrompt.replace(match[0], "").trim();
-        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. DO NOT shorten, summarize, or truncate. Utilize the maximum context length if necessary to preserve all details. NEVER cut off mid-sentence. Include all elements requested.";
+        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. IMPORTANT: Keep the prompt highly detailed but strictly UNDER 800 characters to prevent truncation by the Horde API. NEVER cut off mid-sentence. Include all elements requested.";
         userPrompt = `Base prompt: ${cleanPrompt}\nInstruction: ${instruction}`;
     } else {
-        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. DO NOT shorten, summarize, or truncate. Utilize the maximum context length if necessary to preserve all details. NEVER cut off mid-sentence. Expand the theme deeply.";
+        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. IMPORTANT: Keep the prompt highly detailed but strictly UNDER 800 characters to prevent truncation by the Horde API. NEVER cut off mid-sentence. Expand the theme deeply.";
         userPrompt = `Create a highly detailed image generation prompt based on this theme: ${basePrompt}`;
     }
 
+    // Лимит токенов установлен на 250, чтобы ИИ физически не смог выдать слишком длинный текст и оборваться
     const result = await callOpenRouter(env, llmModel, [
         { role: "system", content: sysPrompt },
         { role: "user", content: userPrompt }
-    ], 8000);
+    ], 250);
 
     if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
 
@@ -413,42 +413,41 @@ async function downloadImage(url) {
     } catch { return null; }
 }
 
-async function applyWatermark(imageBuffer, config) {
-    if (!config.watermarkData) return imageBuffer;
+async function getWatermarkedUrl(imgUrl, config, env) {
+    if (!config.watermarkData || !isHttpUrl(imgUrl)) return imgUrl;
     
-    // ВНИМАНИЕ: Cloudflare Workers не могут нативно манипулировать изображениями (Canvas/Sharp).
-    // Для реального наложения требуется вызов внешнего сервиса (микросервис или API Cloudinary/Imgix).
-    // Здесь подготовлена структура запроса. Пока возвращаем оригинальный буфер, чтобы бот не падал.
-    try {
-        /* Пример использования гипотетического легкого микросервиса:
-        const res = await fetch("https://your-microservice.com/watermark", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                image: bufferToBase64(imageBuffer),
-                watermark: config.watermarkData,
-                position: config.watermarkPosition,
-                blend: "multiply"
-            })
-        });
-        if (res.ok) {
-            const data = await res.json();
-            return base64ToBuffer(data.result) || imageBuffer;
-        }
-        */
-        console.log("Watermark function triggered but external API is required in Workers environment.");
-    } catch(e) { console.error("Watermark overlay failed", e); }
-    
-    return imageBuffer;
+    const workerOrigin = await KV.get(env, "worker_origin");
+    if (!workerOrigin) return imgUrl;
+
+    const wmUrl = `${workerOrigin}/watermark.png`;
+    let markpos = "southeast";
+
+    if (config.watermarkPosition === "random") {
+        const pos = ["northwest", "northeast", "southwest", "southeast", "center"];
+        markpos = pos[Math.floor(Math.random() * pos.length)];
+    } else if (config.watermarkPosition === "corner") {
+        markpos = "southeast";
+    } else {
+        markpos = config.watermarkPosition || "southeast";
+    }
+
+    return `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&mark=${encodeURIComponent(wmUrl)}&markpos=${markpos}&markpad=5&markalpha=90`;
 }
 
-async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
+async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env) {
     if (!imgData) {
         if (notifyId) await tg.send(notifyId, "❌ Нет данных картинки от воркера");
         return { sent: false, tooSmall: false, sizeKB: 0 };
     }
 
     const isUrl = isHttpUrl(imgData);
+    let targetUrl = imgData;
+    
+    // Применяем вотермарку через URL, если это ссылка от Horde (r2: true)
+    if (isUrl) {
+        targetUrl = await getWatermarkedUrl(imgData, config, env);
+    }
+
     let buffer = null;
     const extra = { hasSpoiler: config.useSpoiler };
 
@@ -457,7 +456,11 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
     }
 
     if (isUrl) {
-        buffer = await downloadImage(imgData);
+        buffer = await downloadImage(targetUrl);
+        // Фолбэк на случай если wsrv.nl недоступен
+        if (!buffer) {
+            buffer = await downloadImage(imgData);
+        }
         if (!buffer) {
             const r = await tg.sendPhotoUrl(chatId, imgData, caption, extra);
             return { sent: r.ok, tooSmall: false, sizeKB: 0, msgId: r.result?.message_id };
@@ -466,9 +469,6 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config) {
         buffer = base64ToBuffer(imgData);
         if (!buffer) return { sent: false, tooSmall: false, sizeKB: 0 };
     }
-
-    // Применение водяного знака перед отправкой
-    buffer = await applyWatermark(buffer, config);
 
     const sizeKB = Math.round(buffer.byteLength / 1024);
     if (sizeKB < MIN_IMAGE_KB) {
@@ -583,7 +583,7 @@ async function handleCommand(msg, env) {
                     config.watermarkData = bufferToBase64(arrayBuffer);
                     config.watermarkPosition = params[0] || "random";
                     await saveConfig(env, config);
-                    await tg.send(chatId, `✅ Водяной знак сохранен! Позиция: ${config.watermarkPosition}`);
+                    await tg.send(chatId, `✅ Водяной знак сохранен и будет склеиваться с картинками автоматически! Позиция: ${config.watermarkPosition}`);
                 } else {
                     await tg.send(chatId, `❌ Ошибка API Telegram: ${fileReq.description}`);
                 }
@@ -811,7 +811,6 @@ async function handleCommand(msg, env) {
                 const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
                 const targets = [chatId];
                 
-                // Инициализация батча в KV
                 await KV.put(env, `batch:${batchId}`, { expected: config.count, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: 3600 });
                 
                 const segment = getRandomPromptSegment(config.generalPrompt);
@@ -828,7 +827,6 @@ async function handleCommand(msg, env) {
                             await KV.put(env, `pending:${res.id}`, { targets, prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0, batchId }, { expirationTtl: 3600 });
                         } else {
                             await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
-                            // Уменьшаем счетчик ожидаемых в случае фейла
                             let batch = await KV.get(env, `batch:${batchId}`, "json");
                             if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
                         }
@@ -1021,10 +1019,9 @@ async function processScheduled(env) {
                 if (task.batchId) {
                     let batch = await KV.get(env, `batch:${task.batchId}`, "json");
                     if (batch) {
-                        if (!batch.prompt) batch.prompt = task.prompt; // сохраняем промпт для подписи
+                        if (!batch.prompt) batch.prompt = task.prompt;
                         batch.ready.push(finalImageBase64);
                         
-                        // Если собрали все картинки из батча
                         if (batch.ready.length >= batch.expected) {
                             let captionText = "";
                             if (config.captionMode === 1) captionText = `🎨 <i>${escapeHtml(batch.prompt.substring(0, 300))}</i>`;
@@ -1032,15 +1029,19 @@ async function processScheduled(env) {
 
                             for (const tId of batch.targets) {
                                 if (batch.ready.length === 1) {
-                                    await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
+                                    await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config, env);
                                 } else {
-                                    // Применяем вотермарки и конвертируем в буферы перед отправкой MediaGroup
                                     const processedBuffers = [];
                                     for (const b64 of batch.ready) {
-                                        const isUrl = isHttpUrl(b64);
-                                        let buf = isUrl ? await downloadImage(b64) : base64ToBuffer(b64);
+                                        let targetUrl = b64;
+                                        if (isHttpUrl(targetUrl)) {
+                                            targetUrl = await getWatermarkedUrl(targetUrl, config, env);
+                                        }
+                                        let buf = isHttpUrl(targetUrl) ? await downloadImage(targetUrl) : base64ToBuffer(b64);
+                                        if (!buf && isHttpUrl(targetUrl)) {
+                                            buf = await downloadImage(b64);
+                                        }
                                         if (buf) {
-                                            buf = await applyWatermark(buf, config);
                                             processedBuffers.push(buf);
                                         }
                                     }
@@ -1054,17 +1055,15 @@ async function processScheduled(env) {
                             await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 });
                         }
                     } else {
-                        // Фолбэк если батч потерян
-                        await deliverImage(tg, task.targets[0], finalImageBase64, "", task.notify, config);
+                        await deliverImage(tg, task.targets[0], finalImageBase64, "", task.notify, config, env);
                     }
                 } else {
-                    // Старая логика одиночной отправки
                     let captionText = "";
                     if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
                     else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
                     
                     for (const tId of (task.targets || [])) {
-                        await deliverImage(tg, tId, finalImageBase64, captionText, task.notify, config);
+                        await deliverImage(tg, tId, finalImageBase64, captionText, task.notify, config, env);
                     }
                 }
             }
@@ -1075,19 +1074,22 @@ async function processScheduled(env) {
         }
     }
 
-    // Обработка зависших батчей (частично отправленных)
     const activeBatches = await KV.list(env, "batch:");
     for (const bKey of activeBatches.keys) {
         let batch = await KV.get(env, bKey.name, "json");
         if (batch && batch.expected <= 0 && batch.ready.length > 0) {
             let captionText = config.captionMode === 1 ? `🎨 <i>${escapeHtml(batch.prompt.substring(0, 300))}</i>` : "";
             for (const tId of batch.targets) {
-                if (batch.ready.length === 1) await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
-                else {
+                if (batch.ready.length === 1) {
+                    await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config, env);
+                } else {
                     const processedBuffers = [];
                     for (const b64 of batch.ready) {
-                        let buf = isHttpUrl(b64) ? await downloadImage(b64) : base64ToBuffer(b64);
-                        if (buf) processedBuffers.push(await applyWatermark(buf, config));
+                        let targetUrl = b64;
+                        if (isHttpUrl(targetUrl)) targetUrl = await getWatermarkedUrl(targetUrl, config, env);
+                        let buf = isHttpUrl(targetUrl) ? await downloadImage(targetUrl) : base64ToBuffer(b64);
+                        if (!buf && isHttpUrl(targetUrl)) buf = await downloadImage(b64);
+                        if (buf) processedBuffers.push(buf);
                     }
                     if (processedBuffers.length > 0) await tg.sendMediaGroup(tId, processedBuffers, captionText);
                 }
@@ -1144,6 +1146,20 @@ async function processScheduled(env) {
 export default {
     async fetch(req, env, ctx) {
         const url = new URL(req.url);
+
+        // Сохраняем хост самого воркера, чтобы он мог отдавать вотермарку
+        ctx.waitUntil(KV.put(env, "worker_origin", url.origin));
+
+        if (url.pathname === "/watermark.png") {
+            const config = await getConfig(env);
+            if (config.watermarkData) {
+                const buf = base64ToBuffer(config.watermarkData);
+                if (buf) {
+                    return new Response(buf, { headers: { "Content-Type": "image/png" } });
+                }
+            }
+            return new Response("Not found", { status: 404 });
+        }
 
         if (url.pathname === "/webhook") {
             if (req.method !== "POST") return new Response("POST only", { status: 405 });
