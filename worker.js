@@ -4,8 +4,10 @@ const DEFAULT_CONFIG = {
     channelId: null,
     adminId: null,
     interval: 60,
-    count: 1,
+    count: "1", // Может быть числом строкой "1" или "random 1-5"
     generalPrompt: "",
+    systemContext: "", // Кастомный системный контекст
+    maxTokens: 800, // Увеличенный лимит токенов
     model: "AlbedoBase XL (SDXL)",
     loras: [],
     width: 1024,
@@ -31,7 +33,7 @@ const DEFAULT_CONFIG = {
 };
 
 const HORDE_API = "https://stablehorde.net/api/v2";
-const HORDE_HEADERS = { "Client-Agent": "TgImageBot:16.1:tg" };
+const HORDE_HEADERS = { "Client-Agent": "TgImageBot:16.2:tg" };
 const MIN_IMAGE_KB = 10;
 
 function escapeHtml(text) {
@@ -58,6 +60,21 @@ function base64ToBuffer(b64) {
         for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
         return arr.buffer;
     } catch { return null; }
+}
+
+function getActualCount(countConfig) {
+    const str = String(countConfig);
+    if (str.startsWith("random")) {
+        const match = str.match(/random\s+(\d+)\s*-\s*(\d+)/);
+        if (match) {
+            const min = parseInt(match[1]);
+            const max = parseInt(match[2]);
+            if (!isNaN(min) && !isNaN(max) && min <= max) {
+                return Math.floor(Math.random() * (max - min + 1)) + min;
+            }
+        }
+    }
+    return parseInt(str) || 1;
 }
 
 class Telegram {
@@ -291,21 +308,24 @@ async function generatePrompt(basePrompt, env, config) {
     let sysPrompt, userPrompt;
     const match = basePrompt.match(/\[([\s\S]*?)\]/);
 
+    const baseContext = config.systemContext || "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. IMPORTANT: Keep the prompt highly detailed but strictly UNDER 800 characters to prevent truncation by the Horde API. NEVER cut off mid-sentence.";
+
     if (match) {
         const instruction = match[1];
         const cleanPrompt = basePrompt.replace(match[0], "").trim();
-        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. IMPORTANT: Keep the prompt highly detailed but strictly UNDER 800 characters to prevent truncation by the Horde API. NEVER cut off mid-sentence. Include all elements requested.";
+        sysPrompt = `${baseContext} Include all elements requested.`;
         userPrompt = `Base prompt: ${cleanPrompt}\nInstruction: ${instruction}`;
     } else {
-        sysPrompt = "You are a Stable Diffusion prompt engineer. Output ONLY the final prompt as comma-separated tags. IMPORTANT: Keep the prompt highly detailed but strictly UNDER 800 characters to prevent truncation by the Horde API. NEVER cut off mid-sentence. Expand the theme deeply.";
+        sysPrompt = `${baseContext} Expand the theme deeply.`;
         userPrompt = `Create a highly detailed image generation prompt based on this theme: ${basePrompt}`;
     }
 
-    // Лимит токенов установлен на 250, чтобы ИИ физически не смог выдать слишком длинный текст и оборваться
+    const maxTokens = config.maxTokens || 800;
+
     const result = await callOpenRouter(env, llmModel, [
         { role: "system", content: sysPrompt },
         { role: "user", content: userPrompt }
-    ], 250);
+    ], maxTokens);
 
     if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
 
@@ -524,7 +544,7 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Оценки и Статистика:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; или &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n/setcontext &lt;системный промпт LLM&gt; | /settokens &lt;лимит&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Оценки и Статистика:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
 
         case "/setgroup":
@@ -553,6 +573,29 @@ async function handleCommand(msg, env) {
             config.generalPrompt = params.join(" "); await saveConfig(env, config);
             await tg.send(chatId, `✅ Промпт сохранен. Темы будут выбираться случайно, если разделены ";"\n<code>${escapeHtml(config.generalPrompt)}</code>`);
             break;
+
+        case "/setcontext":
+            if (!params.length) {
+                config.systemContext = "";
+                await saveConfig(env, config);
+                return await tg.send(chatId, "✅ Системный контекст сброшен на дефолтный.");
+            }
+            config.systemContext = params.join(" ");
+            await saveConfig(env, config);
+            await tg.send(chatId, "✅ Системный контекст LLM обновлен.");
+            break;
+
+        case "/settokens": {
+            const t = parseInt(params[0]);
+            if (t > 0 && t <= 8000) {
+                config.maxTokens = t;
+                await saveConfig(env, config);
+                await tg.send(chatId, `✅ Лимит токенов генерации промпта установлен: ${t}`);
+            } else {
+                await tg.send(chatId, "❌ /settokens <число от 1 до 8000>");
+            }
+            break;
+        }
 
         case "/setcaptionmode": {
             const mode = parseInt(params[0]);
@@ -774,9 +817,28 @@ async function handleCommand(msg, env) {
         }
 
         case "/setcount": {
+            const val = params.join(" ").toLowerCase();
+            if (val.startsWith("random")) {
+                const match = val.match(/random\s+(\d+)\s*-\s*(\d+)/);
+                if (match) {
+                    const min = parseInt(match[1]);
+                    const max = parseInt(match[2]);
+                    if (min > 0 && max <= 10 && min <= max) {
+                        config.count = `random ${min}-${max}`;
+                        await saveConfig(env, config);
+                        await tg.send(chatId, `✅ Количество в батче: случайное от ${min} до ${max}`);
+                        break;
+                    }
+                }
+            }
             const cnt = parseInt(params[0]);
-            if (cnt > 0 && cnt <= 10) { config.count = cnt; await saveConfig(env, config); await tg.send(chatId, `✅ Количество в батче: ${cnt}`); }
-            else await tg.send(chatId, "❌ /setcount &lt;1-10&gt;");
+            if (cnt > 0 && cnt <= 10) {
+                config.count = cnt.toString();
+                await saveConfig(env, config);
+                await tg.send(chatId, `✅ Количество в батче: ${cnt}`);
+            } else {
+                await tg.send(chatId, "❌ /setcount <1-10> или /setcount random <min>-<max> (например: random 1-5)");
+            }
             break;
         }
 
@@ -805,17 +867,20 @@ async function handleCommand(msg, env) {
 
         case "/generate":
             if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт (/setprompt)");
-            await tg.send(chatId, `⏳ Генерирую ${config.count} фото... (Обработка Batch)`);
+            
+            const actualCount = getActualCount(config.count);
+            await tg.send(chatId, `⏳ Генерирую ${actualCount} фото... (Обработка Batch)`);
+            
             {
                 const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
                 const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
                 const targets = [chatId];
                 
-                await KV.put(env, `batch:${batchId}`, { expected: config.count, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: 3600 });
+                await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: 3600 });
                 
                 const segment = getRandomPromptSegment(config.generalPrompt);
                 
-                for (let i = 0; i < config.count; i++) {
+                for (let i = 0; i < actualCount; i++) {
                     try {
                         const finalPrompt = await generatePrompt(segment, env, config);
                         const bestRes = await determineResolution(finalPrompt, env, config);
@@ -843,7 +908,7 @@ async function handleCommand(msg, env) {
             let queueCount = 0;
             try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n<b>Рейтинги:</b> ${config.ratingEnabled ? "🟢" : "🔴"} (${config.ratingType})\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n<b>Рейтинги:</b> ${config.ratingEnabled ? "🟢" : "🔴"} (${config.ratingType})\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Дефолт"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1113,9 +1178,11 @@ async function processScheduled(env) {
 
     const segment = getRandomPromptSegment(config.generalPrompt);
     const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
-    await KV.put(env, `batch:${batchId}`, { expected: config.count, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: 3600 });
+    const actualCount = getActualCount(config.count);
 
-    for (let i = 0; i < config.count; i++) {
+    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: 3600 });
+
+    for (let i = 0; i < actualCount; i++) {
         try {
             const prmpt = await generatePrompt(segment, env, config);
             const bestRes = await determineResolution(prmpt, env, config);
@@ -1147,7 +1214,6 @@ export default {
     async fetch(req, env, ctx) {
         const url = new URL(req.url);
 
-        // Сохраняем хост самого воркера, чтобы он мог отдавать вотермарку
         ctx.waitUntil(KV.put(env, "worker_origin", url.origin));
 
         if (url.pathname === "/watermark.png") {
