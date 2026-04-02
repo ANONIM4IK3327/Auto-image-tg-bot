@@ -371,6 +371,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.post_processing = config.postProcessors;
     }
 
+    // ВОТ ОНО - ИСПРАВЛЕНИЕ, КОТОРОЕ СТАВИТ is_version: true
     if (!extra.skipLoras && config.loras?.length > 0) {
         params.loras = config.loras.map(l => ({
             name: String(l.name),
