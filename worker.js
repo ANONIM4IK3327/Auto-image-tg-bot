@@ -375,7 +375,8 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.loras = config.loras.map(l => ({
             name: String(l.name),
             model: parseFloat(l.strength) || 1,
-            clip: parseFloat(l.clip) || 1
+            clip: parseFloat(l.clip) || 1,
+            is_version: /^\d+$/.test(String(l.name))
         }));
     }
 
@@ -698,14 +699,25 @@ async function handleCommand(msg, env) {
             let compatMsg = "";
             let loraTitle = loraId;
             try {
-                const civRes = await fetch(`https://civitai.com/api/v1/models/${loraId}`);
+                let civRes = await fetch(`https://civitai.com/api/v1/models/${loraId}`);
+                let base = "";
                 if (civRes.ok) {
                     const civData = await civRes.json();
-                    const base = civData.modelVersions?.[0]?.baseModel || "";
+                    base = civData.modelVersions?.[0]?.baseModel || "";
                     loraTitle = civData.name || loraId;
+                } else if (/^\d+$/.test(loraId)) {
+                    civRes = await fetch(`https://civitai.com/api/v1/model-versions/${loraId}`);
+                    if (civRes.ok) {
+                        const civData = await civRes.json();
+                        base = civData.baseModel || "";
+                        loraTitle = civData.model?.name ? `${civData.model.name} (${civData.name})` : (civData.name || loraId);
+                    }
+                }
+
+                if (base) {
                     const isXL = config.model?.toLowerCase().includes("xl");
                     const loraIsXL = base.toLowerCase().includes("xl");
-                    if (base) compatMsg = `\n📦 <b>${escapeHtml(loraTitle)}</b> [${base}]`;
+                    compatMsg = `\n📦 <b>${escapeHtml(loraTitle)}</b> [${base}]`;
                     if (isXL !== loraIsXL) compatMsg += `\n⚠️ <b>Внимание:</b> LoRA обучена на <b>${base}</b>. Скорее всего не применится!`;
                     else compatMsg += `\n✅ Совместима с текущей моделью`;
                 }
