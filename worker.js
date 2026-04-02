@@ -26,8 +26,6 @@ const DEFAULT_CONFIG = {
     captionMode: 1,
     captionPrompt: "Опиши эту картинку для поста в Telegram-канале на русском языке, креативно и с эмодзи. Без лишних вступлений.",
     useSpoiler: false,
-    ratingEnabled: false,
-    ratingType: "buttons",
     watermarkData: null,
     watermarkPosition: "random"
 };
@@ -371,7 +369,6 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.post_processing = config.postProcessors;
     }
 
-    // ВОТ ОНО - ИСПРАВЛЕНИЕ, КОТОРОЕ СТАВИТ is_version: true
     if (!extra.skipLoras && config.loras?.length > 0) {
         params.loras = config.loras.map(l => ({
             name: String(l.name),
@@ -436,9 +433,10 @@ async function downloadImage(url) {
 async function getWatermarkedUrl(imgUrl, config, env) {
     if (!config.watermarkData || !isHttpUrl(imgUrl)) return imgUrl;
 
-    const workerOrigin = await KV.get(env, "worker_origin");
-    if (!workerOrigin) return imgUrl;
+    const workerOriginRaw = await KV.get(env, "worker_origin");
+    if (!workerOriginRaw) return imgUrl;
 
+    const workerOrigin = workerOriginRaw.replace(/\/$/, "");
     const wmUrl = `${workerOrigin}/watermark.png`;
     let markpos = "southeast";
 
@@ -469,10 +467,6 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
 
     let buffer = null;
     const extra = { hasSpoiler: config.useSpoiler };
-
-    if (config.ratingEnabled && config.ratingType === "buttons") {
-        extra.replyMarkup = { inline_keyboard: [[{ text: "👍 0", callback_data: "rate_up" }, { text: "👎 0", callback_data: "rate_down" }]] };
-    }
 
     if (isUrl) {
         buffer = await downloadImage(targetUrl);
@@ -542,7 +536,7 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; или &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n/setcontext &lt;системный промпт LLM&gt; | /settokens &lt;лимит&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Оценки и Статистика:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; или &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n/setcontext &lt;системный промпт LLM&gt; | /settokens &lt;лимит&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
 
         case "/setgroup":
@@ -781,43 +775,6 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, `✅ Спойлер: ${config.useSpoiler ? "ВКЛ" : "ВЫКЛ"}`);
             break;
 
-        case "/setratings":
-            if (!params[0]) return await tg.send(chatId, "❌ /setratings <on|off>");
-            config.ratingEnabled = params[0].toLowerCase() === "on";
-            await saveConfig(env, config);
-            await tg.send(chatId, `✅ Рейтинги: ${config.ratingEnabled ? "ВКЛ" : "ВЫКЛ"}`);
-            break;
-
-        case "/setratingtype":
-            if (!params[0] || !["button", "emoji"].includes(params[0].toLowerCase())) return await tg.send(chatId, "❌ /setratingtype <button|emoji>");
-            config.ratingType = params[0].toLowerCase() === "button" ? "buttons" : "reactions";
-            await saveConfig(env, config);
-            await tg.send(chatId, `✅ Тип рейтинга: ${config.ratingType}`);
-            break;
-
-        case "/analytics": {
-            const histList = await KV.list(env, "hist:");
-            if (!histList.keys.length) return await tg.send(chatId, "📊 Нет данных для аналитики.");
-
-            const entries = [];
-            for (const k of histList.keys) {
-                const data = await KV.get(env, k.name, "json");
-                if (data) entries.push(data);
-            }
-            entries.sort((a, b) => b.time - a.time);
-            const recent = entries.slice(0, 15);
-
-            let text = "📊 <b>Последние генерации:</b>\n\n";
-            for (const e of recent) {
-                const scoreData = await KV.get(env, `score:${e.chatId}:${e.msgId}`, "json") || { up: 0, down: 0 };
-                const net = scoreData.up - scoreData.down;
-                const link = `t.me/c/${String(e.chatId).replace("-100", "")}/${e.msgId}`;
-                text += `🔗 <a href="${link}">Post</a> | ⭐️ Score: ${net > 0 ? "+"+net : net} (👍${scoreData.up}/👎${scoreData.down})\n`;
-            }
-            await tg.send(chatId, text, { disable_web_page_preview: true });
-            break;
-        }
-
         case "/setinterval": {
             const inv = parseInt(params[0]);
             if (inv > 0) { config.interval = inv; await saveConfig(env, config); await tg.send(chatId, `✅ Интервал: ${inv} мин`); }
@@ -887,10 +844,9 @@ async function handleCommand(msg, env) {
 
                 await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: 3600 });
 
-                const segment = getRandomPromptSegment(config.generalPrompt);
-
                 for (let i = 0; i < actualCount; i++) {
                     try {
+                        const segment = getRandomPromptSegment(config.generalPrompt);
                         const finalPrompt = await generatePrompt(segment, env, config);
                         const bestRes = await determineResolution(finalPrompt, env, config);
 
@@ -917,7 +873,7 @@ async function handleCommand(msg, env) {
             let queueCount = 0;
             try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n<b>Рейтинги:</b> ${config.ratingEnabled ? "🟢" : "🔴"} (${config.ratingType})\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Дефолт"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Дефолт"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -980,33 +936,6 @@ async function handleCommand(msg, env) {
     }
 }
 
-async function handleCallback(cb, env) {
-    if (!cb.data.startsWith("rate_")) return;
-    const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
-    const msgId = cb.message.message_id;
-    const chatId = cb.message.chat.id;
-    const userId = cb.from.id;
-    const rateKey = `usr_rate:${msgId}:${userId}`;
-
-    const hasRated = await KV.get(env, rateKey);
-    if (hasRated) {
-        await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Вы уже проголосовали!" });
-        return;
-    }
-
-    await KV.put(env, rateKey, "1", { expirationTtl: 14 * 24 * 3600 });
-    const isUp = cb.data === "rate_up";
-    const scoreKey = `score:${chatId}:${msgId}`;
-    let currentScore = await KV.get(env, scoreKey, "json") || { up: 0, down: 0 };
-
-    if (isUp) currentScore.up++; else currentScore.down++;
-    await KV.put(env, scoreKey, currentScore, { expirationTtl: 14 * 24 * 3600 });
-
-    const markup = { inline_keyboard: [[{ text: `👍 ${currentScore.up}`, callback_data: "rate_up" }, { text: `👎 ${currentScore.down}`, callback_data: "rate_down" }]] };
-    await tg.api("editMessageReplyMarkup", { chat_id: chatId, message_id: msgId, reply_markup: markup });
-    await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Голос учтён!" });
-}
-
 async function processScheduled(env) {
     if (!env.UPSTASH_REDIS_REST_URL || !env.TELEGRAM_BOT_TOKEN) return;
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
@@ -1018,17 +947,20 @@ async function processScheduled(env) {
         try {
             const task = await KV.get(env, keyObj.name, "json");
             if (!task) { await KV.del(env, keyObj.name); continue; }
+            
+            const taskAt = task.at || 0;
+            if (Date.now() - taskAt > 3600000) {
+                await KV.del(env, keyObj.name);
+                if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
+                if (task.batchId) {
+                    let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                }
+                continue;
+            }
 
             const check = await hordeCheck(id);
             if (!check.done) {
-                if (Date.now() - task.at > 3600000) {
-                    await KV.del(env, keyObj.name);
-                    if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
-                    if (task.batchId) {
-                        let batch = await KV.get(env, `batch:${task.batchId}`, "json");
-                        if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
-                    }
-                }
                 continue;
             }
 
@@ -1185,7 +1117,6 @@ async function processScheduled(env) {
     const targets = [config.groupId, config.channelId].filter(Boolean);
     let queuedCount = 0;
 
-    const segment = getRandomPromptSegment(config.generalPrompt);
     const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
     const actualCount = getActualCount(config.count);
 
@@ -1193,6 +1124,7 @@ async function processScheduled(env) {
 
     for (let i = 0; i < actualCount; i++) {
         try {
+            const segment = getRandomPromptSegment(config.generalPrompt);
             const prmpt = await generatePrompt(segment, env, config);
             const bestRes = await determineResolution(prmpt, env, config);
             const res = await hordeSubmit(prmpt, config, env, { workerBlacklist: bl, width: bestRes.width, height: bestRes.height });
@@ -1230,7 +1162,12 @@ export default {
             if (config.watermarkData) {
                 const buf = base64ToBuffer(config.watermarkData);
                 if (buf) {
-                    return new Response(buf, { headers: { "Content-Type": "image/png" } });
+                    return new Response(buf, { 
+                        headers: { 
+                            "Content-Type": "image/png",
+                            "Cache-Control": "public, max-age=31536000"
+                        } 
+                    });
                 }
             }
             return new Response("Not found", { status: 404 });
@@ -1242,8 +1179,6 @@ export default {
                 const body = await req.json();
                 if (body.message && (body.message.text?.startsWith("/") || body.message.caption?.startsWith("/"))) {
                     ctx.waitUntil(handleCommand(body.message, env));
-                } else if (body.callback_query) {
-                    ctx.waitUntil(handleCallback(body.callback_query, env));
                 }
 
                 ctx.waitUntil(processScheduled(env));
@@ -1257,7 +1192,7 @@ export default {
             const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url: webhookUrl, allowed_updates: ["message", "callback_query"], drop_pending_updates: true })
+                body: JSON.stringify({ url: webhookUrl, allowed_updates: ["message"], drop_pending_updates: true })
             });
             return new Response(`Webhook: ${webhookUrl}\n\n${JSON.stringify(await res.json(), null, 2)}`);
         }
