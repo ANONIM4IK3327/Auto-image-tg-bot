@@ -24,7 +24,7 @@ const DEFAULT_CONFIG = {
     karras: true,
     postProcessors: [],
     captionMode: 1,
-    captionPrompt: "РћРїРёС€Рё СЌС‚Сѓ РєР°СЂС‚РёРЅРєСѓ РґР»СЏ РїРѕСЃС‚Р° РІ Telegram-РєР°РЅР°Р»Рµ РЅР° СЂСѓСЃСЃРєРѕРј СЏР·С‹РєРµ, РєСЂРµР°С‚РёРІРЅРѕ Рё СЃ СЌРјРѕРґР·Рё. Р‘РµР· Р»РёС€РЅРёС… РІСЃС‚СѓРїР»РµРЅРёР№.",
+    captionPrompt: "Опиши эту картинку для поста в Telegram-канале на русском языке, креативно и с эмодзи. Без лишних вступлений.",
     useSpoiler: false,
     ratingEnabled: false,
     ratingType: "buttons",
@@ -331,20 +331,20 @@ async function generatePrompt(basePrompt, env, config) {
 
     if (match) {
         console.error("[LLM] OpenRouter API failed to process prompt instruction.");
-        throw new Error("РќРµ СѓРґР°Р»РѕСЃСЊ РѕР±СЂР°Р±РѕС‚Р°С‚СЊ РёРЅСЃС‚СЂСѓРєС†РёСЋ РґР»СЏ РїСЂРѕРјРїС‚Р° С‡РµСЂРµР· OpenRouter. РџРѕРІС‚РѕСЂРёС‚Рµ РїРѕР·Р¶Рµ.");
+        throw new Error("Не удалось обработать инструкцию для промпта через OpenRouter. Повторите позже.");
     }
     return basePrompt;
 }
 
 async function generateAiCaption(imagePrompt, env, config) {
-    if (!env.OPENROUTER_API_KEY) return `рџЋЁ <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
+    if (!env.OPENROUTER_API_KEY) return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
     const result = await callOpenRouter(env, config.llmModel || "openrouter/free", [
-        { role: "system", content: config.captionPrompt || "РћРїРёС€Рё РєР°СЂС‚РёРЅРєСѓ РґР»СЏ Telegram-РєР°РЅР°Р»Р°. РџРёС€Рё РёРЅС‚РµСЂРµСЃРЅРѕ, РёСЃРїРѕР»СЊР·СѓР№ СЌРјРѕРґР·Рё. Р‘РµР· РІСЃС‚СѓРїР»РµРЅРёР№." },
-        { role: "user", content: `РџСЂРѕРјРїС‚ РєР°СЂС‚РёРЅРєРё: ${imagePrompt.substring(0, 1000)}` }
+        { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
+        { role: "user", content: `Промпт картинки: ${imagePrompt.substring(0, 1000)}` }
     ], 8000);
 
     if (!result || result.trim().length === 0 || result.includes("HTTP ")) {
-        return `рџЋЁ <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
+        return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 300))}</i>`;
     }
     return result;
 }
@@ -454,7 +454,7 @@ async function getWatermarkedUrl(imgUrl, config, env) {
 
 async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env) {
     if (!imgData) {
-        if (notifyId) await tg.send(notifyId, "вќЊ РќРµС‚ РґР°РЅРЅС‹С… РєР°СЂС‚РёРЅРєРё РѕС‚ РІРѕСЂРєРµСЂР°");
+        if (notifyId) await tg.send(notifyId, "❌ Нет данных картинки от воркера");
         return { sent: false, tooSmall: false, sizeKB: 0 };
     }
 
@@ -469,7 +469,7 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
     const extra = { hasSpoiler: config.useSpoiler };
 
     if (config.ratingEnabled && config.ratingType === "buttons") {
-        extra.replyMarkup = { inline_keyboard: [[{ text: "рџ‘Ќ 0", callback_data: "rate_up" }, { text: "рџ‘Ћ 0", callback_data: "rate_down" }]] };
+        extra.replyMarkup = { inline_keyboard: [[{ text: "👍 0", callback_data: "rate_up" }, { text: "👎 0", callback_data: "rate_down" }]] };
     }
 
     if (isUrl) {
@@ -488,7 +488,7 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
 
     const sizeKB = Math.round(buffer.byteLength / 1024);
     if (sizeKB < MIN_IMAGE_KB) {
-        if (notifyId) await tg.send(notifyId, `рџљ« <b>РџРѕС…РѕР¶Рµ РЅР° Р·Р°РіР»СѓС€РєСѓ/С†РµРЅР·СѓСЂСѓ</b>\nР Р°Р·РјРµСЂ: ${sizeKB}KB`);
+        if (notifyId) await tg.send(notifyId, `🚫 <b>Похоже на заглушку/цензуру</b>\nРазмер: ${sizeKB}KB`);
         return { sent: false, tooSmall: true, sizeKB };
     }
 
@@ -503,7 +503,7 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
         if (r.ok) return { sent: true, tooSmall: false, sizeKB, msgId: r.result?.message_id };
     }
 
-    if (notifyId) await tg.send(notifyId, `вќЊ РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РїСЂР°РІРёС‚СЊ РёР·РѕР±СЂР°Р¶РµРЅРёРµ: ${escapeHtml(r?.description || "unknown error")}`);
+    if (notifyId) await tg.send(notifyId, `❌ Не удалось отправить изображение: ${escapeHtml(r?.description || "unknown error")}`);
     return { sent: false, tooSmall: false, sizeKB };
 }
 
@@ -523,62 +523,62 @@ async function handleCommand(msg, env) {
 
     if (cmd === "/ping") {
         const key = getApiKey(env);
-        return await tg.send(chatId, `рџЏ“ <b>Pong!</b>\nрџ“Ќ Chat: <code>${chatId}</code>\nрџ’ѕ Redis: ${env.UPSTASH_REDIS_REST_URL ? "вњ…" : "вќЊ"}\nрџЋЁ Horde: ${key === "0000000000" ? "рџ”ґ anon" : "вњ… ok"}\nрџ¤– OpenRouter: ${env.OPENROUTER_API_KEY ? "вњ…" : "вќЊ"}`);
+        return await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "❌"}`);
     }
 
     let config = await getConfig(env);
     if (!config.adminId) {
         config.adminId = userId;
         await saveConfig(env, config);
-        await tg.send(chatId, `рџ‘‘ РўС‹ С‚РµРїРµСЂСЊ Р°РґРјРёРЅ. РўРІРѕР№ ID: <code>${userId}</code>`);
+        await tg.send(chatId, `👑 Ты теперь админ. Твой ID: <code>${userId}</code>`);
     }
 
     if (config.adminId !== userId) {
-        return await tg.send(chatId, `рџ”’ Р”РѕСЃС‚СѓРї С‚РѕР»СЊРєРѕ РґР»СЏ Р°РґРјРёРЅР°.`);
+        return await tg.send(chatId, `🔒 Доступ только для админа.`);
     }
 
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `рџ¤– <b>Image Bot</b>\n\n<b>РџРѕСЃС‚РёРЅРі:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;РјРёРЅ&gt; | /setcount &lt;1-10&gt; РёР»Рё &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>РџСЂРѕРјРїС‚С‹:</b>\n/setprompt &lt;С‚РµРјР°1; С‚РµРјР°2&gt; | /setneg &lt;С‚РµРєСЃС‚&gt;\n/setcontext &lt;СЃРёСЃС‚РµРјРЅС‹Р№ РїСЂРѕРјРїС‚ LLM&gt; | /settokens &lt;Р»РёРјРёС‚&gt;\n\n<b>РџРѕРґРїРёСЃРё Рё РР:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;РёРЅСЃС‚СЂ&gt; | /setllm &lt;model&gt;\n\n<b>РџР°СЂР°РјРµС‚СЂС‹ Рё РњРѕРґРµР»Рё:</b>\n/setmodel &lt;РёРјСЏ&gt; | /listmodels | /searchmodel &lt;Р·Р°РїСЂРѕСЃ&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale Рё С‚.Рґ. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (РџСЂРёРєСЂРµРїРёС‚Рµ С„Р°Р№Р» PNG)\n\n<b>РћС†РµРЅРєРё Рё РЎС‚Р°С‚РёСЃС‚РёРєР°:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>РЎС‚Р°С‚СѓСЃ:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; или &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n/setcontext &lt;системный промпт LLM&gt; | /settokens &lt;лимит&gt;\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Оценки и Статистика:</b>\n/setratings &lt;on|off&gt; | /setratingtype &lt;button|emoji&gt; | /analytics\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
 
         case "/setgroup":
             config.groupId = chatId; await saveConfig(env, config);
-            await tg.send(chatId, `вњ… Р“СЂСѓРїРїР° СѓСЃС‚Р°РЅРѕРІР»РµРЅР°: <code>${chatId}</code>`);
+            await tg.send(chatId, `✅ Группа установлена: <code>${chatId}</code>`);
             break;
 
         case "/setchannel":
-            if (!params[0]) return await tg.send(chatId, "вќЊ /setchannel &lt;@username&gt; РёР»Рё ID");
+            if (!params[0]) return await tg.send(chatId, "❌ /setchannel &lt;@username&gt; или ID");
             config.channelId = params[0]; await saveConfig(env, config);
-            await tg.send(chatId, `вњ… РљР°РЅР°Р» СѓСЃС‚Р°РЅРѕРІР»РµРЅ: <code>${params[0]}</code>`);
+            await tg.send(chatId, `✅ Канал установлен: <code>${params[0]}</code>`);
             break;
 
         case "/ungroup":
             config.groupId = null; await saveConfig(env, config);
-            await tg.send(chatId, "вњ… Р“СЂСѓРїРїР° РѕС‚РІСЏР·Р°РЅa");
+            await tg.send(chatId, "✅ Группа отвязанa");
             break;
 
         case "/unchannel":
             config.channelId = null; await saveConfig(env, config);
-            await tg.send(chatId, "вњ… РљР°РЅР°Р» РѕС‚РІСЏР·Р°РЅ");
+            await tg.send(chatId, "✅ Канал отвязан");
             break;
 
         case "/setprompt":
-            if (!params.length) return await tg.send(chatId, "вќЊ /setprompt &lt;С‚РµРјР°1; С‚РµРјР°2&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема1; тема2&gt;");
             config.generalPrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `вњ… РџСЂРѕРјРїС‚ СЃРѕС…СЂР°РЅРµРЅ. РўРµРјС‹ Р±СѓРґСѓС‚ РІС‹Р±РёСЂР°С‚СЊСЃСЏ СЃР»СѓС‡Р°Р№РЅРѕ, РµСЃР»Рё СЂР°Р·РґРµР»РµРЅС‹ ";"\n<code>${escapeHtml(config.generalPrompt)}</code>`);
+            await tg.send(chatId, `✅ Промпт сохранен. Темы будут выбираться случайно, если разделены ";"\n<code>${escapeHtml(config.generalPrompt)}</code>`);
             break;
 
         case "/setcontext":
             if (!params.length) {
                 config.systemContext = "";
                 await saveConfig(env, config);
-                return await tg.send(chatId, "вњ… РЎРёСЃС‚РµРјРЅС‹Р№ РєРѕРЅС‚РµРєСЃС‚ СЃР±СЂРѕС€РµРЅ РЅР° РґРµС„РѕР»С‚РЅС‹Р№.");
+                return await tg.send(chatId, "✅ Системный контекст сброшен на дефолтный.");
             }
             config.systemContext = params.join(" ");
             await saveConfig(env, config);
-            await tg.send(chatId, "вњ… РЎРёСЃС‚РµРјРЅС‹Р№ РєРѕРЅС‚РµРєСЃС‚ LLM РѕР±РЅРѕРІР»РµРЅ.");
+            await tg.send(chatId, "✅ Системный контекст LLM обновлен.");
             break;
 
         case "/settokens": {
@@ -586,31 +586,31 @@ async function handleCommand(msg, env) {
             if (t > 0 && t <= 8000) {
                 config.maxTokens = t;
                 await saveConfig(env, config);
-                await tg.send(chatId, `вњ… Р›РёРјРёС‚ С‚РѕРєРµРЅРѕРІ РіРµРЅРµСЂР°С†РёРё РїСЂРѕРјРїС‚Р° СѓСЃС‚Р°РЅРѕРІР»РµРЅ: ${t}`);
+                await tg.send(chatId, `✅ Лимит токенов генерации промпта установлен: ${t}`);
             } else {
-                await tg.send(chatId, "вќЊ /settokens <С‡РёСЃР»Рѕ РѕС‚ 1 РґРѕ 8000>");
+                await tg.send(chatId, "❌ /settokens <число от 1 до 8000>");
             }
             break;
         }
 
         case "/setcaptionmode": {
             const mode = parseInt(params[0]);
-            if (![0, 1, 2].includes(mode)) return await tg.send(chatId, "вќЊ /setcaptionmode &lt;0|1|2&gt;");
+            if (![0, 1, 2].includes(mode)) return await tg.send(chatId, "❌ /setcaptionmode &lt;0|1|2&gt;");
             config.captionMode = mode; await saveConfig(env, config);
-            await tg.send(chatId, `вњ… Р РµР¶РёРј РїРѕРґРїРёСЃРё: ${mode}`);
+            await tg.send(chatId, `✅ Режим подписи: ${mode}`);
             break;
         }
 
         case "/setcaptionprompt":
-            if (!params.length) return await tg.send(chatId, "вќЊ /setcaptionprompt &lt;РёРЅСЃС‚СЂСѓРєС†РёСЏ&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setcaptionprompt &lt;инструкция&gt;");
             config.captionPrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, "вњ… РРЅСЃС‚СЂСѓРєС†РёСЏ РґР»СЏ РїРѕРґРїРёСЃРµР№ РѕР±РЅРѕРІР»РµРЅР°");
+            await tg.send(chatId, "✅ Инструкция для подписей обновлена");
             break;
 
         case "/setwatermark": {
             const doc = msg.document || msg.reply_to_message?.document;
-            if (!doc) return await tg.send(chatId, "вќЊ РџСЂРёРєСЂРµРїРёС‚Рµ РїСЂРѕР·СЂР°С‡РЅС‹Р№ PNG С„Р°Р№Р» РєР°Рє РґРѕРєСѓРјРµРЅС‚ Рє РєРѕРјР°РЅРґРµ /setwatermark РёР»Рё РѕС‚РІРµС‚СЊС‚Рµ РЅР° РґРѕРєСѓРјРµРЅС‚.");
-            if (doc.mime_type !== "image/png") return await tg.send(chatId, "вќЊ РўРѕР»СЊРєРѕ PNG С„Р°Р№Р»С‹ РїРѕРґРґРµСЂР¶РёРІР°СЋС‚СЃСЏ!");
+            if (!doc) return await tg.send(chatId, "❌ Прикрепите прозрачный PNG файл как документ к команде /setwatermark или ответьте на документ.");
+            if (doc.mime_type !== "image/png") return await tg.send(chatId, "❌ Только PNG файлы поддерживаются!");
 
             try {
                 const fileReq = await tg.api("getFile", { file_id: doc.file_id });
@@ -622,19 +622,19 @@ async function handleCommand(msg, env) {
                     config.watermarkData = bufferToBase64(arrayBuffer);
                     config.watermarkPosition = params[0] || "random";
                     await saveConfig(env, config);
-                    await tg.send(chatId, `вњ… Р’РѕРґСЏРЅРѕР№ Р·РЅР°Рє СЃРѕС…СЂР°РЅРµРЅ Рё Р±СѓРґРµС‚ СЃРєР»РµРёРІР°С‚СЊСЃСЏ СЃ РєР°СЂС‚РёРЅРєР°РјРё Р°РІС‚РѕРјР°С‚РёС‡РµСЃРєРё! РџРѕР·РёС†РёСЏ: ${config.watermarkPosition}`);
+                    await tg.send(chatId, `✅ Водяной знак сохранен и будет склеиваться с картинками автоматически! Позиция: ${config.watermarkPosition}`);
                 } else {
-                    await tg.send(chatId, `вќЊ РћС€РёР±РєР° API Telegram: ${fileReq.description}`);
+                    await tg.send(chatId, `❌ Ошибка API Telegram: ${fileReq.description}`);
                 }
-            } catch (e) { await tg.send(chatId, `вќЊ РћС€РёР±РєР°: ${e.message}`); }
+            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
         }
 
         case "/setenhancer": {
-            if (!params.length) return await tg.send(chatId, "вќЊ /setenhancer <FaceFix|Upscale|AnimeUpscale|CodeFormers|clear>");
+            if (!params.length) return await tg.send(chatId, "❌ /setenhancer <FaceFix|Upscale|AnimeUpscale|CodeFormers|clear>");
             if (params[0].toLowerCase() === "clear") {
                 config.postProcessors = [];
-                await tg.send(chatId, "вњ… РЈР»СѓС‡С€Р°Р№Р·РµСЂС‹ СЃР±СЂРѕС€РµРЅС‹");
+                await tg.send(chatId, "✅ Улучшайзеры сброшены");
             } else {
                 const map = {
                     facefix: "GFPGAN",
@@ -651,49 +651,49 @@ async function handleCommand(msg, env) {
                     else newPps.push(arg);
                 }
                 config.postProcessors = [...new Set(newPps)];
-                await tg.send(chatId, `вњ… РЈР»СѓС‡С€Р°Р№Р·РµСЂС‹: ${config.postProcessors.join(", ")}`);
+                await tg.send(chatId, `✅ Улучшайзеры: ${config.postProcessors.join(", ")}`);
             }
             await saveConfig(env, config);
             break;
         }
 
         case "/setmodel":
-            if (!params.length) return await tg.send(chatId, "вќЊ /setmodel &lt;РёРјСЏ&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;");
             config.model = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `вњ… РњРѕРґРµР»СЊ: <code>${escapeHtml(config.model)}</code>`);
+            await tg.send(chatId, `✅ Модель: <code>${escapeHtml(config.model)}</code>`);
             break;
 
         case "/listmodels":
-            await tg.send(chatId, "вЏі Р—Р°РіСЂСѓР¶Р°СЋ С‚РѕРї-40 РјРѕРґРµР»РµР№...");
+            await tg.send(chatId, "⏳ Загружаю топ-40 моделей...");
             try {
                 const models = (await hordeGetModels() || []).filter(m => m.count > 0).sort((a, b) => b.count - a.count).slice(0, 40);
-                let txt = "рџ“‹ <b>РњРѕРґРµР»Рё (С‚РѕРї-40):</b>\n\n";
-                models.forEach(m => txt += `${m.name?.includes("XL") ? "рџџў" : "вљЄ"} <code>${escapeHtml(m.name)}</code> (${m.count}w)\n`);
+                let txt = "📋 <b>Модели (топ-40):</b>\n\n";
+                models.forEach(m => txt += `${m.name?.includes("XL") ? "🟢" : "⚪"} <code>${escapeHtml(m.name)}</code> (${m.count}w)\n`);
                 await tg.send(chatId, txt);
-            } catch (e) { await tg.send(chatId, `вќЊ РћС€РёР±РєР°: ${e.message}`); }
+            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
 
         case "/searchmodel": {
             const qm = params.join(" ").toLowerCase();
-            if (!qm) return await tg.send(chatId, "вќЊ /searchmodel &lt;Р·Р°РїСЂРѕСЃ&gt;");
+            if (!qm) return await tg.send(chatId, "❌ /searchmodel &lt;запрос&gt;");
             try {
                 const models = (await hordeGetModels() || []).filter(m => m.name.toLowerCase().includes(qm)).sort((a, b) => b.count - a.count).slice(0, 20);
-                if (!models.length) return await tg.send(chatId, "рџ• РќРёС‡РµРіРѕ РЅРµ РЅР°Р№РґРµРЅРѕ");
-                let txt = `рџ”Ќ <b>РќР°Р№РґРµРЅРѕ (${models.length}):</b>\n\n`;
+                if (!models.length) return await tg.send(chatId, "😕 Ничего не найдено");
+                let txt = `🔍 <b>Найдено (${models.length}):</b>\n\n`;
                 models.forEach(m => txt += `<code>${escapeHtml(m.name)}</code> (${m.count}w)\n`);
                 await tg.send(chatId, txt);
-            } catch (e) { await tg.send(chatId, `вќЊ РћС€РёР±РєР°: ${e.message}`); }
+            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
         }
 
         case "/addlora": {
-            if (!params.length) return await tg.send(chatId, "вќЊ /addlora &lt;ID&gt; [strength=1] [clip=1]");
+            if (!params.length) return await tg.send(chatId, "❌ /addlora &lt;ID&gt; [strength=1] [clip=1]");
             const loraId = params[0];
             const loraStr = parseFloat(params[1]) || 1;
             const loraClip = parseFloat(params[2]) || 1;
             if (!config.loras) config.loras = [];
             if (config.loras.find(l => String(l.name) === String(loraId))) {
-                return await tg.send(chatId, `вљ пёЏ LoRA <code>${loraId}</code> СѓР¶Рµ РІ СЃРїРёСЃРєРµ`);
+                return await tg.send(chatId, `⚠️ LoRA <code>${loraId}</code> уже в списке`);
             }
             let compatMsg = "";
             let loraTitle = loraId;
@@ -705,20 +705,20 @@ async function handleCommand(msg, env) {
                     loraTitle = civData.name || loraId;
                     const isXL = config.model?.toLowerCase().includes("xl");
                     const loraIsXL = base.toLowerCase().includes("xl");
-                    if (base) compatMsg = `\nрџ“¦ <b>${escapeHtml(loraTitle)}</b> [${base}]`;
-                    if (isXL !== loraIsXL) compatMsg += `\nвљ пёЏ <b>Р’РЅРёРјР°РЅРёРµ:</b> LoRA РѕР±СѓС‡РµРЅР° РЅР° <b>${base}</b>. РЎРєРѕСЂРµРµ РІСЃРµРіРѕ РЅРµ РїСЂРёРјРµРЅРёС‚СЃСЏ!`;
-                    else compatMsg += `\nвњ… РЎРѕРІРјРµСЃС‚РёРјР° СЃ С‚РµРєСѓС‰РµР№ РјРѕРґРµР»СЊСЋ`;
+                    if (base) compatMsg = `\n📦 <b>${escapeHtml(loraTitle)}</b> [${base}]`;
+                    if (isXL !== loraIsXL) compatMsg += `\n⚠️ <b>Внимание:</b> LoRA обучена на <b>${base}</b>. Скорее всего не применится!`;
+                    else compatMsg += `\n✅ Совместима с текущей моделью`;
                 }
             } catch (_) {}
             config.loras.push({ name: loraId, title: loraTitle, strength: loraStr, clip: loraClip });
             await saveConfig(env, config);
-            await tg.send(chatId, `вњ… LoRA <code>${loraId}</code> РґРѕР±Р°РІР»РµРЅР° (str: ${loraStr}, clip: ${loraClip})${compatMsg}`);
+            await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена (str: ${loraStr}, clip: ${loraClip})${compatMsg}`);
             break;
         }
 
         case "/listloras":
-            if (!config.loras?.length) return await tg.send(chatId, "рџ“‹ РЎРїРёСЃРѕРє LoRA РїСѓСЃС‚.");
-            let lt = "рџ“‹ <b>РђРєС‚РёРІРЅС‹Рµ LoRA:</b>\n\n";
+            if (!config.loras?.length) return await tg.send(chatId, "📋 Список LoRA пуст.");
+            let lt = "📋 <b>Активные LoRA:</b>\n\n";
             config.loras.forEach((l, i) => {
                 const nameStr = l.title && l.title !== l.name ? `${escapeHtml(l.title)} (ID: ${l.name})` : l.name;
                 lt += `${i + 1}. <b>${nameStr}</b> (str: ${l.strength}, clip: ${l.clip})\n`;
@@ -728,63 +728,63 @@ async function handleCommand(msg, env) {
 
         case "/clearloras":
             config.loras = []; await saveConfig(env, config);
-            await tg.send(chatId, "вњ… РЎРїРёСЃРѕРє LoRA РѕС‡РёС‰РµРЅ");
+            await tg.send(chatId, "✅ Список LoRA очищен");
             break;
 
         case "/setsampler":
-            if (!params[0]) return await tg.send(chatId, "вќЊ /setsampler &lt;РёРјСЏ&gt;");
+            if (!params[0]) return await tg.send(chatId, "❌ /setsampler &lt;имя&gt;");
             config.sampler = params[0]; await saveConfig(env, config);
-            await tg.send(chatId, `вњ… Sampler: ${config.sampler}`);
+            await tg.send(chatId, `✅ Sampler: ${config.sampler}`);
             break;
 
         case "/setcfg":
-            if (!params[0]) return await tg.send(chatId, "вќЊ /setcfg &lt;С‡РёСЃР»Рѕ&gt;");
+            if (!params[0]) return await tg.send(chatId, "❌ /setcfg &lt;число&gt;");
             config.cfgScale = parseFloat(params[0]); await saveConfig(env, config);
-            await tg.send(chatId, `вњ… CFG: ${config.cfgScale}`);
+            await tg.send(chatId, `✅ CFG: ${config.cfgScale}`);
             break;
 
         case "/setsteps":
-            if (!params[0]) return await tg.send(chatId, "вќЊ /setsteps &lt;С‡РёСЃР»Рѕ&gt;");
+            if (!params[0]) return await tg.send(chatId, "❌ /setsteps &lt;число&gt;");
             config.steps = parseInt(params[0]); await saveConfig(env, config);
-            await tg.send(chatId, `вњ… Steps: ${config.steps}`);
+            await tg.send(chatId, `✅ Steps: ${config.steps}`);
             break;
 
         case "/setneg":
-            if (!params.length) return await tg.send(chatId, "вќЊ /setneg &lt;С‚РµРєСЃС‚&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setneg &lt;текст&gt;");
             config.negativePrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, "вњ… РќРµРіР°С‚РёРІРЅС‹Р№ РїСЂРѕРјРїС‚ СЃРѕС…СЂР°РЅС‘РЅ");
+            await tg.send(chatId, "✅ Негативный промпт сохранён");
             break;
 
         case "/setllm":
-            if (!params.length) return await tg.send(chatId, "вќЊ /setllm &lt;РјРѕРґРµР»СЊ&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setllm &lt;модель&gt;");
             config.llmModel = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `вњ… LLM: <code>${config.llmModel}</code>`);
+            await tg.send(chatId, `✅ LLM: <code>${config.llmModel}</code>`);
             break;
 
         case "/setspoiler":
-            if (!params[0]) return await tg.send(chatId, "вќЊ /setspoiler <on|off>");
+            if (!params[0]) return await tg.send(chatId, "❌ /setspoiler <on|off>");
             config.useSpoiler = params[0].toLowerCase() === "on";
             await saveConfig(env, config);
-            await tg.send(chatId, `вњ… РЎРїРѕР№Р»РµСЂ: ${config.useSpoiler ? "Р’РљР›" : "Р’Р«РљР›"}`);
+            await tg.send(chatId, `✅ Спойлер: ${config.useSpoiler ? "ВКЛ" : "ВЫКЛ"}`);
             break;
 
         case "/setratings":
-            if (!params[0]) return await tg.send(chatId, "вќЊ /setratings <on|off>");
+            if (!params[0]) return await tg.send(chatId, "❌ /setratings <on|off>");
             config.ratingEnabled = params[0].toLowerCase() === "on";
             await saveConfig(env, config);
-            await tg.send(chatId, `вњ… Р РµР№С‚РёРЅРіРё: ${config.ratingEnabled ? "Р’РљР›" : "Р’Р«РљР›"}`);
+            await tg.send(chatId, `✅ Рейтинги: ${config.ratingEnabled ? "ВКЛ" : "ВЫКЛ"}`);
             break;
 
         case "/setratingtype":
-            if (!params[0] || !["button", "emoji"].includes(params[0].toLowerCase())) return await tg.send(chatId, "вќЊ /setratingtype <button|emoji>");
+            if (!params[0] || !["button", "emoji"].includes(params[0].toLowerCase())) return await tg.send(chatId, "❌ /setratingtype <button|emoji>");
             config.ratingType = params[0].toLowerCase() === "button" ? "buttons" : "reactions";
             await saveConfig(env, config);
-            await tg.send(chatId, `вњ… РўРёРї СЂРµР№С‚РёРЅРіР°: ${config.ratingType}`);
+            await tg.send(chatId, `✅ Тип рейтинга: ${config.ratingType}`);
             break;
 
         case "/analytics": {
             const histList = await KV.list(env, "hist:");
-            if (!histList.keys.length) return await tg.send(chatId, "рџ“Љ РќРµС‚ РґР°РЅРЅС‹С… РґР»СЏ Р°РЅР°Р»РёС‚РёРєРё.");
+            if (!histList.keys.length) return await tg.send(chatId, "📊 Нет данных для аналитики.");
 
             const entries = [];
             for (const k of histList.keys) {
@@ -794,12 +794,12 @@ async function handleCommand(msg, env) {
             entries.sort((a, b) => b.time - a.time);
             const recent = entries.slice(0, 15);
 
-            let text = "рџ“Љ <b>РџРѕСЃР»РµРґРЅРёРµ РіРµРЅРµСЂР°С†РёРё:</b>\n\n";
+            let text = "📊 <b>Последние генерации:</b>\n\n";
             for (const e of recent) {
                 const scoreData = await KV.get(env, `score:${e.chatId}:${e.msgId}`, "json") || { up: 0, down: 0 };
                 const net = scoreData.up - scoreData.down;
                 const link = `t.me/c/${String(e.chatId).replace("-100", "")}/${e.msgId}`;
-                text += `рџ”— <a href="${link}">Post</a> | в­ђпёЏ Score: ${net > 0 ? "+"+net : net} (рџ‘Ќ${scoreData.up}/рџ‘Ћ${scoreData.down})\n`;
+                text += `🔗 <a href="${link}">Post</a> | ⭐️ Score: ${net > 0 ? "+"+net : net} (👍${scoreData.up}/👎${scoreData.down})\n`;
             }
             await tg.send(chatId, text, { disable_web_page_preview: true });
             break;
@@ -807,8 +807,8 @@ async function handleCommand(msg, env) {
 
         case "/setinterval": {
             const inv = parseInt(params[0]);
-            if (inv > 0) { config.interval = inv; await saveConfig(env, config); await tg.send(chatId, `вњ… РРЅС‚РµСЂРІР°Р»: ${inv} РјРёРЅ`); }
-            else await tg.send(chatId, "вќЊ /setinterval &lt;РјРёРЅСѓС‚С‹&gt;");
+            if (inv > 0) { config.interval = inv; await saveConfig(env, config); await tg.send(chatId, `✅ Интервал: ${inv} мин`); }
+            else await tg.send(chatId, "❌ /setinterval &lt;минуты&gt;");
             break;
         }
 
@@ -822,7 +822,7 @@ async function handleCommand(msg, env) {
                     if (min > 0 && max <= 10 && min <= max) {
                         config.count = `random ${min}-${max}`;
                         await saveConfig(env, config);
-                        await tg.send(chatId, `вњ… РљРѕР»РёС‡РµСЃС‚РІРѕ РІ Р±Р°С‚С‡Рµ: СЃР»СѓС‡Р°Р№РЅРѕРµ РѕС‚ ${min} РґРѕ ${max}`);
+                        await tg.send(chatId, `✅ Количество в батче: случайное от ${min} до ${max}`);
                         break;
                     }
                 }
@@ -831,9 +831,9 @@ async function handleCommand(msg, env) {
             if (cnt > 0 && cnt <= 10) {
                 config.count = cnt.toString();
                 await saveConfig(env, config);
-                await tg.send(chatId, `вњ… РљРѕР»РёС‡РµСЃС‚РІРѕ РІ Р±Р°С‚С‡Рµ: ${cnt}`);
+                await tg.send(chatId, `✅ Количество в батче: ${cnt}`);
             } else {
-                await tg.send(chatId, "вќЊ /setcount <1-10> РёР»Рё /setcount random <min>-<max> (РЅР°РїСЂРёРјРµСЂ: random 1-5)");
+                await tg.send(chatId, "❌ /setcount <1-10> или /setcount random <min>-<max> (например: random 1-5)");
             }
             break;
         }
@@ -844,28 +844,28 @@ async function handleCommand(msg, env) {
                 config.width = 64 * Math.round(w / 64);
                 config.height = 64 * Math.round(h / 64);
                 await saveConfig(env, config);
-                await tg.send(chatId, `вњ… Р‘Р°Р·РѕРІС‹Р№ СЂР°Р·РјРµСЂ: ${config.width}x${config.height} (AI РјРѕР¶РµС‚ РїРµСЂРµРѕРїСЂРµРґРµР»СЏС‚СЊ)`);
-            } else await tg.send(chatId, "вќЊ /setsize &lt;W&gt; &lt;H&gt;");
+                await tg.send(chatId, `✅ Базовый размер: ${config.width}x${config.height} (AI может переопределять)`);
+            } else await tg.send(chatId, "❌ /setsize &lt;W&gt; &lt;H&gt;");
             break;
         }
 
         case "/enable":
-            if (!config.groupId && !config.channelId) return await tg.send(chatId, "вќЊ РЎРЅР°С‡Р°Р»Р° РїСЂРёРІСЏР¶Рё РіСЂСѓРїРїСѓ (/setgroup) РёР»Рё РєР°РЅР°Р» (/setchannel)");
-            if (!config.generalPrompt) return await tg.send(chatId, "вќЊ РЎРЅР°С‡Р°Р»Р° Р·Р°РґР°Р№ РїСЂРѕРјРїС‚ (/setprompt)");
+            if (!config.groupId && !config.channelId) return await tg.send(chatId, "❌ Сначала привяжи группу (/setgroup) или канал (/setchannel)");
+            if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт (/setprompt)");
             config.enabled = true; await saveConfig(env, config);
-            await tg.send(chatId, "рџџў РђРІС‚РѕРїРѕСЃС‚РёРЅРі РІРєР»СЋС‡С‘РЅ!");
+            await tg.send(chatId, "🟢 Автопостинг включён!");
             break;
 
         case "/disable":
             config.enabled = false; await saveConfig(env, config);
-            await tg.send(chatId, "рџ”ґ РђРІС‚РѕРїРѕСЃС‚РёРЅРі РІС‹РєР»СЋС‡РµРЅ");
+            await tg.send(chatId, "🔴 Автопостинг выключен");
             break;
 
         case "/generate":
-            if (!config.generalPrompt) return await tg.send(chatId, "вќЊ РЎРЅР°С‡Р°Р»Р° Р·Р°РґР°Р№ РїСЂРѕРјРїС‚ (/setprompt)");
+            if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт (/setprompt)");
 
             const actualCount = getActualCount(config.count);
-            await tg.send(chatId, `вЏі Р“РµРЅРµСЂРёСЂСѓСЋ ${actualCount} С„РѕС‚Рѕ... (РћР±СЂР°Р±РѕС‚РєР° Batch)`);
+            await tg.send(chatId, `⏳ Генерирую ${actualCount} фото... (Обработка Batch)`);
 
             {
                 const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
@@ -881,18 +881,18 @@ async function handleCommand(msg, env) {
                         const finalPrompt = await generatePrompt(segment, env, config);
                         const bestRes = await determineResolution(finalPrompt, env, config);
 
-                        await tg.send(chatId, `рџЋЁ #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 300))}</code>\nрџ“Џ Р РµР·РѕР»СЋС†РёСЏ: ${bestRes.width}x${bestRes.height}`);
+                        await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 300))}</code>\n📏 Резолюция: ${bestRes.width}x${bestRes.height}`);
 
                         const res = await hordeSubmit(finalPrompt, config, env, { workerBlacklist: bl, width: bestRes.width, height: bestRes.height });
                         if (res.id) {
                             await KV.put(env, `pending:${res.id}`, { targets, prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0, batchId }, { expirationTtl: 3600 });
                         } else {
-                            await tg.send(chatId, `вќЊ Horde: ${escapeHtml(JSON.stringify(res))}`);
+                            await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
                             let batch = await KV.get(env, `batch:${batchId}`, "json");
                             if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
                         }
                     } catch (e) {
-                        await tg.send(chatId, `вќЊ РћС€РёР±РєР°: ${e.message}`);
+                        await tg.send(chatId, `❌ Ошибка: ${e.message}`);
                         let batch = await KV.get(env, `batch:${batchId}`, "json");
                         if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
                     }
@@ -903,8 +903,8 @@ async function handleCommand(msg, env) {
         case "/status": {
             let queueCount = 0;
             try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
-            const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "РЅРµС‚";
-            await tg.send(chatId, `рџ“Љ <b>РЎС‚Р°С‚СѓСЃ</b>\n\n<b>РђРІС‚РѕРїРѕСЃС‚:</b> ${config.enabled ? "рџџў" : "рџ”ґ"}\n<b>Р“СЂСѓРїРїР°:</b> ${config.groupId || "вќЊ"}\n<b>РљР°РЅР°Р»:</b> ${config.channelId || "вќЊ"}\n<b>Р‘Р°С‚С‡:</b> ${config.count} С€С‚\n<b>Р’РѕС‚РµСЂРјР°СЂРєР°:</b> ${config.watermarkData ? "рџџў" : "рџ”ґ"}\n<b>РЈР»СѓС‡С€Р°Р№Р·РµСЂС‹:</b> ${pps}\n<b>Р РµР¶РёРј РїРѕРґРїРёСЃРё:</b> ${config.captionMode}\n<b>РЎРїРѕР№Р»РµСЂ:</b> ${config.useSpoiler ? "рџџў" : "рџ”ґ"}\n<b>Р РµР№С‚РёРЅРіРё:</b> ${config.ratingEnabled ? "рџџў" : "рџ”ґ"} (${config.ratingType})\n\n<b>РџСЂРѕРјРїС‚:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>РљРѕРЅС‚РµРєСЃС‚ LLM:</b> ${config.systemContext ? "Р—Р°РґР°РЅ" : "Р”РµС„РѕР»С‚"}\n<b>РўРѕРєРµРЅС‹:</b> ${config.maxTokens}\n\n<b>РќРµРіР°С‚РёРІРЅС‹Р№ РїСЂРѕРјРїС‚:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>РњРѕРґРµР»СЊ:</b> <code>${escapeHtml(config.model)}</code>\n<b>РЎР°РјРїР»РµСЂ:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Р‘Р°Р·.Р Р°Р·РјРµСЂ:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} С€С‚\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>РћС‡РµСЂРµРґСЊ:</b> ${queueCount}`);
+            const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n<b>Рейтинги:</b> ${config.ratingEnabled ? "🟢" : "🔴"} (${config.ratingType})\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Дефолт"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA:</b> ${config.loras?.length || 0} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -912,38 +912,38 @@ async function handleCommand(msg, env) {
             try {
                 const pendList = await KV.list(env, "pending:");
                 if (!pendList.keys.length) {
-                    return await tg.send(chatId, `вЏі Р’ РѕС‡РµСЂРµРґРё: 0 РіРµРЅРµСЂР°С†РёР№`);
+                    return await tg.send(chatId, `⏳ В очереди: 0 генераций`);
                 }
 
-                await tg.send(chatId, `вЏі <b>Р’ РѕС‡РµСЂРµРґРё: ${pendList.keys.length} РіРµРЅРµСЂР°С†РёР№</b>\nРџСЂРѕРІРµСЂСЏСЋ СЃС‚Р°С‚СѓСЃ СЃРµСЂРІРµСЂРѕРІ...`);
+                await tg.send(chatId, `⏳ <b>В очереди: ${pendList.keys.length} генераций</b>\nПроверяю статус серверов...`);
 
                 let count = 0;
                 let statusTxt = "";
                 for (const k of pendList.keys) {
                     if (count >= 5) {
-                        statusTxt += `\n<i>...Рё РµС‰Рµ ${pendList.keys.length - 5}</i>`;
+                        statusTxt += `\n<i>...и еще ${pendList.keys.length - 5}</i>`;
                         break;
                     }
                     const id = k.name.replace("pending:", "");
                     const checkData = await hordeCheck(id);
 
-                    let status = "РћР¶РёРґР°РЅРёРµ";
+                    let status = "Ожидание";
                     let waitTime = checkData.wait_time ? Math.round(checkData.wait_time) : "?";
                     let qPos = checkData.queue_position !== undefined ? checkData.queue_position : "?";
 
                     if (checkData.done) {
-                        status = "вњ… Р“РѕС‚РѕРІРѕ (Р—Р°Р±РёСЂР°СЋ)";
+                        status = "✅ Готово (Забираю)";
                         waitTime = 0;
                         qPos = 0;
                     } else if (checkData.faulted || checkData.message) {
-                        status = "вќЊ РћС€РёР±РєР°/РЈРґР°Р»РµРЅРѕ";
+                        status = "❌ Ошибка/Удалено";
                     }
 
-                    statusTxt += `рџ”№ ID: <code>${id.substring(0,8)}...</code> | ${status}: ~${waitTime} СЃРµРє | РџРµСЂРµРґ РІР°РјРё: ${qPos}\n`;
+                    statusTxt += `🔹 ID: <code>${id.substring(0,8)}...</code> | ${status}: ~${waitTime} сек | Перед вами: ${qPos}\n`;
                     count++;
                 }
-                await tg.send(chatId, `рџ“Љ <b>РЎС‚Р°С‚СѓСЃ РѕС‡РµСЂРµРґРё:</b>\n\n${statusTxt}`);
-            } catch (e) { await tg.send(chatId, `вќЊ РћС€РёР±РєР°: ${e.message}`); }
+                await tg.send(chatId, `📊 <b>Статус очереди:</b>\n\n${statusTxt}`);
+            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
 
         case "/cancel":
@@ -953,17 +953,17 @@ async function handleCommand(msg, env) {
                 for (const k of plist.keys) { await KV.del(env, k.name); canceled++; }
                 const blist = await KV.list(env, "batch:");
                 for (const b of blist.keys) { await KV.del(env, b.name); }
-                await tg.send(chatId, `вњ… РћС‡РµСЂРµРґСЊ РѕС‡РёС‰РµРЅР°. РЈРґР°Р»РµРЅРѕ Р·Р°РґР°С‡: ${canceled}`);
-            } catch (e) { await tg.send(chatId, `вќЊ РћС€РёР±РєР°: ${e.message}`); }
+                await tg.send(chatId, `✅ Очередь очищена. Удалено задач: ${canceled}`);
+            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
 
         case "/workerbl":
             await clearWorkerBlacklist(env);
-            await tg.send(chatId, "вњ… Р‘Р»СЌРєР»РёСЃС‚ РІРѕСЂРєРµСЂРѕРІ РѕС‡РёС‰РµРЅ");
+            await tg.send(chatId, "✅ Блэклист воркеров очищен");
             break;
 
         default:
-            if (cmd.startsWith("/")) await tg.send(chatId, "вќ“ РќРµРёР·РІРµСЃС‚РЅР°СЏ РєРѕРјР°РЅРґР°. Р’РІРµРґРё /help");
+            if (cmd.startsWith("/")) await tg.send(chatId, "❓ Неизвестная команда. Введи /help");
     }
 }
 
@@ -977,7 +977,7 @@ async function handleCallback(cb, env) {
 
     const hasRated = await KV.get(env, rateKey);
     if (hasRated) {
-        await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Р’С‹ СѓР¶Рµ РїСЂРѕРіРѕР»РѕСЃРѕРІР°Р»Рё!" });
+        await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Вы уже проголосовали!" });
         return;
     }
 
@@ -989,9 +989,9 @@ async function handleCallback(cb, env) {
     if (isUp) currentScore.up++; else currentScore.down++;
     await KV.put(env, scoreKey, currentScore, { expirationTtl: 14 * 24 * 3600 });
 
-    const markup = { inline_keyboard: [[{ text: `рџ‘Ќ ${currentScore.up}`, callback_data: "rate_up" }, { text: `рџ‘Ћ ${currentScore.down}`, callback_data: "rate_down" }]] };
+    const markup = { inline_keyboard: [[{ text: `👍 ${currentScore.up}`, callback_data: "rate_up" }, { text: `👎 ${currentScore.down}`, callback_data: "rate_down" }]] };
     await tg.api("editMessageReplyMarkup", { chat_id: chatId, message_id: msgId, reply_markup: markup });
-    await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Р“РѕР»РѕСЃ СѓС‡С‚С‘РЅ!" });
+    await tg.api("answerCallbackQuery", { callback_query_id: cb.id, text: "Голос учтён!" });
 }
 
 async function processScheduled(env) {
@@ -1010,7 +1010,7 @@ async function processScheduled(env) {
             if (!check.done) {
                 if (Date.now() - task.at > 3600000) {
                     await KV.del(env, keyObj.name);
-                    if (task.notify) await tg.send(task.notify, `вЏ° РўР°Р№РјР°СѓС‚: <code>${id}</code>`);
+                    if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
                     if (task.batchId) {
                         let batch = await KV.get(env, `batch:${task.batchId}`, "json");
                         if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
@@ -1023,7 +1023,7 @@ async function processScheduled(env) {
 
             if (res.faulted || res.message) {
                 await KV.del(env, keyObj.name);
-                if (task.notify) await tg.send(task.notify, `вќЊ РћС€РёР±РєР° РіРµРЅРµСЂР°С†РёРё: <code>${id}</code>`);
+                if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации: <code>${id}</code>`);
                 if (task.batchId) {
                     let batch = await KV.get(env, `batch:${task.batchId}`, "json");
                     if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
@@ -1034,7 +1034,7 @@ async function processScheduled(env) {
             const gens = res.generations || [];
             if (!gens.length) {
                 await KV.del(env, keyObj.name);
-                if (task.notify) await tg.send(task.notify, `вљ пёЏ РР·РѕР±СЂР°Р¶РµРЅРёРµ <code>${id}</code> РїСѓСЃС‚РѕРµ.`);
+                if (task.notify) await tg.send(task.notify, `⚠️ Изображение <code>${id}</code> пустое.`);
                 if (task.batchId) {
                     let batch = await KV.get(env, `batch:${task.batchId}`, "json");
                     if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
@@ -1056,17 +1056,17 @@ async function processScheduled(env) {
 
             if (censored) {
                 await addWorkerToBlacklist(env, workerId, workerName);
-                if (task.notify) await tg.send(task.notify, `рџ”ґ Р’РѕСЂРєРµСЂ <code>${workerName}</code> РІС‹РґР°Р» С†РµРЅР·СѓСЂСѓ. Р”РѕР±Р°РІР»РµРЅ РІ Р§РЎ.`);
+                if (task.notify) await tg.send(task.notify, `🔴 Воркер <code>${workerName}</code> выдал цензуру. Добавлен в ЧС.`);
                 const retries = (task.retries || 0) + 1;
                 if (retries < 3) {
                     const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
                     const newRes = await hordeSubmit(task.prompt, config, env, { workerBlacklist: bl });
                     if (newRes.id) {
                         await KV.put(env, `pending:${newRes.id}`, { ...task, at: Date.now(), retries }, { expirationTtl: 3600 });
-                        if (task.notify) await tg.send(task.notify, `рџ”„ Р РµС‚СЂР°Р№ ${retries}/3...`);
+                        if (task.notify) await tg.send(task.notify, `🔄 Ретрай ${retries}/3...`);
                     }
                 } else {
-                    if (task.notify) await tg.send(task.notify, "вќЊ 3 РїРѕРїС‹С‚РєРё РЅРµСѓРґР°С‡РЅС‹.");
+                    if (task.notify) await tg.send(task.notify, "❌ 3 попытки неудачны.");
                     if (task.batchId) {
                         let batch = await KV.get(env, `batch:${task.batchId}`, "json");
                         if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
@@ -1085,7 +1085,7 @@ async function processScheduled(env) {
 
                         if (batch.ready.length >= batch.expected) {
                             let captionText = "";
-                            if (config.captionMode === 1) captionText = `рџЋЁ <i>${escapeHtml(batch.prompt.substring(0, 300))}</i>`;
+                            if (config.captionMode === 1) captionText = `🎨 <i>${escapeHtml(batch.prompt.substring(0, 300))}</i>`;
                             else if (config.captionMode === 2) captionText = await generateAiCaption(batch.prompt, env, config);
 
                             for (const tId of batch.targets) {
@@ -1120,7 +1120,7 @@ async function processScheduled(env) {
                     }
                 } else {
                     let captionText = "";
-                    if (config.captionMode === 1) captionText = task.prompt ? `рџЋЁ <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
+                    if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 300))}</i>` : "";
                     else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
 
                     for (const tId of (task.targets || [])) {
@@ -1131,7 +1131,7 @@ async function processScheduled(env) {
             await KV.del(env, keyObj.name);
 
         } catch (e) {
-            console.error(`[CRON] РћС€РёР±РєР° РѕР±СЂР°Р±РѕС‚РєРё ${id}:`, e.message);
+            console.error(`[CRON] Ошибка обработки ${id}:`, e.message);
         }
     }
 
@@ -1139,7 +1139,7 @@ async function processScheduled(env) {
     for (const bKey of activeBatches.keys) {
         let batch = await KV.get(env, bKey.name, "json");
         if (batch && batch.expected <= 0 && batch.ready.length > 0) {
-            let captionText = config.captionMode === 1 ? `рџЋЁ <i>${escapeHtml(batch.prompt.substring(0, 300))}</i>` : "";
+            let captionText = config.captionMode === 1 ? `🎨 <i>${escapeHtml(batch.prompt.substring(0, 300))}</i>` : "";
             for (const tId of batch.targets) {
                 if (batch.ready.length === 1) {
                     await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config, env);
@@ -1188,12 +1188,12 @@ async function processScheduled(env) {
                 await KV.put(env, `pending:${res.id}`, { targets, prompt: prmpt, at: now, notify: config.adminId, retries: 0, batchId }, { expirationTtl: 3600 });
                 queuedCount++;
             } else {
-                if (config.adminId) await tg.send(config.adminId, `вќЊ <b>РћС€РёР±РєР° Р°РІС‚РѕРіРµРЅРµСЂР°С†РёРё (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
+                if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
                 let batch = await KV.get(env, `batch:${batchId}`, "json");
                 if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
             }
         } catch (e) {
-            if (config.adminId) await tg.send(config.adminId, `вќЊ <b>РћС€РёР±РєР° Р°РІС‚РѕРіРµРЅРµСЂР°С†РёРё:</b>\n${escapeHtml(e.message)}`);
+            if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
             let batch = await KV.get(env, `batch:${batchId}`, "json");
             if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
         }
@@ -1249,7 +1249,7 @@ export default {
             return new Response(`Webhook: ${webhookUrl}\n\n${JSON.stringify(await res.json(), null, 2)}`);
         }
 
-        return new Response("рџ¤– Р‘РѕС‚ Р·Р°РїСѓС‰РµРЅ! РџРµСЂРµР№РґРё РЅР° /setup РґР»СЏ РЅР°СЃС‚СЂРѕР№РєРё РІРµР±С…СѓРєР°.");
+        return new Response("🤖 Бот запущен! Перейди на /setup для настройки вебхука.");
     },
 
     async scheduled(event, env, ctx) {
