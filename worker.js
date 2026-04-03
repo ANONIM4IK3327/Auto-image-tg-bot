@@ -3,6 +3,7 @@ const DEFAULT_CONFIG = {
     groupId: null,
     channelId: null,
     adminId: null,
+    roles: {}, // Format: { "userid": "creator|tech|admin" }
     interval: 60,
     count: "1",
     generalPrompt: "",
@@ -52,7 +53,7 @@ HYBRID STYLE: Blend short tags with natural-language phrases for complex actions
 NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive prompt.`;
 
 const HORDE_API = "https://stablehorde.net/api/v2";
-const HORDE_HEADERS = { "Client-Agent": "TgImageBot:17.0:tg" };
+const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.0:tg" };
 const MIN_IMAGE_KB = 10;
 
 function escapeHtml(text) {
@@ -96,10 +97,6 @@ function getActualCount(countConfig) {
     return parseInt(str) || 1;
 }
 
-/**
- * Parse {lora_id:strength:clip, -excluded_id, -llm} from a prompt.
- * Added: {-llm} or {nollm} will completely disable OpenRouter for this prompt.
- */
 function parsePromptLoras(prompt) {
     const match = prompt.match(/\{([^}]*)\}/);
     if (!match) return { cleanPrompt: prompt, extraLoras: [], excludedLoras: [], disableLlm: false };
@@ -134,6 +131,33 @@ function buildLorasForRequest(config, extraLoras = [], excludedLoras = []) {
     const globalLoras = (config.loras || []).filter(l => l.global !== false);
     const filteredGlobal = globalLoras.filter(l => !excludedLoras.includes(String(l.name)));
     return [...filteredGlobal, ...extraLoras];
+}
+
+// Roles & Access Helper Functions
+function getUserRole(userId, config) {
+    if (String(config.adminId) === String(userId)) return "admin";
+    if (config.roles && config.roles[String(userId)]) return config.roles[String(userId)];
+    return null;
+}
+
+function checkAccess(role, cmd) {
+    if (role === "admin") return true;
+    
+    const creatorCmds = [
+        "/addprompt", "/delprompt", "/promptlist", "/setprompt", 
+        "/setcontext", "/addlora", "/listloras", "/clearloras", 
+        "/setneg", "/generate", "/help", "/start", "/ping"
+    ];
+    
+    const techCmds = [
+        "/status", "/pending", "/cancel", "/workerbl", "/ping", 
+        "/listmodels", "/searchmodel", "/setenhancer", "/setsize", 
+        "/setsteps", "/setcfg", "/setsampler", "/help", "/start"
+    ];
+    
+    if (role === "creator") return creatorCmds.includes(cmd);
+    if (role === "tech") return techCmds.includes(cmd);
+    return false;
 }
 
 class Telegram {
@@ -512,7 +536,6 @@ async function getWatermarkedUrl(imgUrl, config, env) {
     if (!workerOriginRaw) return imgUrl;
 
     const workerOrigin = workerOriginRaw.replace(/\/$/, "");
-    // Добавлен cache-buster чтобы wsrv не кэшировал старые/битые попытки
     const wmUrl = `${workerOrigin}/watermark.png?v=${Date.now()}`;
     let markpos = "southeast";
 
@@ -543,9 +566,8 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
         targetUrl = await getWatermarkedUrl(imgData, config, env);
         buffer = await downloadImage(targetUrl);
         
-        // Обработка сбоя наложения вотермарки
         if (!buffer && targetUrl !== imgData) {
-            if (notifyId) await tg.send(notifyId, `⚠️ <b>Сбой наложения вотермарки</b> (wsrv.nl не ответил или ваш Cloudflare блокирует запросы Bot Fight Mode). Отправлен оригинал.`);
+            if (notifyId) await tg.send(notifyId, `⚠️ <b>Сбой наложения вотермарки</b> (wsrv.nl не ответил). Отправлен оригинал.`);
             buffer = await downloadImage(imgData);
         }
 
@@ -554,7 +576,6 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
             return { sent: r.ok, tooSmall: false, sizeKB: 0, msgId: r.result?.message_id };
         }
     } else {
-        // Если картинка пришла в формате Base64, её физически нельзя прогнать через wsrv.nl по URL
         if (config.watermarkData && notifyId) {
             await tg.send(notifyId, `ℹ️ <b>Вотермарка пропущена:</b> Воркер Horde вернул изображение в формате Base64, а не URL.`);
         }
@@ -597,27 +618,49 @@ async function handleCommand(msg, env) {
     const cmd = args[0].split("@")[0].toLowerCase();
     const params = args.slice(1);
 
-    if (cmd === "/ping") {
-        const key = getApiKey(env);
-        return await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "❌"}`);
-    }
-
     let config = await getConfig(env);
+    
+    // Auto-assign first user as admin
     if (!config.adminId) {
         config.adminId = userId;
         await saveConfig(env, config);
-        await tg.send(chatId, `👑 Ты теперь админ. Твой ID: <code>${userId}</code>`);
+        await tg.send(chatId, `👑 Ты теперь главный админ. Твой ID: <code>${userId}</code>`);
     }
 
-    if (config.adminId !== userId) {
-        return await tg.send(chatId, `🔒 Доступ только для админа.`);
+    const userRole = getUserRole(userId, config);
+    
+    if (!userRole || !checkAccess(userRole, cmd)) {
+        return await tg.send(chatId, `🔒 У тебя (роль: <b>${userRole || "нет прав"}</b>) нет доступа к команде ${cmd}.`);
     }
 
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; или &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n/setcontext &lt;системный промпт LLM&gt; | /settokens &lt;лимит&gt;\n\n<b>LoRA и Отключение ИИ (синтаксис {}):</b>\n<code>{id:сила}</code> — добавить лору только для этого промпта\n<code>{id:сила:clip}</code> — с клип-силой\n<code>{-id}</code> — исключить глобальную лору для этого промпта\n<code>{-llm}</code> — отключить генерацию OpenRouter для этого промпта\nПример: <code>girl {-llm, 2815817:1.2, -9999}</code>\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\nВаша роль: <b>${userRole}</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n\n<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ (OpenRouter) для промпта\n\n<b>Роли:</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin|none&gt;\n\n<b>Остальное:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
+
+        case "/setrole": {
+            if (userRole !== "admin") return await tg.send(chatId, "🔒 Только Admin может управлять ролями.");
+            const targetId = params[0];
+            const role = params[1]?.toLowerCase();
+            if (!targetId || !["creator", "tech", "admin", "none"].includes(role)) {
+                return await tg.send(chatId, "❌ Использование: /setrole &lt;ID&gt; &lt;creator|tech|admin|none&gt;\n\n<b>creator</b> — промпты, лоры, контекст\n<b>tech</b> — статус, очереди, настройки генерации\n<b>admin</b> — всё");
+            }
+            if (!config.roles) config.roles = {};
+            if (role === "none") {
+                delete config.roles[targetId];
+                await tg.send(chatId, `✅ Права пользователя <code>${targetId}</code> удалены.`);
+            } else {
+                config.roles[targetId] = role;
+                await tg.send(chatId, `✅ Пользователю <code>${targetId}</code> назначена роль: <b>${role}</b>`);
+            }
+            await saveConfig(env, config);
+            break;
+        }
+
+        case "/ping":
+            const key = getApiKey(env);
+            return await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "❌"}`);
 
         case "/setgroup":
             config.groupId = chatId; await saveConfig(env, config);
@@ -640,10 +683,57 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, "✅ Канал отвязан");
             break;
 
+        case "/addprompt": {
+            if (!params.length) return await tg.send(chatId, "❌ /addprompt &lt;текст&gt;");
+            let prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p=>p.trim()).filter(Boolean) : [];
+            prompts.push(params.join(" "));
+            config.generalPrompt = prompts.join(" ; ");
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ Промпт добавлен под номером <b>${prompts.length}</b>`);
+            break;
+        }
+
+        case "/delprompt": {
+            if (!params.length) return await tg.send(chatId, "❌ /delprompt &lt;номер&gt;");
+            let prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p=>p.trim()).filter(Boolean) : [];
+            const idx = parseInt(params[0]) - 1;
+            if (isNaN(idx) || idx < 0 || idx >= prompts.length) return await tg.send(chatId, `❌ Неверный номер (от 1 до ${prompts.length})`);
+            prompts.splice(idx, 1);
+            config.generalPrompt = prompts.join(" ; ");
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ Промпт #${idx + 1} удален`);
+            break;
+        }
+
+        case "/promptlist": {
+            let prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p=>p.trim()).filter(Boolean) : [];
+            if (prompts.length === 0) return await tg.send(chatId, "📋 Список промптов пуст");
+
+            if (params.length && !isNaN(parseInt(params[0]))) {
+                const idx = parseInt(params[0]) - 1;
+                if (idx < 0 || idx >= prompts.length) return await tg.send(chatId, "❌ Промпт с таким номером не найден");
+                return await tg.send(chatId, `📋 <b>Промпт #${idx + 1}:</b>\n\n<code>${escapeHtml(prompts[idx])}</code>`);
+            }
+
+            let msg = "📋 <b>Список промптов:</b>\n\n";
+            for (let i = 0; i < prompts.length; i++) {
+                let p = prompts[i];
+                let short = p.length > 80 ? p.substring(0, 80) + "..." : p;
+                let line = `<b>${i + 1}.</b> <code>${escapeHtml(short)}</code>\n`;
+                if ((msg.length + line.length) > 3800) {
+                    await tg.send(chatId, msg);
+                    msg = "";
+                }
+                msg += line;
+            }
+            if (msg) await tg.send(chatId, msg + "\n💡 <i>Введи /promptlist &lt;номер&gt;, чтобы увидеть полный текст</i>");
+            break;
+        }
+
         case "/setprompt":
-            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема1; тема2&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема1; тема2&gt;\n<i>Рекомендуется использовать /addprompt для удобства</i>");
             config.generalPrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ Промпт сохранен. Темы будут выбираться случайно, если разделены ";"\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n💡 Для отключения ИИ добавьте в промпт <code>{-llm}</code>\n💡 Для LoRA используй <code>{id:сила}</code> прямо в промпте`);
+            await tg.send(chatId, `✅ Промпты полностью перезаписаны.\n💡 Для LoRA используй <code>{id:сила}</code>, для отключения ИИ — <code>{-llm}</code>`);
             break;
 
         case "/setcontext":
@@ -698,7 +788,7 @@ async function handleCommand(msg, env) {
                     config.watermarkData = bufferToBase64(arrayBuffer);
                     config.watermarkPosition = params[0] || "random";
                     await saveConfig(env, config);
-                    await tg.send(chatId, `✅ Водяной знак сохранен и будет накладываться!\nПозиция: ${config.watermarkPosition}\n\n⚠️ <b>Важно:</b> Убедитесь, что в панели Cloudflare (Security -> Bots) отключен "Bot Fight Mode", иначе сервер наложения не сможет скачать вотермарку!`);
+                    await tg.send(chatId, `✅ Водяной знак сохранен!\nПозиция: ${config.watermarkPosition}`);
                 } else {
                     await tg.send(chatId, `❌ Ошибка API Telegram: ${fileReq.description}`);
                 }
@@ -802,7 +892,7 @@ async function handleCommand(msg, env) {
             } catch (_) {}
             config.loras.push({ name: loraId, title: loraTitle, strength: loraStr, clip: loraClip, global: isGlobal });
             await saveConfig(env, config);
-            await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена\nСила: ${loraStr} | Clip: ${loraClip} | Режим: ${isGlobal ? "🌐 Глобальная" : "🎯 Ручная (только через {})"}${compatMsg}`);
+            await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена\nСила: ${loraStr} | Clip: ${loraClip} | Режим: ${isGlobal ? "🌐 Глобальная" : "🎯 Ручная"}${compatMsg}`);
             break;
         }
 
@@ -907,7 +997,7 @@ async function handleCommand(msg, env) {
 
         case "/enable":
             if (!config.groupId && !config.channelId) return await tg.send(chatId, "❌ Сначала привяжи группу (/setgroup) или канал (/setchannel)");
-            if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт (/setprompt)");
+            if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала добавь промпт (/addprompt)");
             config.enabled = true; await saveConfig(env, config);
             await tg.send(chatId, "🟢 Автопостинг включён!");
             break;
@@ -918,7 +1008,7 @@ async function handleCommand(msg, env) {
             break;
 
         case "/generate":
-            if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала задай промпт (/setprompt)");
+            if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала добавь промпт (/addprompt)");
 
             const actualCount = getActualCount(config.count);
             await tg.send(chatId, `⏳ Генерирую ${actualCount} фото... (Обработка Batch)`);
@@ -937,7 +1027,6 @@ async function handleCommand(msg, env) {
                         const { cleanPrompt, extraLoras, excludedLoras, disableLlm } = parsePromptLoras(segment);
                         const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
 
-                        // Отключение ИИ по запросу из скобок
                         const finalPrompt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config);
                         const bestRes = await determineResolution(finalPrompt, env, config);
 
@@ -984,7 +1073,9 @@ async function handleCommand(msg, env) {
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
             const globalLoras = (config.loras || []).filter(l => l.global !== false);
             const manualLoras = (config.loras || []).filter(l => l.global === false);
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            const promptsCount = config.generalPrompt ? config.generalPrompt.split(';').filter(Boolean).length : 0;
+            
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(см. /promptlist)</i>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1264,7 +1355,6 @@ async function processScheduled(env) {
             const { cleanPrompt, extraLoras, excludedLoras, disableLlm } = parsePromptLoras(segment);
             const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
 
-            // Отключение LLM, если указано
             const prmpt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config);
             const bestRes = await determineResolution(prmpt, env, config);
             const res = await hordeSubmit(prmpt, config, env, {
