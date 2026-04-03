@@ -2,7 +2,8 @@ const DEFAULT_CONFIG = {
     enabled: false,
     groupId: null,
     channelId: null,
-    adminId: null,
+    adminId: null, // Legacy, kept for migration
+    admins: {}, // New role system: { "userId": "owner" | "tech" | "creative" }
     interval: 60,
     count: "1",
     generalPrompt: "",
@@ -97,29 +98,25 @@ function getActualCount(countConfig) {
 }
 
 /**
- * Parse {lora_id:strength:clip, lora_id2:strength, -excluded_id} from a prompt.
- * Returns the clean prompt (with {} block removed) plus extra/excluded LoRA lists.
- *
- * Syntax:
- *   {name:strength}         — add LoRA with given strength (clip defaults to 1)
- *   {name:strength:clip}    — add LoRA with strength and clip
- *   {name}                  — add LoRA with strength=1, clip=1
- *   {-name}                 — exclude this global LoRA for this prompt
- *   Multiple entries separated by commas: {2815817:1.2, -9999, other_lora:0.8:0.9}
+ * Parse {lora_id:strength:clip, lora_id2:strength, -excluded_id, nollm} from a prompt.
+ * Returns the clean prompt (with {} block removed) plus extra/excluded LoRA lists and skipLlm flag.
  */
 function parsePromptLoras(prompt) {
     const match = prompt.match(/\{([^}]*)\}/);
-    if (!match) return { cleanPrompt: prompt, extraLoras: [], excludedLoras: [] };
+    if (!match) return { cleanPrompt: prompt, extraLoras: [], excludedLoras: [], skipLlm: false };
 
     const content = match[1];
     const cleanPrompt = prompt.replace(match[0], '').replace(/\s{2,}/g, ' ').trim();
 
     const extraLoras = [];
     const excludedLoras = [];
+    let skipLlm = false;
 
     const parts = content.split(',').map(s => s.trim()).filter(Boolean);
     for (const part of parts) {
-        if (part.startsWith('-')) {
+        if (part === 'nollm' || part === '-llm') {
+            skipLlm = true;
+        } else if (part.startsWith('-')) {
             excludedLoras.push(part.substring(1).trim());
         } else {
             const segments = part.split(':');
@@ -130,20 +127,26 @@ function parsePromptLoras(prompt) {
         }
     }
 
-    return { cleanPrompt, extraLoras, excludedLoras };
+    return { cleanPrompt, extraLoras, excludedLoras, skipLlm };
 }
 
-/**
- * Build the final LoRA list for a generation request.
- * - Global LoRAs (l.global !== false) are always included unless excluded via {-name}
- * - Manual LoRAs (l.global === false) are only included when specified via {} in prompt
- * - extraLoras: per-prompt LoRAs parsed from {} syntax
- * - excludedLoras: global LoRA IDs to skip for this prompt
- */
 function buildLorasForRequest(config, extraLoras = [], excludedLoras = []) {
     const globalLoras = (config.loras || []).filter(l => l.global !== false);
     const filteredGlobal = globalLoras.filter(l => !excludedLoras.includes(String(l.name)));
     return [...filteredGlobal, ...extraLoras];
+}
+
+async function uploadToTelegraph(buffer) {
+    const form = new FormData();
+    form.append("file", new Blob([buffer], { type: "image/webp" }), "image.webp");
+    try {
+        const res = await fetch("https://telegra.ph/upload", { method: "POST", body: form });
+        const data = await res.json();
+        if (data && data[0] && data[0].src) return "https://telegra.ph" + data[0].src;
+    } catch (e) {
+        console.error("[Telegraph Upload Error]", e.message);
+    }
+    return null;
 }
 
 class Telegram {
@@ -371,13 +374,12 @@ async function determineResolution(prompt, env, config) {
     return { width: r[0], height: r[1] };
 }
 
-async function generatePrompt(basePrompt, env, config) {
-    if (!env.OPENROUTER_API_KEY) return basePrompt;
+async function generatePrompt(basePrompt, env, config, skipLlm = false) {
+    if (skipLlm || !env.OPENROUTER_API_KEY) return basePrompt;
     const llmModel = config.llmModel || "openrouter/free";
     let sysPrompt, userPrompt;
     const match = basePrompt.match(/\[([\s\S]*?)\]/);
 
-    // Use user-defined system context, or fall back to the built-in uncensored Illustrious XL context
     const baseContext = config.systemContext || DEFAULT_SYSTEM_CONTEXT;
 
     if (match) {
@@ -441,10 +443,6 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.post_processing = config.postProcessors;
     }
 
-    // LoRA resolution order:
-    //   1. If lorasOverride is explicitly provided (from {} parsing), use it as-is.
-    //   2. Otherwise, use all global LoRAs from config (l.global !== false).
-    //   3. If skipLoras is true, use no LoRAs (legacy fallback).
     let effectiveLoras = [];
     if (!extra.skipLoras) {
         if (extra.lorasOverride !== undefined) {
@@ -543,28 +541,41 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
         return { sent: false, tooSmall: false, sizeKB: 0 };
     }
 
-    const isUrl = isHttpUrl(imgData);
+    let isUrl = isHttpUrl(imgData);
     let targetUrl = imgData;
+    let buffer = null;
 
-    if (isUrl) {
-        targetUrl = await getWatermarkedUrl(imgData, config, env);
+    // Feature: Base64 to Telegraph conversion to enable watermarking via wsrv.nl
+    if (!isUrl && config.watermarkData) {
+        buffer = base64ToBuffer(imgData);
+        if (buffer) {
+            const tUrl = await uploadToTelegraph(buffer);
+            if (tUrl) {
+                targetUrl = tUrl;
+                isUrl = true;
+                buffer = null; // Let the downloadImage grab the watermarked version below
+            }
+        }
     }
 
-    let buffer = null;
-    const extra = { hasSpoiler: config.useSpoiler };
-
     if (isUrl) {
+        if (config.watermarkData) {
+            targetUrl = await getWatermarkedUrl(targetUrl, config, env);
+        }
         buffer = await downloadImage(targetUrl);
-        if (!buffer) {
+        if (!buffer && isHttpUrl(imgData)) {
             buffer = await downloadImage(imgData);
         }
-        if (!buffer) {
-            const r = await tg.sendPhotoUrl(chatId, imgData, caption, extra);
+    } else if (!buffer) {
+        buffer = base64ToBuffer(imgData);
+    }
+
+    if (!buffer) {
+        if (isUrl) {
+            const r = await tg.sendPhotoUrl(chatId, imgData, caption, { hasSpoiler: config.useSpoiler });
             return { sent: r.ok, tooSmall: false, sizeKB: 0, msgId: r.result?.message_id };
         }
-    } else {
-        buffer = base64ToBuffer(imgData);
-        if (!buffer) return { sent: false, tooSmall: false, sizeKB: 0 };
+        return { sent: false, tooSmall: false, sizeKB: 0 };
     }
 
     const sizeKB = Math.round(buffer.byteLength / 1024);
@@ -573,6 +584,7 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
         return { sent: false, tooSmall: true, sizeKB };
     }
 
+    const extra = { hasSpoiler: config.useSpoiler };
     let r = await tg.sendPhoto(chatId, buffer, caption, extra);
     if (r.ok) return { sent: true, tooSmall: false, sizeKB, msgId: r.result?.message_id };
 
@@ -586,6 +598,16 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
 
     if (notifyId) await tg.send(notifyId, `❌ Не удалось отправить изображение: ${escapeHtml(r?.description || "unknown error")}`);
     return { sent: false, tooSmall: false, sizeKB };
+}
+
+function hasPermission(role, cmd) {
+    if (role === "owner") return true;
+    const techCmds = ["/setllm", "/setmodel", "/listmodels", "/searchmodel", "/setsampler", "/setcfg", "/setsteps", "/setenhancer", "/settokens", "/setcontext", "/status", "/pending", "/ping", "/help", "/start"];
+    const creativeCmds = ["/setprompt", "/setneg", "/setcaptionmode", "/setcaptionprompt", "/setsize", "/setspoiler", "/setwatermark", "/addlora", "/listloras", "/clearloras", "/status", "/pending", "/ping", "/help", "/start", "/generate"];
+
+    if (role === "tech" && techCmds.includes(cmd)) return true;
+    if (role === "creative" && creativeCmds.includes(cmd)) return true;
+    return false;
 }
 
 async function handleCommand(msg, env) {
@@ -608,21 +630,67 @@ async function handleCommand(msg, env) {
     }
 
     let config = await getConfig(env);
-    if (!config.adminId) {
+    if (!config.admins) config.admins = {};
+
+    // Auto-setup first user as owner or migrate legacy adminId
+    if (!config.adminId && Object.keys(config.admins).length === 0) {
         config.adminId = userId;
+        config.admins[String(userId)] = "owner";
         await saveConfig(env, config);
-        await tg.send(chatId, `👑 Ты теперь админ. Твой ID: <code>${userId}</code>`);
+        await tg.send(chatId, `👑 Ты теперь главный админ (owner). Твой ID: <code>${userId}</code>`);
+    } else if (config.adminId && Object.keys(config.admins).length === 0) {
+        config.admins[String(config.adminId)] = "owner";
+        await saveConfig(env, config);
     }
 
-    if (config.adminId !== userId) {
-        return await tg.send(chatId, `🔒 Доступ только для админа.`);
+    const userRole = config.admins[String(userId)];
+    if (!userRole) {
+        return await tg.send(chatId, `🔒 Доступ запрещен. Твой ID: <code>${userId}</code>`);
+    }
+
+    if (!hasPermission(userRole, cmd)) {
+        return await tg.send(chatId, `🚫 У твоей роли (<b>${userRole}</b>) нет прав на эту команду.`);
     }
 
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; или &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n/setcontext &lt;системный промпт LLM&gt; | /settokens &lt;лимит&gt;\n\n<b>LoRA в промпте (синтаксис {}):</b>\n<code>{id:сила}</code> — добавить лору только для этого промпта\n<code>{id:сила:clip}</code> — с клип-силой\n<code>{-id}</code> — исключить глобальную лору для этого промпта\nПример: <code>girl {2815817:1.2, -9999}</code>\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; или &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n/setcontext &lt;системный промпт LLM&gt; | /settokens &lt;лимит&gt;\n\n<b>LoRA в промпте (синтаксис {}):</b>\n<code>{id:сила}</code> — добавить лору только для этого промпта\n<code>{id:сила:clip}</code> — с клип-силой\n<code>{-id}</code> — исключить глобальную лору для этого промпта\n<code>{nollm}</code> — отключить LLM запрос для этого промпта\nПример: <code>girl {2815817:1.2, -9999, nollm}</code>\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Админы:</b>\n/addadmin &lt;id&gt; &lt;owner|tech|creative&gt; | /deladmin &lt;id&gt; | /admins\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
+
+        case "/addadmin": {
+            const newAdminId = params[0];
+            const newRole = params[1]?.toLowerCase();
+            if (!newAdminId || !["owner", "tech", "creative"].includes(newRole)) {
+                return await tg.send(chatId, "❌ Использование: /addadmin <ID> <owner|tech|creative>");
+            }
+            config.admins[newAdminId] = newRole;
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ Пользователь <code>${newAdminId}</code> добавлен как <b>${newRole}</b>.`);
+            break;
+        }
+
+        case "/deladmin": {
+            const delAdminId = params[0];
+            if (!delAdminId) return await tg.send(chatId, "❌ Укажи ID администратора.");
+            if (delAdminId === String(config.adminId) || (config.admins[delAdminId] === "owner" && Object.values(config.admins).filter(r => r === "owner").length === 1)) {
+                return await tg.send(chatId, "❌ Нельзя удалить единственного главного владельца.");
+            }
+            delete config.admins[delAdminId];
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ Пользователь <code>${delAdminId}</code> удален из админов.`);
+            break;
+        }
+
+        case "/admins": {
+            let admTxt = "👥 <b>Администраторы:</b>\n\n";
+            for (const [id, role] of Object.entries(config.admins || {})) {
+                let roleIcon = role === "owner" ? "👑" : (role === "tech" ? "⚙️" : "🎨");
+                admTxt += `${roleIcon} ID: <code>${id}</code> — <b>${role}</b>\n`;
+            }
+            await tg.send(chatId, admTxt);
+            break;
+        }
 
         case "/setgroup":
             config.groupId = chatId; await saveConfig(env, config);
@@ -648,7 +716,7 @@ async function handleCommand(msg, env) {
         case "/setprompt":
             if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема1; тема2&gt;");
             config.generalPrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ Промпт сохранен. Темы будут выбираться случайно, если разделены ";"\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n💡 Для LoRA используй <code>{id:сила}</code> прямо в промпте`);
+            await tg.send(chatId, `✅ Промпт сохранен. Темы будут выбираться случайно, если разделены ";"\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n💡 Для LoRA используй <code>{id:сила}</code> прямо в промпте. Для отключения LLM пиши <code>{nollm}</code>`);
             break;
 
         case "/setcontext":
@@ -768,14 +836,10 @@ async function handleCommand(msg, env) {
         }
 
         case "/addlora": {
-            // Usage: /addlora <ID> [strength=1] [clip=1] [global|manual]
-            // global  — LoRA is always applied to every generation (default)
-            // manual  — LoRA is only applied when referenced via {} in a prompt
             if (!params.length) return await tg.send(chatId, "❌ /addlora &lt;ID&gt; [strength=1] [clip=1] [global|manual]\n\n🌐 <b>global</b> — применяется всегда (по умолчанию)\n🎯 <b>manual</b> — только через {ID:сила} в промпте");
             const loraId = params[0];
             const loraStr = parseFloat(params[1]) || 1;
             const loraClip = parseFloat(params[2]) || 1;
-            // 4th param: global or manual (default: global)
             const modeParam = (params[3] || "global").toLowerCase();
             const isGlobal = modeParam !== "manual";
 
@@ -943,19 +1007,18 @@ async function handleCommand(msg, env) {
                     try {
                         const segment = getRandomPromptSegment(config.generalPrompt);
 
-                        // Parse {} LoRA syntax from the segment
-                        const { cleanPrompt, extraLoras, excludedLoras } = parsePromptLoras(segment);
+                        const { cleanPrompt, extraLoras, excludedLoras, skipLlm } = parsePromptLoras(segment);
                         const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
 
-                        const finalPrompt = await generatePrompt(cleanPrompt, env, config);
+                        const finalPrompt = await generatePrompt(cleanPrompt, env, config, skipLlm);
                         const bestRes = await determineResolution(finalPrompt, env, config);
 
-                        // Build LoRA info string for display
                         const loraInfo = lorasOverride.length > 0
                             ? `\n🎨 LoRA: ${lorasOverride.map(l => `${l.name}(${l.strength})`).join(', ')}`
                             : '';
+                        const llmStatus = skipLlm ? "\n🤖 LLM: Отключен (nollm)" : "";
 
-                        await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 300))}</code>\n📏 Резолюция: ${bestRes.width}x${bestRes.height}${loraInfo}`);
+                        await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 300))}</code>\n📏 Резолюция: ${bestRes.width}x${bestRes.height}${loraInfo}${llmStatus}`);
 
                         const res = await hordeSubmit(finalPrompt, config, env, {
                             workerBlacklist: bl,
@@ -1125,7 +1188,6 @@ async function processScheduled(env) {
                 const retries = (task.retries || 0) + 1;
                 if (retries < 3) {
                     const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
-                    // Preserve lorasOverride from the original task on retry
                     const newRes = await hordeSubmit(task.prompt, config, env, {
                         workerBlacklist: bl,
                         lorasOverride: task.lorasOverride
@@ -1164,16 +1226,27 @@ async function processScheduled(env) {
                                     const processedBuffers = [];
                                     for (const b64 of batch.ready) {
                                         let targetUrl = b64;
-                                        if (isHttpUrl(targetUrl)) {
+                                        let isUrl = isHttpUrl(targetUrl);
+                                        let buf = null;
+
+                                        if (!isUrl && config.watermarkData) {
+                                            const tempBuf = base64ToBuffer(b64);
+                                            const tUrl = tempBuf ? await uploadToTelegraph(tempBuf) : null;
+                                            if (tUrl) { targetUrl = tUrl; isUrl = true; }
+                                        }
+
+                                        if (isUrl && config.watermarkData) {
                                             targetUrl = await getWatermarkedUrl(targetUrl, config, env);
                                         }
-                                        let buf = isHttpUrl(targetUrl) ? await downloadImage(targetUrl) : base64ToBuffer(b64);
-                                        if (!buf && isHttpUrl(targetUrl)) {
-                                            buf = await downloadImage(b64);
+
+                                        if (isUrl) {
+                                            buf = await downloadImage(targetUrl);
+                                            if (!buf && isHttpUrl(b64)) buf = await downloadImage(b64);
+                                        } else {
+                                            buf = base64ToBuffer(b64);
                                         }
-                                        if (buf) {
-                                            processedBuffers.push(buf);
-                                        }
+
+                                        if (buf) processedBuffers.push(buf);
                                     }
                                     if (processedBuffers.length > 0) {
                                         await tg.sendMediaGroup(tId, processedBuffers, captionText);
@@ -1216,9 +1289,26 @@ async function processScheduled(env) {
                     const processedBuffers = [];
                     for (const b64 of batch.ready) {
                         let targetUrl = b64;
-                        if (isHttpUrl(targetUrl)) targetUrl = await getWatermarkedUrl(targetUrl, config, env);
-                        let buf = isHttpUrl(targetUrl) ? await downloadImage(targetUrl) : base64ToBuffer(b64);
-                        if (!buf && isHttpUrl(targetUrl)) buf = await downloadImage(b64);
+                        let isUrl = isHttpUrl(targetUrl);
+                        let buf = null;
+
+                        if (!isUrl && config.watermarkData) {
+                            const tempBuf = base64ToBuffer(b64);
+                            const tUrl = tempBuf ? await uploadToTelegraph(tempBuf) : null;
+                            if (tUrl) { targetUrl = tUrl; isUrl = true; }
+                        }
+
+                        if (isUrl && config.watermarkData) {
+                            targetUrl = await getWatermarkedUrl(targetUrl, config, env);
+                        }
+
+                        if (isUrl) {
+                            buf = await downloadImage(targetUrl);
+                            if (!buf && isHttpUrl(b64)) buf = await downloadImage(b64);
+                        } else {
+                            buf = base64ToBuffer(b64);
+                        }
+
                         if (buf) processedBuffers.push(buf);
                     }
                     if (processedBuffers.length > 0) await tg.sendMediaGroup(tId, processedBuffers, captionText);
@@ -1244,17 +1334,19 @@ async function processScheduled(env) {
     const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
     const actualCount = getActualCount(config.count);
 
-    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: 3600 });
+    // Provide default owner ID to notify array if possible, otherwise first owner ID available
+    const ownerId = Object.keys(config.admins || {}).find(id => config.admins[id] === "owner") || config.adminId;
+
+    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: ownerId, prompt: "" }, { expirationTtl: 3600 });
 
     for (let i = 0; i < actualCount; i++) {
         try {
             const segment = getRandomPromptSegment(config.generalPrompt);
 
-            // Parse {} LoRA syntax from the segment
-            const { cleanPrompt, extraLoras, excludedLoras } = parsePromptLoras(segment);
+            const { cleanPrompt, extraLoras, excludedLoras, skipLlm } = parsePromptLoras(segment);
             const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
 
-            const prmpt = await generatePrompt(cleanPrompt, env, config);
+            const prmpt = await generatePrompt(cleanPrompt, env, config, skipLlm);
             const bestRes = await determineResolution(prmpt, env, config);
             const res = await hordeSubmit(prmpt, config, env, {
                 workerBlacklist: bl,
@@ -1268,19 +1360,19 @@ async function processScheduled(env) {
                     targets,
                     prompt: prmpt,
                     at: now,
-                    notify: config.adminId,
+                    notify: ownerId,
                     retries: 0,
                     batchId,
                     lorasOverride
                 }, { expirationTtl: 3600 });
                 queuedCount++;
             } else {
-                if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
+                if (ownerId) await tg.send(ownerId, `❌ <b>Ошибка автогенерации (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
                 let batch = await KV.get(env, `batch:${batchId}`, "json");
                 if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
             }
         } catch (e) {
-            if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
+            if (ownerId) await tg.send(ownerId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
             let batch = await KV.get(env, `batch:${batchId}`, "json");
             if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
         }
