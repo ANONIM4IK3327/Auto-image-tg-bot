@@ -545,7 +545,6 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
     let targetUrl = imgData;
     let buffer = null;
 
-    // Feature: Base64 to Telegraph conversion to enable watermarking via wsrv.nl
     if (!isUrl && config.watermarkData) {
         buffer = base64ToBuffer(imgData);
         if (buffer) {
@@ -553,7 +552,7 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
             if (tUrl) {
                 targetUrl = tUrl;
                 isUrl = true;
-                buffer = null; // Let the downloadImage grab the watermarked version below
+                buffer = null; 
             }
         }
     }
@@ -632,7 +631,6 @@ async function handleCommand(msg, env) {
     let config = await getConfig(env);
     if (!config.admins) config.admins = {};
 
-    // Auto-setup first user as owner or migrate legacy adminId
     if (!config.adminId && Object.keys(config.admins).length === 0) {
         config.adminId = userId;
         config.admins[String(userId)] = "owner";
@@ -1056,7 +1054,12 @@ async function handleCommand(msg, env) {
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
             const globalLoras = (config.loras || []).filter(l => l.global !== false);
             const manualLoras = (config.loras || []).filter(l => l.global === false);
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            
+            // Заворачиваем промпты в сворачиваемые цитаты:
+            const safeGenPrompt = config.generalPrompt ? escapeHtml(config.generalPrompt) : "Не задан";
+            const safeNegPrompt = config.negativePrompt ? escapeHtml(config.negativePrompt) : "Не задан";
+
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпт:</b>\n<blockquote expandable><code>${safeGenPrompt}</code></blockquote>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<blockquote expandable><code>${safeNegPrompt}</code></blockquote>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1334,7 +1337,6 @@ async function processScheduled(env) {
     const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
     const actualCount = getActualCount(config.count);
 
-    // Provide default owner ID to notify array if possible, otherwise first owner ID available
     const ownerId = Object.keys(config.admins || {}).find(id => config.admins[id] === "owner") || config.adminId;
 
     await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: ownerId, prompt: "" }, { expirationTtl: 3600 });
