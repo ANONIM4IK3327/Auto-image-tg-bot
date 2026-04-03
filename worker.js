@@ -2,8 +2,7 @@ const DEFAULT_CONFIG = {
     enabled: false,
     groupId: null,
     channelId: null,
-    adminId: null, // Legacy, kept for migration
-    admins: {}, // New role system: { "userId": "owner" | "tech" | "creative" }
+    adminId: null,
     interval: 60,
     count: "1",
     generalPrompt: "",
@@ -98,24 +97,25 @@ function getActualCount(countConfig) {
 }
 
 /**
- * Parse {lora_id:strength:clip, lora_id2:strength, -excluded_id, nollm} from a prompt.
- * Returns the clean prompt (with {} block removed) plus extra/excluded LoRA lists and skipLlm flag.
+ * Parse {lora_id:strength:clip, -excluded_id, -llm} from a prompt.
+ * Added: {-llm} or {nollm} will completely disable OpenRouter for this prompt.
  */
 function parsePromptLoras(prompt) {
     const match = prompt.match(/\{([^}]*)\}/);
-    if (!match) return { cleanPrompt: prompt, extraLoras: [], excludedLoras: [], skipLlm: false };
+    if (!match) return { cleanPrompt: prompt, extraLoras: [], excludedLoras: [], disableLlm: false };
 
     const content = match[1];
     const cleanPrompt = prompt.replace(match[0], '').replace(/\s{2,}/g, ' ').trim();
 
     const extraLoras = [];
     const excludedLoras = [];
-    let skipLlm = false;
+    let disableLlm = false;
 
     const parts = content.split(',').map(s => s.trim()).filter(Boolean);
     for (const part of parts) {
-        if (part === 'nollm' || part === '-llm') {
-            skipLlm = true;
+        const lower = part.toLowerCase();
+        if (lower === '-llm' || lower === 'nollm') {
+            disableLlm = true;
         } else if (part.startsWith('-')) {
             excludedLoras.push(part.substring(1).trim());
         } else {
@@ -127,26 +127,13 @@ function parsePromptLoras(prompt) {
         }
     }
 
-    return { cleanPrompt, extraLoras, excludedLoras, skipLlm };
+    return { cleanPrompt, extraLoras, excludedLoras, disableLlm };
 }
 
 function buildLorasForRequest(config, extraLoras = [], excludedLoras = []) {
     const globalLoras = (config.loras || []).filter(l => l.global !== false);
     const filteredGlobal = globalLoras.filter(l => !excludedLoras.includes(String(l.name)));
     return [...filteredGlobal, ...extraLoras];
-}
-
-async function uploadToTelegraph(buffer) {
-    const form = new FormData();
-    form.append("file", new Blob([buffer], { type: "image/webp" }), "image.webp");
-    try {
-        const res = await fetch("https://telegra.ph/upload", { method: "POST", body: form });
-        const data = await res.json();
-        if (data && data[0] && data[0].src) return "https://telegra.ph" + data[0].src;
-    } catch (e) {
-        console.error("[Telegraph Upload Error]", e.message);
-    }
-    return null;
 }
 
 class Telegram {
@@ -374,8 +361,8 @@ async function determineResolution(prompt, env, config) {
     return { width: r[0], height: r[1] };
 }
 
-async function generatePrompt(basePrompt, env, config, skipLlm = false) {
-    if (skipLlm || !env.OPENROUTER_API_KEY) return basePrompt;
+async function generatePrompt(basePrompt, env, config) {
+    if (!env.OPENROUTER_API_KEY) return basePrompt;
     const llmModel = config.llmModel || "openrouter/free";
     let sysPrompt, userPrompt;
     const match = basePrompt.match(/\[([\s\S]*?)\]/);
@@ -508,7 +495,12 @@ async function hordeGetModels() {
 
 async function downloadImage(url) {
     try {
-        const res = await fetch(url);
+        const res = await fetch(url, { 
+            headers: { 
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 TgImageBot/1.0",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
+            } 
+        });
         return res.ok ? await res.arrayBuffer() : null;
     } catch { return null; }
 }
@@ -520,7 +512,8 @@ async function getWatermarkedUrl(imgUrl, config, env) {
     if (!workerOriginRaw) return imgUrl;
 
     const workerOrigin = workerOriginRaw.replace(/\/$/, "");
-    const wmUrl = `${workerOrigin}/watermark.png`;
+    // Добавлен cache-buster чтобы wsrv не кэшировал старые/битые попытки
+    const wmUrl = `${workerOrigin}/watermark.png?v=${Date.now()}`;
     let markpos = "southeast";
 
     if (config.watermarkPosition === "random") {
@@ -532,7 +525,7 @@ async function getWatermarkedUrl(imgUrl, config, env) {
         markpos = config.watermarkPosition || "southeast";
     }
 
-    return `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&mark=${encodeURIComponent(wmUrl)}&markpos=${markpos}&markpad=5&markalpha=90`;
+    return `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&mark=${encodeURIComponent(wmUrl)}&markpos=${markpos}&markpad=5&output=webp`;
 }
 
 async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env) {
@@ -541,40 +534,32 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
         return { sent: false, tooSmall: false, sizeKB: 0 };
     }
 
-    let isUrl = isHttpUrl(imgData);
+    const isUrl = isHttpUrl(imgData);
     let targetUrl = imgData;
     let buffer = null;
-
-    if (!isUrl && config.watermarkData) {
-        buffer = base64ToBuffer(imgData);
-        if (buffer) {
-            const tUrl = await uploadToTelegraph(buffer);
-            if (tUrl) {
-                targetUrl = tUrl;
-                isUrl = true;
-                buffer = null; 
-            }
-        }
-    }
+    const extra = { hasSpoiler: config.useSpoiler };
 
     if (isUrl) {
-        if (config.watermarkData) {
-            targetUrl = await getWatermarkedUrl(targetUrl, config, env);
-        }
+        targetUrl = await getWatermarkedUrl(imgData, config, env);
         buffer = await downloadImage(targetUrl);
-        if (!buffer && isHttpUrl(imgData)) {
+        
+        // Обработка сбоя наложения вотермарки
+        if (!buffer && targetUrl !== imgData) {
+            if (notifyId) await tg.send(notifyId, `⚠️ <b>Сбой наложения вотермарки</b> (wsrv.nl не ответил или ваш Cloudflare блокирует запросы Bot Fight Mode). Отправлен оригинал.`);
             buffer = await downloadImage(imgData);
         }
-    } else if (!buffer) {
-        buffer = base64ToBuffer(imgData);
-    }
 
-    if (!buffer) {
-        if (isUrl) {
-            const r = await tg.sendPhotoUrl(chatId, imgData, caption, { hasSpoiler: config.useSpoiler });
+        if (!buffer) {
+            const r = await tg.sendPhotoUrl(chatId, imgData, caption, extra);
             return { sent: r.ok, tooSmall: false, sizeKB: 0, msgId: r.result?.message_id };
         }
-        return { sent: false, tooSmall: false, sizeKB: 0 };
+    } else {
+        // Если картинка пришла в формате Base64, её физически нельзя прогнать через wsrv.nl по URL
+        if (config.watermarkData && notifyId) {
+            await tg.send(notifyId, `ℹ️ <b>Вотермарка пропущена:</b> Воркер Horde вернул изображение в формате Base64, а не URL.`);
+        }
+        buffer = base64ToBuffer(imgData);
+        if (!buffer) return { sent: false, tooSmall: false, sizeKB: 0 };
     }
 
     const sizeKB = Math.round(buffer.byteLength / 1024);
@@ -583,7 +568,6 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
         return { sent: false, tooSmall: true, sizeKB };
     }
 
-    const extra = { hasSpoiler: config.useSpoiler };
     let r = await tg.sendPhoto(chatId, buffer, caption, extra);
     if (r.ok) return { sent: true, tooSmall: false, sizeKB, msgId: r.result?.message_id };
 
@@ -597,16 +581,6 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
 
     if (notifyId) await tg.send(notifyId, `❌ Не удалось отправить изображение: ${escapeHtml(r?.description || "unknown error")}`);
     return { sent: false, tooSmall: false, sizeKB };
-}
-
-function hasPermission(role, cmd) {
-    if (role === "owner") return true;
-    const techCmds = ["/setllm", "/setmodel", "/listmodels", "/searchmodel", "/setsampler", "/setcfg", "/setsteps", "/setenhancer", "/settokens", "/setcontext", "/status", "/pending", "/ping", "/help", "/start"];
-    const creativeCmds = ["/setprompt", "/setneg", "/setcaptionmode", "/setcaptionprompt", "/setsize", "/setspoiler", "/setwatermark", "/addlora", "/listloras", "/clearloras", "/status", "/pending", "/ping", "/help", "/start", "/generate"];
-
-    if (role === "tech" && techCmds.includes(cmd)) return true;
-    if (role === "creative" && creativeCmds.includes(cmd)) return true;
-    return false;
 }
 
 async function handleCommand(msg, env) {
@@ -629,66 +603,21 @@ async function handleCommand(msg, env) {
     }
 
     let config = await getConfig(env);
-    if (!config.admins) config.admins = {};
-
-    if (!config.adminId && Object.keys(config.admins).length === 0) {
+    if (!config.adminId) {
         config.adminId = userId;
-        config.admins[String(userId)] = "owner";
         await saveConfig(env, config);
-        await tg.send(chatId, `👑 Ты теперь главный админ (owner). Твой ID: <code>${userId}</code>`);
-    } else if (config.adminId && Object.keys(config.admins).length === 0) {
-        config.admins[String(config.adminId)] = "owner";
-        await saveConfig(env, config);
+        await tg.send(chatId, `👑 Ты теперь админ. Твой ID: <code>${userId}</code>`);
     }
 
-    const userRole = config.admins[String(userId)];
-    if (!userRole) {
-        return await tg.send(chatId, `🔒 Доступ запрещен. Твой ID: <code>${userId}</code>`);
-    }
-
-    if (!hasPermission(userRole, cmd)) {
-        return await tg.send(chatId, `🚫 У твоей роли (<b>${userRole}</b>) нет прав на эту команду.`);
+    if (config.adminId !== userId) {
+        return await tg.send(chatId, `🔒 Доступ только для админа.`);
     }
 
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; или &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n/setcontext &lt;системный промпт LLM&gt; | /settokens &lt;лимит&gt;\n\n<b>LoRA в промпте (синтаксис {}):</b>\n<code>{id:сила}</code> — добавить лору только для этого промпта\n<code>{id:сила:clip}</code> — с клип-силой\n<code>{-id}</code> — исключить глобальную лору для этого промпта\n<code>{nollm}</code> — отключить LLM запрос для этого промпта\nПример: <code>girl {2815817:1.2, -9999, nollm}</code>\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Админы:</b>\n/addadmin &lt;id&gt; &lt;owner|tech|creative&gt; | /deladmin &lt;id&gt; | /admins\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; или &lt;random 1-5&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/setprompt &lt;тема1; тема2&gt; | /setneg &lt;текст&gt;\n/setcontext &lt;системный промпт LLM&gt; | /settokens &lt;лимит&gt;\n\n<b>LoRA и Отключение ИИ (синтаксис {}):</b>\n<code>{id:сила}</code> — добавить лору только для этого промпта\n<code>{id:сила:clip}</code> — с клип-силой\n<code>{-id}</code> — исключить глобальную лору для этого промпта\n<code>{-llm}</code> — отключить генерацию OpenRouter для этого промпта\nПример: <code>girl {-llm, 2815817:1.2, -9999}</code>\n\n<b>Подписи и ИИ:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n\n<b>Параметры и Модели:</b>\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel &lt;запрос&gt;\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras\n/setenhancer &lt;FaceFix AnimeUpscale и т.д. | clear&gt;\n/setsize &lt;W&gt; &lt;H&gt; | /setsteps &lt;N&gt; | /setcfg &lt;N&gt; | /setsampler &lt;name&gt;\n/setspoiler &lt;on|off&gt;\n/setwatermark &lt;random|corner&gt; (Прикрепите файл PNG)\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
-
-        case "/addadmin": {
-            const newAdminId = params[0];
-            const newRole = params[1]?.toLowerCase();
-            if (!newAdminId || !["owner", "tech", "creative"].includes(newRole)) {
-                return await tg.send(chatId, "❌ Использование: /addadmin <ID> <owner|tech|creative>");
-            }
-            config.admins[newAdminId] = newRole;
-            await saveConfig(env, config);
-            await tg.send(chatId, `✅ Пользователь <code>${newAdminId}</code> добавлен как <b>${newRole}</b>.`);
-            break;
-        }
-
-        case "/deladmin": {
-            const delAdminId = params[0];
-            if (!delAdminId) return await tg.send(chatId, "❌ Укажи ID администратора.");
-            if (delAdminId === String(config.adminId) || (config.admins[delAdminId] === "owner" && Object.values(config.admins).filter(r => r === "owner").length === 1)) {
-                return await tg.send(chatId, "❌ Нельзя удалить единственного главного владельца.");
-            }
-            delete config.admins[delAdminId];
-            await saveConfig(env, config);
-            await tg.send(chatId, `✅ Пользователь <code>${delAdminId}</code> удален из админов.`);
-            break;
-        }
-
-        case "/admins": {
-            let admTxt = "👥 <b>Администраторы:</b>\n\n";
-            for (const [id, role] of Object.entries(config.admins || {})) {
-                let roleIcon = role === "owner" ? "👑" : (role === "tech" ? "⚙️" : "🎨");
-                admTxt += `${roleIcon} ID: <code>${id}</code> — <b>${role}</b>\n`;
-            }
-            await tg.send(chatId, admTxt);
-            break;
-        }
 
         case "/setgroup":
             config.groupId = chatId; await saveConfig(env, config);
@@ -714,7 +643,7 @@ async function handleCommand(msg, env) {
         case "/setprompt":
             if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема1; тема2&gt;");
             config.generalPrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ Промпт сохранен. Темы будут выбираться случайно, если разделены ";"\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n💡 Для LoRA используй <code>{id:сила}</code> прямо в промпте. Для отключения LLM пиши <code>{nollm}</code>`);
+            await tg.send(chatId, `✅ Промпт сохранен. Темы будут выбираться случайно, если разделены ";"\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n💡 Для отключения ИИ добавьте в промпт <code>{-llm}</code>\n💡 Для LoRA используй <code>{id:сила}</code> прямо в промпте`);
             break;
 
         case "/setcontext":
@@ -769,7 +698,7 @@ async function handleCommand(msg, env) {
                     config.watermarkData = bufferToBase64(arrayBuffer);
                     config.watermarkPosition = params[0] || "random";
                     await saveConfig(env, config);
-                    await tg.send(chatId, `✅ Водяной знак сохранен и будет склеиваться с картинками автоматически! Позиция: ${config.watermarkPosition}`);
+                    await tg.send(chatId, `✅ Водяной знак сохранен и будет накладываться!\nПозиция: ${config.watermarkPosition}\n\n⚠️ <b>Важно:</b> Убедитесь, что в панели Cloudflare (Security -> Bots) отключен "Bot Fight Mode", иначе сервер наложения не сможет скачать вотермарку!`);
                 } else {
                     await tg.send(chatId, `❌ Ошибка API Telegram: ${fileReq.description}`);
                 }
@@ -1005,16 +934,17 @@ async function handleCommand(msg, env) {
                     try {
                         const segment = getRandomPromptSegment(config.generalPrompt);
 
-                        const { cleanPrompt, extraLoras, excludedLoras, skipLlm } = parsePromptLoras(segment);
+                        const { cleanPrompt, extraLoras, excludedLoras, disableLlm } = parsePromptLoras(segment);
                         const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
 
-                        const finalPrompt = await generatePrompt(cleanPrompt, env, config, skipLlm);
+                        // Отключение ИИ по запросу из скобок
+                        const finalPrompt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config);
                         const bestRes = await determineResolution(finalPrompt, env, config);
 
                         const loraInfo = lorasOverride.length > 0
                             ? `\n🎨 LoRA: ${lorasOverride.map(l => `${l.name}(${l.strength})`).join(', ')}`
                             : '';
-                        const llmStatus = skipLlm ? "\n🤖 LLM: Отключен (nollm)" : "";
+                        const llmStatus = disableLlm ? "\n🤖 LLM: 🔴 Отключен" : "";
 
                         await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 300))}</code>\n📏 Резолюция: ${bestRes.width}x${bestRes.height}${loraInfo}${llmStatus}`);
 
@@ -1054,12 +984,7 @@ async function handleCommand(msg, env) {
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
             const globalLoras = (config.loras || []).filter(l => l.global !== false);
             const manualLoras = (config.loras || []).filter(l => l.global === false);
-            
-            // Заворачиваем промпты в сворачиваемые цитаты:
-            const safeGenPrompt = config.generalPrompt ? escapeHtml(config.generalPrompt) : "Не задан";
-            const safeNegPrompt = config.negativePrompt ? escapeHtml(config.negativePrompt) : "Не задан";
-
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпт:</b>\n<blockquote expandable><code>${safeGenPrompt}</code></blockquote>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<blockquote expandable><code>${safeNegPrompt}</code></blockquote>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпт:</b>\n<code>${escapeHtml(config.generalPrompt)}</code>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1230,22 +1155,19 @@ async function processScheduled(env) {
                                     for (const b64 of batch.ready) {
                                         let targetUrl = b64;
                                         let isUrl = isHttpUrl(targetUrl);
+                                        if (isUrl) {
+                                            targetUrl = await getWatermarkedUrl(b64, config, env);
+                                        }
+
                                         let buf = null;
-
-                                        if (!isUrl && config.watermarkData) {
-                                            const tempBuf = base64ToBuffer(b64);
-                                            const tUrl = tempBuf ? await uploadToTelegraph(tempBuf) : null;
-                                            if (tUrl) { targetUrl = tUrl; isUrl = true; }
-                                        }
-
-                                        if (isUrl && config.watermarkData) {
-                                            targetUrl = await getWatermarkedUrl(targetUrl, config, env);
-                                        }
-
                                         if (isUrl) {
                                             buf = await downloadImage(targetUrl);
-                                            if (!buf && isHttpUrl(b64)) buf = await downloadImage(b64);
+                                            if (!buf && targetUrl !== b64) {
+                                                if (batch.notify) await tg.send(batch.notify, `⚠️ Сбой вотермарки в батче. Отправляю оригинал.`);
+                                                buf = await downloadImage(b64);
+                                            }
                                         } else {
+                                            if (config.watermarkData && batch.notify) await tg.send(batch.notify, `ℹ️ Вотермарка пропущена: получена Base64 картинка.`);
                                             buf = base64ToBuffer(b64);
                                         }
 
@@ -1293,21 +1215,17 @@ async function processScheduled(env) {
                     for (const b64 of batch.ready) {
                         let targetUrl = b64;
                         let isUrl = isHttpUrl(targetUrl);
+                        if (isUrl) {
+                            targetUrl = await getWatermarkedUrl(b64, config, env);
+                        }
+
                         let buf = null;
-
-                        if (!isUrl && config.watermarkData) {
-                            const tempBuf = base64ToBuffer(b64);
-                            const tUrl = tempBuf ? await uploadToTelegraph(tempBuf) : null;
-                            if (tUrl) { targetUrl = tUrl; isUrl = true; }
-                        }
-
-                        if (isUrl && config.watermarkData) {
-                            targetUrl = await getWatermarkedUrl(targetUrl, config, env);
-                        }
-
                         if (isUrl) {
                             buf = await downloadImage(targetUrl);
-                            if (!buf && isHttpUrl(b64)) buf = await downloadImage(b64);
+                            if (!buf && targetUrl !== b64) {
+                                if (batch.notify) await tg.send(batch.notify, `⚠️ Сбой вотермарки. Отправляю оригинал.`);
+                                buf = await downloadImage(b64);
+                            }
                         } else {
                             buf = base64ToBuffer(b64);
                         }
@@ -1337,18 +1255,17 @@ async function processScheduled(env) {
     const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
     const actualCount = getActualCount(config.count);
 
-    const ownerId = Object.keys(config.admins || {}).find(id => config.admins[id] === "owner") || config.adminId;
-
-    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: ownerId, prompt: "" }, { expirationTtl: 3600 });
+    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: 3600 });
 
     for (let i = 0; i < actualCount; i++) {
         try {
             const segment = getRandomPromptSegment(config.generalPrompt);
 
-            const { cleanPrompt, extraLoras, excludedLoras, skipLlm } = parsePromptLoras(segment);
+            const { cleanPrompt, extraLoras, excludedLoras, disableLlm } = parsePromptLoras(segment);
             const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
 
-            const prmpt = await generatePrompt(cleanPrompt, env, config, skipLlm);
+            // Отключение LLM, если указано
+            const prmpt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config);
             const bestRes = await determineResolution(prmpt, env, config);
             const res = await hordeSubmit(prmpt, config, env, {
                 workerBlacklist: bl,
@@ -1362,19 +1279,19 @@ async function processScheduled(env) {
                     targets,
                     prompt: prmpt,
                     at: now,
-                    notify: ownerId,
+                    notify: config.adminId,
                     retries: 0,
                     batchId,
                     lorasOverride
                 }, { expirationTtl: 3600 });
                 queuedCount++;
             } else {
-                if (ownerId) await tg.send(ownerId, `❌ <b>Ошибка автогенерации (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
+                if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
                 let batch = await KV.get(env, `batch:${batchId}`, "json");
                 if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
             }
         } catch (e) {
-            if (ownerId) await tg.send(ownerId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
+            if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
             let batch = await KV.get(env, `batch:${batchId}`, "json");
             if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
         }
