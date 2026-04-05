@@ -56,7 +56,7 @@ NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive promp
 // Default LLM model on Stable Horde (uncensored, high quality)
 const DEFAULT_LLM_MODEL = "MythoMax-L2-13B";
 
-const HORDE_API = "https://stablehorde.net/api/v2";
+const HORDE_API = "https://aihorde.net/api/v2";
 const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.1:tg" };
 const MIN_IMAGE_KB = 10;
 
@@ -327,26 +327,26 @@ function getRandomPromptSegment(generalPrompt) {
 
 // LLM Timeout Logic
 async function checkLlmStatus(env) {
-    const timeout = await KV.get(env, "llm_timeout");
+    const timeout = await KV.get(env, "llm_lock_time");
     if (timeout && Date.now() < parseInt(timeout)) return false;
     return true;
 }
 
 async function recordLlmFailure(env) {
-    let fails = parseInt(await KV.get(env, "llm_fails") || "0");
+    let fails = parseInt(await KV.get(env, "llm_fail_count") || "0");
     fails++;
     if (fails >= 3) {
-        await KV.put(env, "llm_timeout", String(Date.now() + 3600000)); // 1 hour
-        await KV.put(env, "llm_fails", "0");
+        await KV.put(env, "llm_lock_time", String(Date.now() + 3600000)); // 1 hour
+        await KV.put(env, "llm_fail_count", "0");
         console.error("[LLM] 3 failures reached, entering 1 hour timeout.");
     } else {
-        await KV.put(env, "llm_fails", String(fails));
+        await KV.put(env, "llm_fail_count", String(fails));
     }
 }
 
 async function recordLlmSuccess(env) {
-    await KV.put(env, "llm_fails", "0");
-    await KV.del(env, "llm_timeout");
+    await KV.put(env, "llm_fail_count", "0");
+    await KV.del(env, "llm_lock_time");
 }
 
 // ─── Horde LLM (text generation) ────────────────────────────────────────────
@@ -381,17 +381,14 @@ async function callHordeLLM(env, model, messages, maxTokens = 400) {
                 prompt,
                 params: {
                     max_length: Math.min(maxTokens, 512),
-                    max_context_length: 4096,
+                    max_context_length: 2048,
                     temperature: 0.7,
                     top_p: 0.9,
                     top_k: 0,
-                    n: 1,
                     stop_sequence: ["###", "\n\n\n", "### Instruction"]
                 },
                 models: [llmModel],
-                nsfw: true,
-                trusted_workers: false,
-                slow_workers: true
+                trusted_workers: false
             })
         });
 
@@ -470,8 +467,7 @@ async function hordeSubmitInterrogate(imageBase64, env) {
                 forms: [
                     { name: "caption" },
                     { name: "interrogation" }
-                ],
-                slow_workers: true
+                ]
             })
         });
         if (!res.ok) {
