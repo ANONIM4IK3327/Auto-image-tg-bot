@@ -18,6 +18,7 @@ const DEFAULT_CONFIG = {
     sampler: "k_dpmpp_2m",
     nsfw: true,
     negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
+    llmEnabled: true, // Global LLM toggle
     llmModel: "openrouter/free",
     clipSkip: 2,
     hiresFix: false,
@@ -53,7 +54,7 @@ HYBRID STYLE: Blend short tags with natural-language phrases for complex actions
 NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive prompt.`;
 
 const HORDE_API = "https://stablehorde.net/api/v2";
-const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.0:tg" };
+const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.1:tg" };
 const MIN_IMAGE_KB = 10;
 
 function escapeHtml(text) {
@@ -102,6 +103,7 @@ function parsePromptLoras(prompt) {
     const extraLoras = [];
     const excludedLoras = [];
     let disableLlm = false;
+    let modelOverride = null;
 
     // Глобальный поиск всех блоков {}
     const regex = /\{([^}]*)\}/g;
@@ -115,6 +117,8 @@ function parsePromptLoras(prompt) {
             const lower = part.toLowerCase();
             if (lower === '-llm' || lower === 'nollm') {
                 disableLlm = true;
+            } else if (lower.startsWith('model:')) {
+                modelOverride = part.substring(6).trim();
             } else if (part.startsWith('-')) {
                 excludedLoras.push(part.substring(1).trim());
             } else {
@@ -127,7 +131,7 @@ function parsePromptLoras(prompt) {
         }
     }
     cleanPrompt = cleanPrompt.replace(/\s{2,}/g, ' ').trim();
-    return { cleanPrompt, extraLoras, excludedLoras, disableLlm };
+    return { cleanPrompt, extraLoras, excludedLoras, disableLlm, modelOverride };
 }
 
 function buildLorasForRequest(config, extraLoras = [], excludedLoras = []) {
@@ -145,20 +149,21 @@ function getUserRole(userId, config) {
 
 function checkAccess(role, cmd) {
     if (role === "admin") return true;
-    
+
     const creatorCmds = [
         "/addprompt", "/delprompt", "/promptlist", "/setprompt", 
-        "/setcontext", "/addlora", "/listloras", "/clearloras", 
+        "/setcontext", "/addlora", "/listloras", "/clearloras", "/dellora",
         "/setneg", "/generate", "/help", "/start", "/ping",
         "/setwatermark", "/delwatermark"
     ];
-    
+
     const techCmds = [
         "/status", "/pending", "/cancel", "/workerbl", "/ping", 
         "/listmodels", "/searchmodel", "/setenhancer", "/setsize", 
-        "/setsteps", "/setcfg", "/setsampler", "/help", "/start"
+        "/setsteps", "/setcfg", "/setsampler", "/help", "/start",
+        "/togglellm", "/setllm", "/settokens", "/setcaptionmode", "/setcaptionprompt"
     ];
-    
+
     if (role === "creator") return creatorCmds.includes(cmd);
     if (role === "tech") return techCmds.includes(cmd);
     return false;
@@ -316,7 +321,33 @@ function getRandomPromptSegment(generalPrompt) {
     return segments[Math.floor(Math.random() * segments.length)];
 }
 
+// LLM Timeout Logic
+async function checkLlmStatus(env) {
+    const timeout = await KV.get(env, "llm_timeout");
+    if (timeout && Date.now() < parseInt(timeout)) return false; 
+    return true;
+}
+
+async function recordLlmFailure(env) {
+    let fails = parseInt(await KV.get(env, "llm_fails") || "0");
+    fails++;
+    if (fails >= 3) {
+        await KV.put(env, "llm_timeout", String(Date.now() + 3600000)); // 1 hour
+        await KV.put(env, "llm_fails", "0");
+        console.error("[LLM] 3 failures reached, entering 1 hour timeout.");
+    } else {
+        await KV.put(env, "llm_fails", String(fails));
+    }
+}
+
+async function recordLlmSuccess(env) {
+    await KV.put(env, "llm_fails", "0");
+    await KV.del(env, "llm_timeout");
+}
+
 async function callOpenRouter(env, model, messages, maxTokens = 8000, retries = 2) {
+    if (!(await checkLlmStatus(env))) return null;
+
     let lastErr = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
@@ -350,7 +381,10 @@ async function callOpenRouter(env, model, messages, maxTokens = 8000, retries = 
             }
 
             const text = data.choices?.[0]?.message?.content?.trim();
-            if (text && text.length > 3) return text;
+            if (text && text.length > 3) {
+                await recordLlmSuccess(env);
+                return text;
+            }
 
             lastErr = "Empty response from model";
         } catch (e) {
@@ -360,17 +394,23 @@ async function callOpenRouter(env, model, messages, maxTokens = 8000, retries = 
         }
     }
     console.error("[LLM] All attempts failed:", lastErr);
+    await recordLlmFailure(env);
     return null;
 }
 
 async function determineResolution(prompt, env, config) {
-    const presets = [[1024, 1024], [832, 1216], [1216, 832], [768, 1344]];
-    if (!env.OPENROUTER_API_KEY) {
+    // Расширенные пресеты SDXL
+    const presets = [
+        [1024, 1024], [1152, 896], [896, 1152], 
+        [1216, 832], [832, 1216], [1344, 768], 
+        [768, 1344], [1536, 640]
+    ];
+    if (!env.OPENROUTER_API_KEY || !config.llmEnabled) {
         const r = presets[Math.floor(Math.random() * presets.length)];
         return { width: r[0], height: r[1] };
     }
     try {
-        const sysPrompt = "You are an AI choosing aspect ratios. Read the prompt and output ONLY one of these exact strings based on what visually fits best: '1024x1024' (Square), '832x1216' (Portrait/Characters), '1216x832' (Landscape/Scenery), or '768x1344' (Cinematic/Tall). NO explanations, NO markdown.";
+        const sysPrompt = "You are an AI choosing aspect ratios. Read the prompt and output ONLY one of these exact strings based on what visually fits best: '1024x1024' (Square), '1152x896' (Slight Landscape), '896x1152' (Slight Portrait), '1216x832' (Landscape), '832x1216' (Portrait), '1344x768' (Widescreen), '768x1344' (Tall), '1536x640' (Cinematic). NO explanations, NO markdown.";
         const result = await callOpenRouter(env, config.llmModel || "openrouter/free", [
             { role: "system", content: sysPrompt },
             { role: "user", content: `Prompt: ${prompt}` }
@@ -379,9 +419,13 @@ async function determineResolution(prompt, env, config) {
         if (result) {
             const clean = result.replace(/['"`]/g, '').trim().toLowerCase();
             if (clean.includes("1024x1024")) return { width: 1024, height: 1024 };
-            if (clean.includes("832x1216")) return { width: 832, height: 1216 };
+            if (clean.includes("1152x896")) return { width: 1152, height: 896 };
+            if (clean.includes("896x1152")) return { width: 896, height: 1152 };
             if (clean.includes("1216x832")) return { width: 1216, height: 832 };
+            if (clean.includes("832x1216")) return { width: 832, height: 1216 };
+            if (clean.includes("1344x768")) return { width: 1344, height: 768 };
             if (clean.includes("768x1344")) return { width: 768, height: 1344 };
+            if (clean.includes("1536x640")) return { width: 1536, height: 640 };
         }
     } catch (e) { console.error("[LLM Resolution error]", e); }
 
@@ -390,7 +434,8 @@ async function determineResolution(prompt, env, config) {
 }
 
 async function generatePrompt(basePrompt, env, config) {
-    if (!env.OPENROUTER_API_KEY) return basePrompt;
+    if (!env.OPENROUTER_API_KEY || !config.llmEnabled) return basePrompt;
+    
     const llmModel = config.llmModel || "openrouter/free";
     let sysPrompt, userPrompt;
     const match = basePrompt.match(/\[([\s\S]*?)\]/);
@@ -424,7 +469,8 @@ async function generatePrompt(basePrompt, env, config) {
 }
 
 async function generateAiCaption(imagePrompt, env, config) {
-    if (!env.OPENROUTER_API_KEY) return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 900))}</i>`;
+    if (!env.OPENROUTER_API_KEY || !config.llmEnabled) return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 900))}</i>`;
+    
     const result = await callOpenRouter(env, config.llmModel || "openrouter/free", [
         { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
         { role: "user", content: `Промпт картинки: ${imagePrompt.substring(0, 1000)}` }
@@ -483,7 +529,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         censor_nsfw: false,
         trusted_workers: false,
         replacement_filter: false,
-        models: [config.model],
+        models: [extra.modelOverride || config.model],
         r2: true,
         shared: false,
         allow_downgrade: true
@@ -552,7 +598,8 @@ async function getWatermarkedUrl(imgUrl, config, env) {
         markpos = config.watermarkPosition || "southeast";
     }
 
-    return `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&mark=${encodeURIComponent(wmUrl)}&markpos=${markpos}&markpad=5&output=webp`;
+    // Добавил &we для страховки форматов
+    return `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&mark=${encodeURIComponent(wmUrl)}&markpos=${markpos}&markpad=5&we&output=webp`;
 }
 
 async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env) {
@@ -569,9 +616,9 @@ async function deliverImage(tg, chatId, imgData, caption, notifyId, config, env)
     if (isUrl) {
         targetUrl = await getWatermarkedUrl(imgData, config, env);
         buffer = await downloadImage(targetUrl);
-        
+
         if (!buffer && targetUrl !== imgData) {
-            if (notifyId) await tg.send(notifyId, `⚠️ <b>Сбой наложения вотермарки</b> (wsrv.nl не ответил). Отправлен оригинал.`);
+            if (notifyId) await tg.send(notifyId, `⚠️ <b>Сбой наложения вотермарки</b> (wsrv.nl не ответил/отклонил). Отправлен оригинал.`);
             buffer = await downloadImage(imgData);
         }
 
@@ -623,7 +670,7 @@ async function handleCommand(msg, env) {
     const params = args.slice(1);
 
     let config = await getConfig(env);
-    
+
     // Auto-assign first user as admin
     if (!config.adminId) {
         config.adminId = userId;
@@ -632,7 +679,7 @@ async function handleCommand(msg, env) {
     }
 
     const userRole = getUserRole(userId, config);
-    
+
     if (!userRole || !checkAccess(userRole, cmd)) {
         return await tg.send(chatId, `🔒 У тебя (роль: <b>${userRole || "нет прав"}</b>) нет доступа к команде ${cmd}.`);
     }
@@ -640,7 +687,7 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\nВаша роль: <b>${userRole}</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate\n\n<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n\n<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ (OpenRouter) для промпта\n\n<b>Роли:</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin|none&gt;\n\n<b>Остальное:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /setllm &lt;model&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\nВаша роль: <b>${userRole}</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate [номер]\n\n<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n\n<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ (OpenRouter) для промпта\n\n<b>Роли:</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin|none&gt;\n\n<b>Остальное:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /togglellm | /setllm &lt;model&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
 
         case "/setrole": {
@@ -662,9 +709,16 @@ async function handleCommand(msg, env) {
             break;
         }
 
+        case "/togglellm": {
+            config.llmEnabled = !config.llmEnabled;
+            await saveConfig(env, config);
+            await tg.send(chatId, `🤖 Глобальный ИИ (LLM): ${config.llmEnabled ? "🟢 ВКЛЮЧЕН" : "🔴 ВЫКЛЮЧЕН"}`);
+            break;
+        }
+
         case "/ping":
             const key = getApiKey(env);
-            return await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "❌"}`);
+            return await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "❌"} (Глобально: ${config.llmEnabled ? "🟢" : "🔴"})`);
 
         case "/setgroup":
             config.groupId = chatId; await saveConfig(env, config);
@@ -926,6 +980,18 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, "✅ Список LoRA очищен");
             break;
 
+        case "/dellora": {
+            if (!params.length) return await tg.send(chatId, "❌ Использование: /dellora <номер>");
+            const idx = parseInt(params[0]) - 1;
+            if (!config.loras || isNaN(idx) || idx < 0 || idx >= config.loras.length) {
+                return await tg.send(chatId, "❌ Неверный номер LoRA. Посмотри список: /listloras");
+            }
+            const removed = config.loras.splice(idx, 1);
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ Успешно удалена LoRA: <b>${escapeHtml(removed[0].name)}</b>`);
+            break;
+        }
+
         case "/setsampler":
             if (!params[0]) return await tg.send(chatId, "❌ /setsampler &lt;имя&gt;");
             config.sampler = params[0]; await saveConfig(env, config);
@@ -1022,6 +1088,17 @@ async function handleCommand(msg, env) {
         case "/generate":
             if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала добавь промпт (/addprompt)");
 
+            let targetPromptSegment = null;
+            if (params.length > 0 && !isNaN(parseInt(params[0]))) {
+                const idx = parseInt(params[0]) - 1;
+                const prompts = config.generalPrompt.split(';').map(p=>p.trim()).filter(Boolean);
+                if (idx >= 0 && idx < prompts.length) {
+                    targetPromptSegment = prompts[idx];
+                } else {
+                    return await tg.send(chatId, `❌ Неверный номер промпта. Всего: ${prompts.length}`);
+                }
+            }
+
             const actualCount = getActualCount(config.count);
             await tg.send(chatId, `⏳ Генерирую ${actualCount} фото... (Обработка Batch)`);
 
@@ -1034,9 +1111,9 @@ async function handleCommand(msg, env) {
 
                 for (let i = 0; i < actualCount; i++) {
                     try {
-                        const segment = getRandomPromptSegment(config.generalPrompt);
+                        const segment = targetPromptSegment !== null ? targetPromptSegment : getRandomPromptSegment(config.generalPrompt);
 
-                        const { cleanPrompt, extraLoras, excludedLoras, disableLlm } = parsePromptLoras(segment);
+                        const { cleanPrompt, extraLoras, excludedLoras, disableLlm, modelOverride } = parsePromptLoras(segment);
                         const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
 
                         const finalPrompt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config);
@@ -1045,16 +1122,19 @@ async function handleCommand(msg, env) {
                         const loraInfo = lorasOverride.length > 0
                             ? `\n🎨 LoRA: ${lorasOverride.map(l => `${l.name}(${l.strength})`).join(', ')}`
                             : '';
-                        const llmStatus = disableLlm ? "\n🤖 LLM: 🔴 Отключен" : "";
+                        const llmStatus = (disableLlm || !config.llmEnabled) ? "\n🤖 LLM: 🔴 Отключен" : "";
+                        const modelInfo = modelOverride ? `\n🧠 Модель (override): ${modelOverride}` : "";
 
-                        await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 3500))}</code>\n📏 Резолюция: ${bestRes.width}x${bestRes.height}${loraInfo}${llmStatus}`);
+                        await tg.send(chatId, `🎨 #${i + 1}:\n<code>${escapeHtml(finalPrompt.substring(0, 3500))}</code>\n📏 Разрешение: ${bestRes.width}x${bestRes.height}${loraInfo}${llmStatus}${modelInfo}`);
 
                         const res = await hordeSubmit(finalPrompt, config, env, {
                             workerBlacklist: bl,
                             width: bestRes.width,
                             height: bestRes.height,
-                            lorasOverride
+                            lorasOverride,
+                            modelOverride
                         });
+                        
                         if (res.id) {
                             await KV.put(env, `pending:${res.id}`, {
                                 targets,
@@ -1063,7 +1143,8 @@ async function handleCommand(msg, env) {
                                 notify: chatId,
                                 retries: 0,
                                 batchId,
-                                lorasOverride
+                                lorasOverride,
+                                modelOverride
                             }, { expirationTtl: 3600 });
                         } else {
                             await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
@@ -1074,6 +1155,10 @@ async function handleCommand(msg, env) {
                         await tg.send(chatId, `❌ Ошибка: ${e.message}`);
                         let batch = await KV.get(env, `batch:${batchId}`, "json");
                         if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
+                    }
+                    
+                    if (i < actualCount - 1) {
+                        await new Promise(r => setTimeout(r, 2000)); // Защита от 429 Too Many Requests
                     }
                 }
             }
@@ -1086,8 +1171,9 @@ async function handleCommand(msg, env) {
             const globalLoras = (config.loras || []).filter(l => l.global !== false);
             const manualLoras = (config.loras || []).filter(l => l.global === false);
             const promptsCount = config.generalPrompt ? config.generalPrompt.split(';').filter(Boolean).length : 0;
-            
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(см. /promptlist)</i>\n\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            const llmState = config.llmEnabled ? "🟢 ВКЛ" : "🔴 ВЫКЛ";
+
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(см. /promptlist)</i>\n\n<b>Глобальный ИИ:</b> ${llmState}\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1221,7 +1307,8 @@ async function processScheduled(env) {
                     const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
                     const newRes = await hordeSubmit(task.prompt, config, env, {
                         workerBlacklist: bl,
-                        lorasOverride: task.lorasOverride
+                        lorasOverride: task.lorasOverride,
+                        modelOverride: task.modelOverride
                     });
                     if (newRes.id) {
                         await KV.put(env, `pending:${newRes.id}`, { ...task, at: Date.now(), retries }, { expirationTtl: 3600 });
@@ -1364,7 +1451,7 @@ async function processScheduled(env) {
         try {
             const segment = getRandomPromptSegment(config.generalPrompt);
 
-            const { cleanPrompt, extraLoras, excludedLoras, disableLlm } = parsePromptLoras(segment);
+            const { cleanPrompt, extraLoras, excludedLoras, disableLlm, modelOverride } = parsePromptLoras(segment);
             const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
 
             const prmpt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config);
@@ -1373,7 +1460,8 @@ async function processScheduled(env) {
                 workerBlacklist: bl,
                 width: bestRes.width,
                 height: bestRes.height,
-                lorasOverride
+                lorasOverride,
+                modelOverride
             });
 
             if (res.id) {
@@ -1384,7 +1472,8 @@ async function processScheduled(env) {
                     notify: config.adminId,
                     retries: 0,
                     batchId,
-                    lorasOverride
+                    lorasOverride,
+                    modelOverride
                 }, { expirationTtl: 3600 });
                 queuedCount++;
             } else {
@@ -1396,6 +1485,10 @@ async function processScheduled(env) {
             if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
             let batch = await KV.get(env, `batch:${batchId}`, "json");
             if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
+        }
+        
+        if (i < actualCount - 1) {
+            await new Promise(r => setTimeout(r, 2000));
         }
     }
 
@@ -1420,7 +1513,9 @@ export default {
                     return new Response(buf, {
                         headers: {
                             "Content-Type": "image/png",
-                            "Cache-Control": "public, max-age=31536000"
+                            "Cache-Control": "public, max-age=31536000",
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS"
                         }
                     });
                 }
