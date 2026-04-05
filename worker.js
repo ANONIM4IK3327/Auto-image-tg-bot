@@ -19,7 +19,7 @@ const DEFAULT_CONFIG = {
     nsfw: true,
     negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
     llmEnabled: true, // Global LLM toggle
-    llmModel: "aphrodite/Sao10K/L3-8B-Stheno-v3.2", // Smart uncensored text model on Horde
+    llmModel: "MythoMax-L2-13B", // Horde text model
     clipSkip: 2,
     hiresFix: false,
     hiresFixDenoising: 0.65,
@@ -52,6 +52,9 @@ EXPLICIT CONTENT RULES: When content is 18+, use rating_explicit and apply preci
 HYBRID STYLE: Blend short tags with natural-language phrases for complex actions. Example: "1girl, removing teal sweater, bare shoulders visible, black miniskirt, sitting on gaming chair in dimly-lit PC cafe, neon monitor glow on skin, subsurface scattering, cinematic shadows"
 
 NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive prompt.`;
+
+// Default LLM model on Stable Horde (uncensored, high quality)
+const DEFAULT_LLM_MODEL = "MythoMax-L2-13B";
 
 const HORDE_API = "https://stablehorde.net/api/v2";
 const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.1:tg" };
@@ -151,17 +154,18 @@ function checkAccess(role, cmd) {
     if (role === "admin") return true;
 
     const creatorCmds = [
-        "/addprompt", "/delprompt", "/promptlist", "/setprompt", 
+        "/addprompt", "/delprompt", "/promptlist", "/setprompt",
         "/setcontext", "/addlora", "/listloras", "/clearloras", "/dellora",
         "/setneg", "/generate", "/help", "/start", "/ping",
         "/setwatermark", "/delwatermark", "/img2txt"
     ];
 
     const techCmds = [
-        "/status", "/pending", "/cancel", "/workerbl", "/ping", 
-        "/listmodels", "/searchmodel", "/setenhancer", "/setsize", 
+        "/status", "/pending", "/cancel", "/workerbl", "/ping",
+        "/listmodels", "/searchmodel", "/setenhancer", "/setsize",
         "/setsteps", "/setcfg", "/setsampler", "/help", "/start",
-        "/togglellm", "/setllm", "/settokens", "/setcaptionmode", "/setcaptionprompt"
+        "/togglellm", "/setllm", "/settokens", "/setcaptionmode", "/setcaptionprompt",
+        "/img2txt"
     ];
 
     if (role === "creator") return creatorCmds.includes(cmd);
@@ -269,11 +273,7 @@ const KV = {
 
 async function getConfig(env) {
     const data = await KV.get(env, "config", "json");
-    const merged = { ...DEFAULT_CONFIG, ...(data || {}) };
-    if (merged.llmModel === "openrouter/free") {
-        merged.llmModel = DEFAULT_CONFIG.llmModel; // migrate old configs
-    }
-    return merged;
+    return { ...DEFAULT_CONFIG, ...(data || {}) };
 }
 
 async function saveConfig(env, config) {
@@ -328,7 +328,7 @@ function getRandomPromptSegment(generalPrompt) {
 // LLM Timeout Logic
 async function checkLlmStatus(env) {
     const timeout = await KV.get(env, "llm_timeout");
-    if (timeout && Date.now() < parseInt(timeout)) return false; 
+    if (timeout && Date.now() < parseInt(timeout)) return false;
     return true;
 }
 
@@ -349,12 +349,28 @@ async function recordLlmSuccess(env) {
     await KV.del(env, "llm_timeout");
 }
 
-async function callHordeText(env, model, prompt, maxTokens = 800) {
+// ─── Horde LLM (text generation) ────────────────────────────────────────────
+// Replaces OpenRouter. Uses MythoMax-L2-13B (uncensored) by default.
+// Messages format is kept identical to OpenAI-style for drop-in replacement.
+async function callHordeLLM(env, model, messages, maxTokens = 400) {
     if (!(await checkLlmStatus(env))) return null;
 
+    // Normalize model — handle legacy openrouter-style names
+    let llmModel = (model || DEFAULT_LLM_MODEL).trim();
+    if (!llmModel || llmModel.includes("/")) llmModel = DEFAULT_LLM_MODEL;
+
+    // Build Alpaca-style prompt that works with MythoMax and most Llama2 fine-tunes
+    const systemMsg = messages.find(m => m.role === "system")?.content || "";
+    const userMsg   = messages.find(m => m.role === "user")?.content   || "";
+
+    const prompt = systemMsg
+        ? `### Instruction:\n${systemMsg}\n\n### Input:\n${userMsg}\n\n### Response:\n`
+        : `### Instruction:\n${userMsg}\n\n### Response:\n`;
+
     const key = getApiKey(env);
+
     try {
-        const res = await fetch(`${HORDE_API}/generate/text/async`, {
+        const submitRes = await fetch(`${HORDE_API}/generate/text/async`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -362,78 +378,145 @@ async function callHordeText(env, model, prompt, maxTokens = 800) {
                 ...HORDE_HEADERS
             },
             body: JSON.stringify({
-                prompt: prompt,
+                prompt,
                 params: {
-                    max_context_length: 2048,
-                    max_length: maxTokens,
-                    temperature: 0.7
+                    max_length: Math.min(maxTokens, 512),
+                    max_context_length: 4096,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    top_k: 0,
+                    n: 1,
+                    stop_sequence: ["###", "\n\n\n", "### Instruction"]
                 },
-                models: model ? [model] : []
+                models: [llmModel],
+                nsfw: true,
+                trusted_workers: false,
+                slow_workers: true
             })
         });
 
-        if (!res.ok) {
-            const errBody = await res.text();
-            console.error(`[LLM] Horde text request failed:`, errBody.substring(0, 200));
+        if (!submitRes.ok) {
+            const errText = await submitRes.text();
+            console.error("[HordeLLM] Submit error:", submitRes.status, errText.substring(0, 200));
             await recordLlmFailure(env);
             return null;
         }
 
-        const data = await res.json();
-        const id = data.id;
-        if (!id) return null;
-
-        // Poll for up to 15 seconds so we don't break the CF Worker 30s execution limit
-        const start = Date.now();
-        while (Date.now() - start < 15000) {
-            await new Promise(r => setTimeout(r, 2000));
-            const checkRes = await fetch(`${HORDE_API}/generate/text/status/${id}`, {
-                headers: HORDE_HEADERS
-            });
-            if (!checkRes.ok) continue;
-            const checkData = await checkRes.json();
-
-            if (checkData.done) {
-                if (checkData.generations && checkData.generations.length > 0) {
-                    await recordLlmSuccess(env);
-                    return checkData.generations[0].text.trim();
-                }
-                break;
-            }
-            if (checkData.faulted) break;
+        const submitData = await submitRes.json();
+        if (!submitData.id) {
+            console.error("[HordeLLM] No ID in response:", JSON.stringify(submitData).substring(0, 200));
+            await recordLlmFailure(env);
+            return null;
         }
-        
+
+        const jobId = submitData.id;
+        const maxWait = 22000; // 22 seconds max wait
+        const pollInterval = 2500;
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < maxWait) {
+            await new Promise(r => setTimeout(r, pollInterval));
+            try {
+                const statusRes = await fetch(`${HORDE_API}/generate/text/status/${jobId}`, {
+                    headers: HORDE_HEADERS
+                });
+                if (!statusRes.ok) continue;
+
+                const statusData = await statusRes.json();
+
+                if (statusData.faulted) {
+                    console.error("[HordeLLM] Job faulted:", jobId);
+                    await recordLlmFailure(env);
+                    return null;
+                }
+
+                if (statusData.done && statusData.generations?.length > 0) {
+                    const text = statusData.generations[0].text?.trim();
+                    if (text && text.length > 3) {
+                        await recordLlmSuccess(env);
+                        return text.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
+                    }
+                    break;
+                }
+            } catch (e) {
+                console.error("[HordeLLM] Poll error:", e.message);
+            }
+        }
+
+        console.error("[HordeLLM] Timeout for job:", jobId);
         await recordLlmFailure(env);
-        return null; // timeout or fault
+        return null;
+
     } catch (e) {
-        console.error(`[LLM] Horde Text exception:`, e.message);
+        console.error("[HordeLLM] Exception:", e.message);
         await recordLlmFailure(env);
         return null;
     }
 }
 
+// ─── Horde Interrogation (IMG2TXT) ───────────────────────────────────────────
+async function hordeSubmitInterrogate(imageBase64, env) {
+    const key = getApiKey(env);
+    try {
+        const res = await fetch(`${HORDE_API}/interrogate/async`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                apikey: key,
+                ...HORDE_HEADERS
+            },
+            body: JSON.stringify({
+                source_image: imageBase64,
+                forms: [
+                    { name: "caption" },
+                    { name: "interrogation" }
+                ],
+                slow_workers: true
+            })
+        });
+        if (!res.ok) {
+            console.error("[Interrogate] Submit error:", res.status, (await res.text()).substring(0, 200));
+            return null;
+        }
+        const data = await res.json();
+        return data.id || null;
+    } catch (e) {
+        console.error("[Interrogate] Exception:", e.message);
+        return null;
+    }
+}
+
+async function hordeGetInterrogation(id) {
+    try {
+        const res = await fetch(`${HORDE_API}/interrogate/status/${id}`, {
+            headers: HORDE_HEADERS
+        });
+        if (!res.ok) return null;
+        return await res.json();
+    } catch (e) {
+        return null;
+    }
+}
+
 async function determineResolution(prompt, env, config) {
-    // Расширенные пресеты SDXL
     const presets = [
-        [1024, 1024], [1152, 896], [896, 1152], 
-        [1216, 832], [832, 1216], [1344, 768], 
+        [1024, 1024], [1152, 896], [896, 1152],
+        [1216, 832], [832, 1216], [1344, 768],
         [768, 1344], [1536, 640]
     ];
     if (!config.llmEnabled) {
         const r = presets[Math.floor(Math.random() * presets.length)];
         return { width: r[0], height: r[1] };
     }
-    
-    let llmModel = config.llmModel || DEFAULT_CONFIG.llmModel;
-
     try {
         const sysPrompt = "You are an AI choosing aspect ratios. Read the prompt and output ONLY one of these exact strings based on what visually fits best: '1024x1024' (Square), '1152x896' (Slight Landscape), '896x1152' (Slight Portrait), '1216x832' (Landscape), '832x1216' (Portrait), '1344x768' (Widescreen), '768x1344' (Tall), '1536x640' (Cinematic). NO explanations, NO markdown.";
-        const fullPrompt = `### System:\n${sysPrompt}\n\n### User:\nPrompt: ${prompt}\n\n### Assistant:\n`;
-        
-        const result = await callHordeText(env, llmModel, fullPrompt, 50);
+        const result = await callHordeLLM(env, config.llmModel, [
+            { role: "system", content: sysPrompt },
+            { role: "user", content: `Prompt: ${prompt}` }
+        ], 20);
 
         if (result) {
-            const clean = result.replace(/['"`]/g, '').trim().toLowerCase();
+            const clean = result.replace(/['"`]/g, "").trim().toLowerCase();
             if (clean.includes("1024x1024")) return { width: 1024, height: 1024 };
             if (clean.includes("1152x896")) return { width: 1152, height: 896 };
             if (clean.includes("896x1152")) return { width: 896, height: 1152 };
@@ -452,7 +535,7 @@ async function determineResolution(prompt, env, config) {
 async function generatePrompt(basePrompt, env, config) {
     if (!config.llmEnabled) return basePrompt;
 
-    let llmModel = config.llmModel || DEFAULT_CONFIG.llmModel;
+    const llmModel = config.llmModel || DEFAULT_LLM_MODEL;
     let sysPrompt, userPrompt;
     const match = basePrompt.match(/\[([\s\S]*?)\]/);
 
@@ -468,19 +551,17 @@ async function generatePrompt(basePrompt, env, config) {
         userPrompt = `Create a highly detailed Stable Diffusion prompt based on this theme: ${basePrompt}`;
     }
 
-    const fullPrompt = `### System:\n${sysPrompt}\n\n### User:\n${userPrompt}\n\n### Assistant:\n`;
     const maxTokens = config.maxTokens || 800;
 
-    const result = await callHordeText(env, llmModel, fullPrompt, maxTokens);
+    const result = await callHordeLLM(env, llmModel, [
+        { role: "system", content: sysPrompt },
+        { role: "user", content: userPrompt }
+    ], maxTokens);
 
-    if (result) {
-        let cleaned = result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
-        cleaned = cleaned.replace(/^Assistant:\s*/i, "");
-        return cleaned;
-    }
+    if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
 
     if (match) {
-        console.error("[LLM] Text API failed to process prompt instruction.");
+        console.error("[LLM] Horde LLM failed to process prompt instruction.");
         throw new Error("Не удалось обработать инструкцию для промпта через Horde LLM. Повторите позже.");
     }
     return basePrompt;
@@ -489,18 +570,15 @@ async function generatePrompt(basePrompt, env, config) {
 async function generateAiCaption(imagePrompt, env, config) {
     if (!config.llmEnabled) return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 900))}</i>`;
 
-    let llmModel = config.llmModel || DEFAULT_CONFIG.llmModel;
-    const sysPrompt = config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений.";
-    const userPrompt = `Промпт картинки: ${imagePrompt.substring(0, 1000)}`;
-    const fullPrompt = `### System:\n${sysPrompt}\n\n### User:\n${userPrompt}\n\n### Assistant:\n`;
+    const result = await callHordeLLM(env, config.llmModel || DEFAULT_LLM_MODEL, [
+        { role: "system", content: config.captionPrompt || "Опиши картинку для Telegram-канала. Пиши интересно, используй эмодзи. Без вступлений." },
+        { role: "user", content: `Промпт картинки: ${imagePrompt.substring(0, 1000)}` }
+    ], 400);
 
-    const result = await callHordeText(env, llmModel, fullPrompt, 8000);
-
-    if (!result || result.trim().length === 0 || result.includes("HTTP ")) {
+    if (!result || result.trim().length === 0) {
         return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 900))}</i>`;
     }
-    let cleaned = result.replace(/^Assistant:\s*/i, "");
-    return cleaned;
+    return result;
 }
 
 async function hordeSubmit(prompt, config, env, extra = {}) {
@@ -588,13 +666,17 @@ async function hordeGetModels() {
     return (await fetch(`${HORDE_API}/status/models?type=image`, { headers: HORDE_HEADERS })).json();
 }
 
+async function hordeGetTextModels() {
+    return (await fetch(`${HORDE_API}/status/models?type=text`, { headers: HORDE_HEADERS })).json();
+}
+
 async function downloadImage(url) {
     try {
-        const res = await fetch(url, { 
-            headers: { 
+        const res = await fetch(url, {
+            headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 TgImageBot/1.0",
                 "Accept": "image/webp,image/apng,image/*,*/*;q=0.8"
-            } 
+            }
         });
         return res.ok ? await res.arrayBuffer() : null;
     } catch { return null; }
@@ -619,7 +701,6 @@ async function getWatermarkedUrl(imgUrl, config, env) {
         markpos = config.watermarkPosition || "southeast";
     }
 
-    // Добавил &we для страховки форматов
     return `https://wsrv.nl/?url=${encodeURIComponent(imgUrl)}&mark=${encodeURIComponent(wmUrl)}&markpos=${markpos}&markpad=5&we&output=webp`;
 }
 
@@ -708,63 +789,8 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\nВаша роль: <b>${userRole}</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate [номер]\n\n<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n\n<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ для промпта\n\n<b>Роли:</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin|none&gt;\n\n<b>Остальное:</b>\n/img2txt [фото] - описать картинку (Interrogation)\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /togglellm | /setllm &lt;model&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\nВаша роль: <b>${userRole}</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate [номер]\n\n<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n\n<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ для промпта\n\n<b>IMG2TXT:</b>\n/img2txt — прикрепи фото или ответь на фото, бот опишет его для SDXL Illustrious\n\n<b>Роли:</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin|none&gt;\n\n<b>Остальное:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /togglellm | /setllm &lt;model&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel | /listtextmodels\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
-
-        case "/img2txt": {
-            let fileId = null;
-            if (msg.photo && msg.photo.length > 0) {
-                fileId = msg.photo[msg.photo.length - 1].file_id;
-            } else if (msg.reply_to_message && msg.reply_to_message.photo) {
-                fileId = msg.reply_to_message.photo[msg.reply_to_message.photo.length - 1].file_id;
-            } else if (msg.document && msg.document.mime_type?.startsWith("image/")) {
-                fileId = msg.document.file_id;
-            } else if (msg.reply_to_message && msg.reply_to_message.document?.mime_type?.startsWith("image/")) {
-                fileId = msg.reply_to_message.document.file_id;
-            }
-
-            if (!fileId) {
-                return await tg.send(chatId, "❌ Отправь картинку с подписью /img2txt или ответь на картинку этой командой.");
-            }
-
-            await tg.send(chatId, "⏳ Отправляю изображение на анализ (Interrogation)...");
-            try {
-                const fileReq = await tg.api("getFile", { file_id: fileId });
-                if (!fileReq.ok) return await tg.send(chatId, `❌ Ошибка API Telegram: ${fileReq.description}`);
-                
-                const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileReq.result.file_path}`;
-                const fileRes = await fetch(fileUrl);
-                const arrayBuffer = await fileRes.arrayBuffer();
-                const base64Img = bufferToBase64(arrayBuffer);
-
-                const key = getApiKey(env);
-                const res = await fetch(`${HORDE_API}/interrogate/async`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json", apikey: key, ...HORDE_HEADERS },
-                    body: JSON.stringify({
-                        source_image: base64Img,
-                        forms: [{ name: "interrogation" }]
-                    })
-                });
-
-                if (!res.ok) {
-                    const err = await res.text();
-                    return await tg.send(chatId, `❌ Ошибка Horde: ${err.substring(0, 200)}`);
-                }
-                const data = await res.json();
-                const id = data.id;
-                
-                if (id) {
-                    await KV.put(env, `interrogate:${id}`, { chatId, at: Date.now() }, { expirationTtl: 3600 });
-                    await tg.send(chatId, `✅ Изображение принято на анализ (ID: <code>${id.substring(0,8)}...</code>). Результат (теги) придет автоматически.`);
-                } else {
-                    await tg.send(chatId, `❌ Не удалось получить ID задачи.`);
-                }
-            } catch (e) {
-                await tg.send(chatId, `❌ Ошибка: ${e.message}`);
-            }
-            break;
-        }
 
         case "/setrole": {
             if (userRole !== "admin") return await tg.send(chatId, "🔒 Только Admin может управлять ролями.");
@@ -788,13 +814,14 @@ async function handleCommand(msg, env) {
         case "/togglellm": {
             config.llmEnabled = !config.llmEnabled;
             await saveConfig(env, config);
-            await tg.send(chatId, `🤖 Глобальный ИИ (LLM Horde Text): ${config.llmEnabled ? "🟢 ВКЛЮЧЕН" : "🔴 ВЫКЛЮЧЕН"}`);
+            await tg.send(chatId, `🤖 Глобальный ИИ (LLM): ${config.llmEnabled ? "🟢 ВКЛЮЧЕН" : "🔴 ВЫКЛЮЧЕН"}`);
             break;
         }
 
-        case "/ping":
+        case "/ping": {
             const key = getApiKey(env);
-            return await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde Image: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 Horde Text: ${config.llmEnabled ? "🟢" : "🔴"}`);
+            return await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde Image: ${key === "0000000000" ? "🟡 anon (лимиты)" : "✅ с ключом"}\n🤖 Horde LLM: ${config.llmEnabled ? "🟢 ВКЛ" : "🔴 ВЫКЛ"} | <code>${escapeHtml(config.llmModel || DEFAULT_LLM_MODEL)}</code>`);
+        }
 
         case "/setgroup":
             config.groupId = chatId; await saveConfig(env, config);
@@ -819,7 +846,7 @@ async function handleCommand(msg, env) {
 
         case "/addprompt": {
             if (!params.length) return await tg.send(chatId, "❌ /addprompt &lt;текст&gt;");
-            let prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p=>p.trim()).filter(Boolean) : [];
+            let prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p => p.trim()).filter(Boolean) : [];
             prompts.push(params.join(" "));
             config.generalPrompt = prompts.join(" ; ");
             await saveConfig(env, config);
@@ -829,7 +856,7 @@ async function handleCommand(msg, env) {
 
         case "/delprompt": {
             if (!params.length) return await tg.send(chatId, "❌ /delprompt &lt;номер&gt;");
-            let prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p=>p.trim()).filter(Boolean) : [];
+            let prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p => p.trim()).filter(Boolean) : [];
             const idx = parseInt(params[0]) - 1;
             if (isNaN(idx) || idx < 0 || idx >= prompts.length) return await tg.send(chatId, `❌ Неверный номер (от 1 до ${prompts.length})`);
             prompts.splice(idx, 1);
@@ -840,7 +867,7 @@ async function handleCommand(msg, env) {
         }
 
         case "/promptlist": {
-            let prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p=>p.trim()).filter(Boolean) : [];
+            let prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p => p.trim()).filter(Boolean) : [];
             if (prompts.length === 0) return await tg.send(chatId, "📋 Список промптов пуст");
 
             if (params.length && !isNaN(parseInt(params[0]))) {
@@ -975,8 +1002,20 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, "⏳ Загружаю топ-40 моделей...");
             try {
                 const models = (await hordeGetModels() || []).filter(m => m.count > 0).sort((a, b) => b.count - a.count).slice(0, 40);
-                let txt = "📋 <b>Модели (топ-40):</b>\n\n";
+                let txt = "📋 <b>Модели изображений (топ-40):</b>\n\n";
                 models.forEach(m => txt += `${m.name?.includes("XL") ? "🟢" : "⚪"} <code>${escapeHtml(m.name)}</code> (${m.count}w)\n`);
+                await tg.send(chatId, txt);
+            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+            break;
+
+        case "/listtextmodels":
+            await tg.send(chatId, "⏳ Загружаю текстовые модели...");
+            try {
+                const models = (await hordeGetTextModels() || []).filter(m => m.count > 0).sort((a, b) => b.count - a.count).slice(0, 30);
+                if (!models.length) return await tg.send(chatId, "😕 Текстовые модели не найдены");
+                let txt = "📋 <b>Текстовые LLM модели Horde:</b>\n\n";
+                models.forEach(m => txt += `<code>${escapeHtml(m.name)}</code> (${m.count}w)\n`);
+                txt += `\n💡 Текущая: <code>${escapeHtml(config.llmModel || DEFAULT_LLM_MODEL)}</code>\nСменить: /setllm &lt;имя&gt;`;
                 await tg.send(chatId, txt);
             } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
@@ -1093,9 +1132,9 @@ async function handleCommand(msg, env) {
             break;
 
         case "/setllm":
-            if (!params.length) return await tg.send(chatId, "❌ /setllm &lt;модель&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setllm &lt;модель&gt;\n\nПопулярные модели Horde:\n• <code>MythoMax-L2-13B</code> (рекомендуется, uncensored)\n• <code>Noromaid-20B</code>\n• <code>mistral-7b-v0.1</code>\n\nСписок доступных: /listtextmodels");
             config.llmModel = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ LLM: <code>${config.llmModel}</code>`);
+            await tg.send(chatId, `✅ LLM модель: <code>${escapeHtml(config.llmModel)}</code>`);
             break;
 
         case "/setspoiler":
@@ -1164,23 +1203,23 @@ async function handleCommand(msg, env) {
         case "/generate":
             if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала добавь промпт (/addprompt)");
 
-            let targetPromptSegment = null;
-            if (params.length > 0 && !isNaN(parseInt(params[0]))) {
-                const idx = parseInt(params[0]) - 1;
-                const prompts = config.generalPrompt.split(';').map(p=>p.trim()).filter(Boolean);
-                if (idx >= 0 && idx < prompts.length) {
-                    targetPromptSegment = prompts[idx];
-                } else {
-                    return await tg.send(chatId, `❌ Неверный номер промпта. Всего: ${prompts.length}`);
-                }
-            }
-
-            const actualCount = getActualCount(config.count);
-            await tg.send(chatId, `⏳ Генерирую ${actualCount} фото... (Обработка Batch)`);
-
             {
+                let targetPromptSegment = null;
+                if (params.length > 0 && !isNaN(parseInt(params[0]))) {
+                    const idx = parseInt(params[0]) - 1;
+                    const prompts = config.generalPrompt.split(';').map(p => p.trim()).filter(Boolean);
+                    if (idx >= 0 && idx < prompts.length) {
+                        targetPromptSegment = prompts[idx];
+                    } else {
+                        return await tg.send(chatId, `❌ Неверный номер промпта. Всего: ${prompts.length}`);
+                    }
+                }
+
+                const actualCount = getActualCount(config.count);
+                await tg.send(chatId, `⏳ Генерирую ${actualCount} фото... (Обработка Batch)`);
+
                 const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
-                const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
+                const batchId = Date.now() + "_" + Math.random().toString(36).substring(2, 7);
                 const targets = [chatId];
 
                 await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: 3600 });
@@ -1234,11 +1273,142 @@ async function handleCommand(msg, env) {
                     }
 
                     if (i < actualCount - 1) {
-                        await new Promise(r => setTimeout(r, 2000)); // Защита от спама Horde
+                        await new Promise(r => setTimeout(r, 2000)); // Защита от 429 Too Many Requests
                     }
                 }
             }
             break;
+
+        // ─── IMG2TXT ──────────────────────────────────────────────────────────
+        case "/img2txt": {
+            // Принимаем фото из текущего сообщения или из reply
+            const photoArr = msg.photo || msg.reply_to_message?.photo;
+            const docMsg   = msg.document || msg.reply_to_message?.document;
+
+            if (!photoArr?.length && !docMsg) {
+                return await tg.send(chatId,
+                    "❌ Прикрепи картинку к команде <code>/img2txt</code> или ответь на картинку.\n\n" +
+                    "🎨 Бот опишет её как детальный промпт для SDXL Illustrious."
+                );
+            }
+
+            await tg.send(chatId, "⏳ Загружаю изображение и отправляю на анализ Horde...");
+
+            try {
+                // Определяем file_id
+                let fileId;
+                if (photoArr?.length) {
+                    fileId = photoArr[photoArr.length - 1].file_id; // берём наибольший размер
+                } else {
+                    if (!docMsg.mime_type?.startsWith("image/")) {
+                        return await tg.send(chatId, "❌ Документ не является изображением.");
+                    }
+                    fileId = docMsg.file_id;
+                }
+
+                // Получаем путь файла через Telegram API
+                const fileReq = await tg.api("getFile", { file_id: fileId });
+                if (!fileReq.ok) return await tg.send(chatId, "❌ Ошибка получения файла от Telegram.");
+
+                const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileReq.result.file_path}`;
+                const imgBuffer = await downloadImage(fileUrl);
+                if (!imgBuffer) return await tg.send(chatId, "❌ Не удалось загрузить изображение.");
+
+                const imageBase64 = bufferToBase64(imgBuffer);
+
+                // Отправляем на interrogation в Horde
+                const interrogId = await hordeSubmitInterrogate(imageBase64, env);
+                if (!interrogId) {
+                    return await tg.send(chatId, "❌ Horde вернул ошибку при отправке на анализ. Попробуй позже.");
+                }
+
+                await tg.send(chatId, `🔍 Анализ запущен (ID: <code>${interrogId.substring(0, 8)}...</code>)\n⏳ Ожидаю результат (до 35 сек)...`);
+
+                // Поллинг результата
+                const maxWait = 35000;
+                const startTime = Date.now();
+                let result = null;
+
+                while (Date.now() - startTime < maxWait) {
+                    await new Promise(r => setTimeout(r, 3000));
+                    const data = await hordeGetInterrogation(interrogId);
+                    if (!data) continue;
+
+                    if (data.faulted) {
+                        return await tg.send(chatId, "❌ Анализ завершился с ошибкой на стороне Horde.");
+                    }
+
+                    // Проверяем что хотя бы один form завершён
+                    const anyDone = data.forms?.some(f => f.state === "done");
+                    const allDone = data.forms?.every(f => f.state === "done");
+
+                    if (allDone) {
+                        result = data;
+                        break;
+                    } else if (anyDone && (Date.now() - startTime > maxWait * 0.7)) {
+                        // Если прошло 70% времени и хотя бы что-то есть — берём
+                        result = data;
+                        break;
+                    }
+                }
+
+                if (!result) {
+                    return await tg.send(chatId, "⏰ Таймаут анализа (>35 сек). Попробуй ещё раз — возможно, Horde загружен.");
+                }
+
+                // Извлекаем caption и теги
+                let caption = "";
+                let rawTags = {};
+
+                for (const form of (result.forms || [])) {
+                    if (form.state !== "done") continue;
+                    if (form.form === "caption") {
+                        caption = form.result?.caption || "";
+                    } else if (form.form === "interrogation") {
+                        rawTags = form.result?.interrogation || {};
+                    }
+                }
+
+                // Топ-40 тегов по уверенности
+                const topTags = Object.entries(rawTags)
+                    .sort(([, a], [, b]) => b - a)
+                    .slice(0, 40)
+                    .map(([tag]) => tag)
+                    .join(", ");
+
+                if (!caption && !topTags) {
+                    return await tg.send(chatId, "❌ Horde не вернул описание. Попробуй другое изображение.");
+                }
+
+                // Если LLM включён — форматируем через Horde LLM в SDXL Illustrious промпт
+                let finalPrompt = [caption, topTags].filter(Boolean).join(", ");
+
+                if (config.llmEnabled) {
+                    const sysCtx = config.systemContext || DEFAULT_SYSTEM_CONTEXT;
+                    const llmInput = `Convert this image analysis into a complete Stable Diffusion Illustrious XL prompt.\nCaption: ${caption}\nDetected tags: ${topTags}`;
+
+                    const llmResult = await callHordeLLM(env, config.llmModel, [
+                        { role: "system", content: sysCtx },
+                        { role: "user",   content: llmInput }
+                    ], 500);
+
+                    if (llmResult) finalPrompt = llmResult;
+                }
+
+                // Формируем ответ
+                let replyText = `🖼️ <b>Промпт для SDXL Illustrious:</b>\n\n<code>${escapeHtml(finalPrompt)}</code>`;
+                if (caption) {
+                    replyText += `\n\n📝 <b>Исходный caption:</b>\n<i>${escapeHtml(caption)}</i>`;
+                }
+
+                await tg.send(chatId, replyText);
+
+            } catch (e) {
+                console.error("[IMG2TXT] Error:", e.message);
+                await tg.send(chatId, `❌ Ошибка IMG2TXT: ${e.message}`);
+            }
+            break;
+        }
 
         case "/status": {
             let queueCount = 0;
@@ -1249,7 +1419,7 @@ async function handleCommand(msg, env) {
             const promptsCount = config.generalPrompt ? config.generalPrompt.split(';').filter(Boolean).length : 0;
             const llmState = config.llmEnabled ? "🟢 ВКЛ" : "🔴 ВЫКЛ";
 
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(см. /promptlist)</i>\n\n<b>Глобальный ИИ:</b> ${llmState}\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(см. /promptlist)</i>\n\n<b>Horde LLM:</b> ${llmState} | <code>${escapeHtml(config.llmModel || DEFAULT_LLM_MODEL)}</code>\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1284,7 +1454,7 @@ async function handleCommand(msg, env) {
                         status = "❌ Ошибка/Удалено";
                     }
 
-                    statusTxt += `🔹 ID: <code>${id.substring(0,8)}...</code> | ${status}: ~${waitTime} сек | Перед вами: ${qPos}\n`;
+                    statusTxt += `🔹 ID: <code>${id.substring(0, 8)}...</code> | ${status}: ~${waitTime} сек | Перед вами: ${qPos}\n`;
                     count++;
                 }
                 await tg.send(chatId, `📊 <b>Статус очереди:</b>\n\n${statusTxt}`);
@@ -1317,52 +1487,6 @@ async function processScheduled(env) {
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
     const config = await getConfig(env);
 
-    // Обработка задач Interrogation (IMG2TXT)
-    const interrTasks = await KV.list(env, "interrogate:");
-    for (const bKey of interrTasks.keys) {
-        const id = bKey.name.replace("interrogate:", "");
-        try {
-            const task = await KV.get(env, bKey.name, "json");
-            if (!task) { await KV.del(env, bKey.name); continue; }
-            
-            if (Date.now() - task.at > 3600000) {
-                if (task.chatId) await tg.send(task.chatId, `⏰ Таймаут распознавания изображения <code>${id.substring(0,8)}</code>.`);
-                await KV.del(env, bKey.name);
-                continue;
-            }
-
-            const res = await fetch(`${HORDE_API}/interrogate/status/${id}`, { headers: HORDE_HEADERS });
-            if (!res.ok) continue;
-            const checkData = await res.json();
-
-            if (checkData.state === "done") {
-                if (checkData.forms && checkData.forms.length > 0) {
-                    const formResult = checkData.forms[0].result;
-                    let textResult = "";
-                    
-                    if (typeof formResult === "object") {
-                        // Dict tags (Danbooru style) -> format into comma separated string
-                        const tags = Object.keys(formResult).sort((a, b) => formResult[b] - formResult[a]);
-                        textResult = tags.join(", ");
-                    } else {
-                        textResult = String(formResult);
-                    }
-                    
-                    if (task.chatId) await tg.send(task.chatId, `🔍 <b>Результат IMG2TXT:</b>\n\n<code>${escapeHtml(textResult)}</code>`);
-                } else {
-                    if (task.chatId) await tg.send(task.chatId, `⚠️ Не удалось распознать изображение (пустой результат).`);
-                }
-                await KV.del(env, bKey.name);
-            } else if (checkData.state === "faulted") {
-                if (task.chatId) await tg.send(task.chatId, `❌ Ошибка при распознавании воркером.`);
-                await KV.del(env, bKey.name);
-            }
-        } catch (e) {
-            console.error(`[CRON] Ошибка проверки interrogation ${id}:`, e.message);
-        }
-    }
-
-    // Обработка генерации изображений
     const pendingList = await KV.list(env, "pending:");
     for (const keyObj of pendingList.keys) {
         const id = keyObj.name.replace("pending:", "");
@@ -1382,7 +1506,9 @@ async function processScheduled(env) {
             }
 
             const check = await hordeCheck(id);
-            if (!check.done) continue;
+            if (!check.done) {
+                continue;
+            }
 
             const res = await hordeGetResult(id);
 
@@ -1551,7 +1677,6 @@ async function processScheduled(env) {
         }
     }
 
-    // Cron Automatic Posting
     if (!config.enabled || (!config.groupId && !config.channelId) || !config.generalPrompt) return;
     if ((await KV.list(env, "pending:")).keys.length > 0) return;
 
@@ -1563,7 +1688,7 @@ async function processScheduled(env) {
     const targets = [config.groupId, config.channelId].filter(Boolean);
     let queuedCount = 0;
 
-    const batchId = Date.now() + "_" + Math.random().toString(36).substring(2,7);
+    const batchId = Date.now() + "_" + Math.random().toString(36).substring(2, 7);
     const actualCount = getActualCount(config.count);
 
     await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: 3600 });
@@ -1571,13 +1696,13 @@ async function processScheduled(env) {
     for (let i = 0; i < actualCount; i++) {
         try {
             const segment = getRandomPromptSegment(config.generalPrompt);
+
             const { cleanPrompt, extraLoras, excludedLoras, disableLlm, modelOverride } = parsePromptLoras(segment);
             const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
 
-            const finalPrompt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config);
-            const bestRes = await determineResolution(finalPrompt, env, config);
-
-            const res = await hordeSubmit(finalPrompt, config, env, {
+            const prmpt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config);
+            const bestRes = await determineResolution(prmpt, env, config);
+            const res = await hordeSubmit(prmpt, config, env, {
                 workerBlacklist: bl,
                 width: bestRes.width,
                 height: bestRes.height,
@@ -1588,8 +1713,8 @@ async function processScheduled(env) {
             if (res.id) {
                 await KV.put(env, `pending:${res.id}`, {
                     targets,
-                    prompt: finalPrompt,
-                    at: Date.now(),
+                    prompt: prmpt,
+                    at: now,
                     notify: config.adminId,
                     retries: 0,
                     batchId,
@@ -1598,11 +1723,12 @@ async function processScheduled(env) {
                 }, { expirationTtl: 3600 });
                 queuedCount++;
             } else {
+                if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
                 let batch = await KV.get(env, `batch:${batchId}`, "json");
                 if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
             }
         } catch (e) {
-            console.error(e);
+            if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
             let batch = await KV.get(env, `batch:${batchId}`, "json");
             if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
         }
@@ -1615,28 +1741,66 @@ async function processScheduled(env) {
     if (queuedCount > 0) {
         await KV.put(env, "last_post_time", String(now));
     } else {
-        await KV.del(env, `batch:${batchId}`);
+        await KV.put(env, "last_post_time", String(now - (config.interval * 60 * 1000) + 120000));
     }
 }
 
 export default {
-    async fetch(request, env, ctx) {
-        // HTTP Webhook Telegram
-        if (request.method === "POST") {
-            try {
-                const data = await request.json();
-                if (data.message) {
-                    await handleCommand(data.message, env);
+    async fetch(req, env, ctx) {
+        const url = new URL(req.url);
+
+        ctx.waitUntil(KV.put(env, "worker_origin", url.origin));
+
+        if (url.pathname === "/watermark.png") {
+            const config = await getConfig(env);
+            if (config.watermarkData) {
+                const buf = base64ToBuffer(config.watermarkData);
+                if (buf) {
+                    return new Response(buf, {
+                        headers: {
+                            "Content-Type": "image/png",
+                            "Cache-Control": "public, max-age=31536000",
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS"
+                        }
+                    });
                 }
-            } catch (e) {
-                console.error("Webhook error:", e);
             }
+            return new Response("Not found", { status: 404 });
+        }
+
+        if (url.pathname === "/webhook") {
+            if (req.method !== "POST") return new Response("POST only", { status: 405 });
+            try {
+                const body = await req.json();
+                if (body.message && (body.message.text?.startsWith("/") || body.message.caption?.startsWith("/"))) {
+                    ctx.waitUntil(handleCommand(body.message, env));
+                }
+
+                ctx.waitUntil(processScheduled(env));
+            } catch (e) { console.error("[WH]", e.message); }
             return new Response("OK", { status: 200 });
         }
-        return new Response("TgImageBot Worker is running.", { status: 200 });
+
+        if (url.pathname === "/setup") {
+            if (!env.TELEGRAM_BOT_TOKEN) return new Response("No TELEGRAM_BOT_TOKEN!", { status: 500 });
+            const webhookUrl = `${url.origin}/webhook`;
+            const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url: webhookUrl, allowed_updates: ["message"], drop_pending_updates: true })
+            });
+            return new Response(`Webhook: ${webhookUrl}\n\n${JSON.stringify(await res.json(), null, 2)}`);
+        }
+
+        return new Response("🤖 Бот запущен! Перейди на /setup для настройки вебхука.");
     },
+
     async scheduled(event, env, ctx) {
-        // Cron trigger
-        await processScheduled(env);
+        try {
+            await processScheduled(env);
+        } catch (e) {
+            console.error("[CRON] CRASH:", e.message);
+        }
     }
 };
