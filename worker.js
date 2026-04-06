@@ -20,6 +20,15 @@ const DEFAULT_CONFIG = {
     negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
     llmEnabled: true,
     llmModel: "openrouter/free",
+    visionModel: "google/gemini-2.0-flash-001",
+    visionModels: [
+        "google/gemini-2.0-flash-001",
+        "google/gemma-3-27b-it:free",
+        "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "qwen/qwen2.5-vl-72b-instruct:free",
+        "qwen/qwen2.5-vl-7b-instruct:free",
+        "mistralai/pixtral-12b:free"
+    ],
     clipSkip: 2,
     hiresFix: false,
     hiresFixDenoising: 0.65,
@@ -55,6 +64,18 @@ NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive promp
 const HORDE_API = "https://stablehorde.net/api/v2";
 const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.2:tg" };
 const MIN_IMAGE_KB = 10;
+const PENDING_TTL_SEC = 10800;
+const TASK_TIMEOUT_MS = 10800000;
+const MAX_DELIVERY_RETRIES = 3;
+
+function getVisionModels(config) {
+    const models = Array.isArray(config.visionModels) ? config.visionModels.filter(Boolean) : [];
+    const base = models.length ? models : DEFAULT_CONFIG.visionModels;
+    const preferred = config.visionModel;
+    const uniq = [...new Set(base)];
+    if (preferred && !uniq.includes(preferred)) return [preferred, ...uniq];
+    return uniq;
+}
 
 function escapeHtml(text) {
     return text == null ? "" : String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -151,14 +172,16 @@ function checkAccess(role, cmd) {
         "/addprompt", "/delprompt", "/promptlist", "/setprompt",
         "/setcontext", "/addlora", "/listloras", "/clearloras", "/dellora",
         "/setneg", "/generate", "/help", "/start", "/ping",
-        "/setwatermark", "/delwatermark", "/img2txt", "/llmlist"
+        "/setwatermark", "/delwatermark", "/img2txt", "/llmlist",
+        "/setvmodel", "/listvmodel"
     ];
 
     const techCmds = [
         "/status", "/pending", "/cancel", "/workerbl", "/ping",
         "/listmodels", "/searchmodel", "/setenhancer", "/setsize",
         "/setsteps", "/setcfg", "/setsampler", "/help", "/start",
-        "/togglellm", "/setllm", "/settokens", "/setcaptionmode", "/setcaptionprompt"
+        "/togglellm", "/setllm", "/settokens", "/setcaptionmode", "/setcaptionprompt",
+        "/setvmodel", "/listvmodel"
     ];
 
     if (role === "creator") return creatorCmds.includes(cmd);
@@ -680,7 +703,7 @@ async function handleCommand(msg, env) {
     switch (cmd) {
         case "/start":
         case "/help":
-            await tg.send(chatId, `🤖 <b>Image Bot</b>\nВаша роль: <b>${userRole}</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate [номер]\n\n<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n\n<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ (OpenRouter) для промпта\n\n<b>LLM:</b>\n/llmlist | /img2txt (на фото)\n\n<b>Роли:</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin|none&gt;\n\n<b>Остальное:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /togglellm | /setllm &lt;model&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
+            await tg.send(chatId, `🤖 <b>Image Bot</b>\nВаша роль: <b>${userRole}</b>\n\n<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate [номер]\n\n<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n\n<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ (OpenRouter) для промпта\n\n<b>LLM/vision:</b>\n/llmlist | /img2txt (на фото) | /listvmodel | /setvmodel\n\n<b>Роли:</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin|none&gt;\n\n<b>Остальное:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt; | /togglellm | /setllm &lt;model&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark\n\n<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`);
             break;
 
         case "/llmlist": {
@@ -747,14 +770,7 @@ async function handleCommand(msg, env) {
 
                 const sysPrompt = "You are a specialized image analyzer for Stable Diffusion (SDXL Illustrious) and Anime art. Describe the character(s), physical features, eye/hair color, clothing, pose, background, lighting, and style using ONLY comma-separated booru-style tags. OUTPUT ONLY COMMA-SEPARATED TAGS. No introductory text, no sentences.";
 
-                const visionModels = [
-                    "google/gemini-2.0-flash-001",
-                    "google/gemma-3-27b-it:free",
-                    "meta-llama/llama-3.2-11b-vision-instruct:free",
-                    "qwen/qwen2.5-vl-72b-instruct:free",
-                    "qwen/qwen2.5-vl-7b-instruct:free",
-                    "mistralai/pixtral-12b:free"
-                ];
+                const visionModels = getVisionModels(config);
 
                 let tags = null;
                 let usedModel = "";
@@ -1154,6 +1170,39 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, `✅ LLM: <code>${config.llmModel}</code>`);
             break;
 
+        case "/listvmodel": {
+            const vModels = getVisionModels(config);
+            let txt = "👁️ <b>Vision модели для /img2txt:</b>\n\n";
+            txt += `Текущая: <code>${escapeHtml(config.visionModel || vModels[0] || "не задана")}</code>\n\n`;
+            vModels.forEach((m, i) => {
+                const marker = m === config.visionModel ? "✅" : "▫️";
+                txt += `${marker} ${i + 1}. <code>${escapeHtml(m)}</code>\n`;
+            });
+            txt += "\n💡 <i>/setvmodel &lt;номер|id&gt;</i>";
+            await tg.send(chatId, txt);
+            break;
+        }
+
+        case "/setvmodel": {
+            if (!params.length) return await tg.send(chatId, "❌ /setvmodel &lt;номер|id&gt;");
+            const vModels = getVisionModels(config);
+            const raw = params.join(" ").trim();
+            const idx = parseInt(raw, 10);
+            let selected = null;
+            if (!isNaN(idx) && idx >= 1 && idx <= vModels.length) {
+                selected = vModels[idx - 1];
+            } else if (vModels.includes(raw)) {
+                selected = raw;
+            }
+            if (!selected) {
+                return await tg.send(chatId, "❌ Неизвестная vision-модель. Посмотри список: /listvmodel");
+            }
+            config.visionModel = selected;
+            await saveConfig(env, config);
+            await tg.send(chatId, `✅ Vision модель: <code>${escapeHtml(selected)}</code>`);
+            break;
+        }
+
         case "/setspoiler":
             if (!params[0]) return await tg.send(chatId, "❌ /setspoiler <on|off>");
             config.useSpoiler = params[0].toLowerCase() === "on";
@@ -1239,7 +1288,7 @@ async function handleCommand(msg, env) {
                 const batchId = Date.now() + "_" + Math.random().toString(36).substring(2, 7);
                 const targets = [chatId];
 
-                await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: 3600 });
+                await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
 
                 for (let i = 0; i < actualCount; i++) {
                     try {
@@ -1277,16 +1326,16 @@ async function handleCommand(msg, env) {
                                 batchId,
                                 lorasOverride,
                                 modelOverride
-                            }, { expirationTtl: 3600 });
+                            }, { expirationTtl: PENDING_TTL_SEC });
                         } else {
                             await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
                             let batch = await KV.get(env, `batch:${batchId}`, "json");
-                            if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
+                            if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                         }
                     } catch (e) {
                         await tg.send(chatId, `❌ Ошибка: ${e.message}`);
                         let batch = await KV.get(env, `batch:${batchId}`, "json");
-                        if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
+                        if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                     }
 
                     if (i < actualCount - 1) {
@@ -1305,7 +1354,7 @@ async function handleCommand(msg, env) {
             const promptsCount = config.generalPrompt ? config.generalPrompt.split(';').filter(Boolean).length : 0;
             const llmState = config.llmEnabled ? "🟢 ВКЛ" : "🔴 ВЫКЛ";
 
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(см. /promptlist)</i>\n\n<b>Глобальный ИИ:</b> ${llmState}\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(см. /promptlist)</i>\n\n<b>Глобальный ИИ:</b> ${llmState}\n<b>Контекст LLM:</b> ${config.systemContext ? "Задан" : "Встроенный (Illustrious XL)"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Баз.Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐 global:</b> ${globalLoras.length} шт | <b>🎯 manual:</b> ${manualLoras.length} шт\n<b>LLM:</b> <code>${escapeHtml(config.llmModel)}</code>\n<b>Vision:</b> <code>${escapeHtml(config.visionModel || getVisionModels(config)[0] || "не задана")}</code>\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1381,12 +1430,12 @@ async function processScheduled(env) {
             if (!task) { await KV.del(env, keyObj.name); continue; }
 
             const taskAt = task.at || 0;
-            if (Date.now() - taskAt > 3600000) {
+            if (Date.now() - taskAt > TASK_TIMEOUT_MS) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
                 if (task.batchId) {
                     let batch = await KV.get(env, `batch:${task.batchId}`, "json");
-                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
             }
@@ -1398,7 +1447,7 @@ async function processScheduled(env) {
                 if (task.notify) await tg.send(task.notify, `❌ Задача провалилась в Horde: <code>${id}</code>`);
                 if (task.batchId) {
                     let batch = await KV.get(env, `batch:${task.batchId}`, "json");
-                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
             }
@@ -1414,7 +1463,7 @@ async function processScheduled(env) {
                 if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации: <code>${id}</code>`);
                 if (task.batchId) {
                     let batch = await KV.get(env, `batch:${task.batchId}`, "json");
-                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
             }
@@ -1425,7 +1474,7 @@ async function processScheduled(env) {
                 if (task.notify) await tg.send(task.notify, `⚠️ Изображение <code>${id}</code> пустое.`);
                 if (task.batchId) {
                     let batch = await KV.get(env, `batch:${task.batchId}`, "json");
-                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
             }
@@ -1454,19 +1503,21 @@ async function processScheduled(env) {
                         modelOverride: task.modelOverride
                     });
                     if (newRes.id) {
-                        await KV.put(env, `pending:${newRes.id}`, { ...task, at: Date.now(), retries }, { expirationTtl: 3600 });
+                        await KV.put(env, `pending:${newRes.id}`, { ...task, at: Date.now(), retries }, { expirationTtl: PENDING_TTL_SEC });
                         if (task.notify) await tg.send(task.notify, `🔄 Ретрай ${retries}/3...`);
                     }
                 } else {
                     if (task.notify) await tg.send(task.notify, "❌ 3 попытки неудачны.");
                     if (task.batchId) {
                         let batch = await KV.get(env, `batch:${task.batchId}`, "json");
-                        if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 }); }
+                        if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                     }
                 }
                 await KV.del(env, keyObj.name);
                 continue;
             }
+
+            let shouldDeletePending = true;
 
             if (finalImageBase64) {
                 if (task.batchId) {
@@ -1480,9 +1531,14 @@ async function processScheduled(env) {
                             if (config.captionMode === 1) captionText = `🎨 <i>${escapeHtml(batch.prompt.substring(0, 900))}</i>`;
                             else if (config.captionMode === 2) captionText = await generateAiCaption(batch.prompt, env, config);
 
+                            let delivered = true;
                             for (const tId of batch.targets) {
                                 if (batch.ready.length === 1) {
-                                    await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config, env);
+                                    const singleRes = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config, env);
+                                    if (!singleRes.sent) {
+                                        delivered = false;
+                                        break;
+                                    }
                                 } else {
                                     const processedBuffers = [];
                                     for (const b64 of batch.ready) {
@@ -1506,29 +1562,60 @@ async function processScheduled(env) {
 
                                         if (buf) processedBuffers.push(buf);
                                     }
-                                    if (processedBuffers.length > 0) {
-                                        await tg.sendMediaGroup(tId, processedBuffers, captionText);
+                                    if (!processedBuffers.length) {
+                                        delivered = false;
+                                        if (batch.notify) await tg.send(batch.notify, `❌ Пустой батч при отправке (ID: <code>${task.batchId}</code>).`);
+                                        break;
+                                    }
+                                    const mg = await tg.sendMediaGroup(tId, processedBuffers, captionText);
+                                    if (!mg.ok) {
+                                        delivered = false;
+                                        if (batch.notify) await tg.send(batch.notify, `❌ Ошибка отправки media group: ${escapeHtml(mg.description || "unknown")}`);
+                                        break;
                                     }
                                 }
                             }
-                            await KV.del(env, `batch:${task.batchId}`);
+                            if (delivered) {
+                                await KV.del(env, `batch:${task.batchId}`);
+                            } else {
+                                batch.deliveryRetries = (batch.deliveryRetries || 0) + 1;
+                                if (batch.deliveryRetries >= MAX_DELIVERY_RETRIES) {
+                                    if (batch.notify) await tg.send(batch.notify, `❌ Батч <code>${task.batchId}</code> не удалось доставить после ${MAX_DELIVERY_RETRIES} попыток.`);
+                                    await KV.del(env, `batch:${task.batchId}`);
+                                } else {
+                                    await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC });
+                                }
+                            }
                         } else {
-                            await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: 3600 });
+                            await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC });
                         }
                     } else {
-                        await deliverImage(tg, task.targets[0], finalImageBase64, "", task.notify, config, env);
+                        const fallbackRes = await deliverImage(tg, task.targets[0], finalImageBase64, "", task.notify, config, env);
+                        if (!fallbackRes.sent) shouldDeletePending = false;
                     }
                 } else {
                     let captionText = "";
                     if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 900))}</i>` : "";
                     else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
 
+                    let deliveredToAllTargets = true;
                     for (const tId of (task.targets || [])) {
-                        await deliverImage(tg, tId, finalImageBase64, captionText, task.notify, config, env);
+                        const sendRes = await deliverImage(tg, tId, finalImageBase64, captionText, task.notify, config, env);
+                        if (!sendRes.sent) deliveredToAllTargets = false;
+                    }
+                    if (!deliveredToAllTargets) {
+                        const deliveryRetries = (task.deliveryRetries || 0) + 1;
+                        if (deliveryRetries >= MAX_DELIVERY_RETRIES) {
+                            if (task.notify) await tg.send(task.notify, `❌ Не удалось доставить изображение <code>${id}</code> после ${MAX_DELIVERY_RETRIES} попыток.`);
+                        } else {
+                            shouldDeletePending = false;
+                            await KV.put(env, keyObj.name, { ...task, deliveryRetries, at: Date.now() }, { expirationTtl: PENDING_TTL_SEC });
+                            if (task.notify) await tg.send(task.notify, `🔄 Повтор доставки ${deliveryRetries}/${MAX_DELIVERY_RETRIES} для <code>${id.substring(0, 8)}...</code>`);
+                        }
                     }
                 }
             }
-            await KV.del(env, keyObj.name);
+            if (shouldDeletePending) await KV.del(env, keyObj.name);
 
         } catch (e) {
             console.error(`[CRON] Ошибка обработки ${id}:`, e.message);
@@ -1540,9 +1627,14 @@ async function processScheduled(env) {
         let batch = await KV.get(env, bKey.name, "json");
         if (batch && batch.expected <= 0 && batch.ready.length > 0) {
             let captionText = config.captionMode === 1 ? `🎨 <i>${escapeHtml(batch.prompt.substring(0, 900))}</i>` : "";
+            let delivered = true;
             for (const tId of batch.targets) {
                 if (batch.ready.length === 1) {
-                    await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config, env);
+                    const singleRes = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config, env);
+                    if (!singleRes.sent) {
+                        delivered = false;
+                        break;
+                    }
                 } else {
                     const processedBuffers = [];
                     for (const b64 of batch.ready) {
@@ -1565,10 +1657,30 @@ async function processScheduled(env) {
 
                         if (buf) processedBuffers.push(buf);
                     }
-                    if (processedBuffers.length > 0) await tg.sendMediaGroup(tId, processedBuffers, captionText);
+                    if (!processedBuffers.length) {
+                        delivered = false;
+                        if (batch.notify) await tg.send(batch.notify, "❌ Пустой батч при повторной отправке.");
+                        break;
+                    }
+                    const mg = await tg.sendMediaGroup(tId, processedBuffers, captionText);
+                    if (!mg.ok) {
+                        delivered = false;
+                        if (batch.notify) await tg.send(batch.notify, `❌ Ошибка повторной отправки media group: ${escapeHtml(mg.description || "unknown")}`);
+                        break;
+                    }
                 }
             }
-            await KV.del(env, bKey.name);
+            if (delivered) {
+                await KV.del(env, bKey.name);
+            } else {
+                batch.deliveryRetries = (batch.deliveryRetries || 0) + 1;
+                if (batch.deliveryRetries >= MAX_DELIVERY_RETRIES) {
+                    if (batch.notify) await tg.send(batch.notify, `❌ Батч не доставлен после ${MAX_DELIVERY_RETRIES} попыток.`);
+                    await KV.del(env, bKey.name);
+                } else {
+                    await KV.put(env, bKey.name, batch, { expirationTtl: PENDING_TTL_SEC });
+                }
+            }
         } else if (batch && batch.expected <= 0) {
             await KV.del(env, bKey.name);
         }
@@ -1588,7 +1700,7 @@ async function processScheduled(env) {
     const batchId = Date.now() + "_" + Math.random().toString(36).substring(2, 7);
     const actualCount = getActualCount(config.count);
 
-    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: 3600 });
+    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
 
     for (let i = 0; i < actualCount; i++) {
         try {
@@ -1617,17 +1729,17 @@ async function processScheduled(env) {
                     batchId,
                     lorasOverride,
                     modelOverride
-                }, { expirationTtl: 3600 });
+                }, { expirationTtl: PENDING_TTL_SEC });
                 queuedCount++;
             } else {
                 if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации (Horde):</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
                 let batch = await KV.get(env, `batch:${batchId}`, "json");
-                if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
+                if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
             }
         } catch (e) {
             if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
             let batch = await KV.get(env, `batch:${batchId}`, "json");
-            if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: 3600 }); }
+            if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
         }
 
         if (i < actualCount - 1) {
