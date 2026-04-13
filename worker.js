@@ -349,6 +349,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         karras: config.karras !== false,
         clip_skip: config.clipSkip || 2,
         n: 1
+        
     };
 
     if (config.hiresFix) {
@@ -383,7 +384,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         trusted_workers: false,
         slow_workers: true,
         models: [extra.modelOverride || config.model],
-        r2: true
+        r2: true,
         shared: false,
         allow_downgrade: true
     };
