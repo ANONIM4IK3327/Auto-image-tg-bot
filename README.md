@@ -30,8 +30,8 @@ An automated Telegram bot that generates AI images via the [Stable Horde](https:
 
 ### 🔥 New in this version
 
-- Added `none` role features: `/promptsuggest` with moderation buttons (approve / rework / reject).
-- `none` users can use `img2txt` with configurable cooldown (default: 1 hour).
+- Added participant features: users without privileged roles can send `/promptsuggest` with moderation buttons (approve / rework / reject).
+- Participants can use `img2txt` with configurable cooldown (default: 1 hour).
 - Added artifact quality check with optional auto-regeneration for severe defects.
 - Improved OpenRouter error reporting with prompt number context.
 
@@ -309,7 +309,7 @@ curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"
 
 | Command | Role | Description |
 |---|---|---|
-| `/setrole <userId> <creator\|tech\|admin\|none>` | admin | Assign a role to a user |
+| `/setrole <userId> <creator\|tech\|admin>` | admin | Assign a role to a user |
 
 ---
 
