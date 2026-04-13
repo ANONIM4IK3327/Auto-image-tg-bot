@@ -1,5 +1,7 @@
 # 🤖 Auto-Image Telegram Bot
 
+> **Vibeproject**
+
 > **[🇷🇺 Русская документация](README_RU.md)** | **[🇬🇧 English documentation](README.md)**
 
 An automated Telegram bot that generates AI images via the [Stable Horde](https://stablehorde.net/) distributed network and posts them to groups or channels on a schedule. Runs entirely on **Cloudflare Workers** (serverless, free tier supported).
@@ -24,6 +26,14 @@ An automated Telegram bot that generates AI images via the [Stable Horde](https:
 ---
 
 ## ✨ Features
+
+
+### 🔥 New in this version
+
+- Added `none` role features: `/promptsuggest` with moderation buttons (approve / rework / reject).
+- `none` users can use `img2txt` with configurable cooldown (default: 1 hour).
+- Added artifact quality check with optional auto-regeneration for severe defects.
+- Improved OpenRouter error reporting with prompt number context.
 
 - 🎨 **AI Image generation** via Stable Horde (free, no GPU required)
 - 🤖 **Prompt enhancement** via OpenRouter LLM (optional)
