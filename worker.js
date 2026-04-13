@@ -384,6 +384,8 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         slow_workers: true,
         models: [extra.modelOverride || config.model],
         r2: true
+        shared: false,
+        allow_downgrade: true
     };
 
     if (extra.workerBlacklist?.length) body.blacklist = extra.workerBlacklist;
