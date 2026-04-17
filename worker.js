@@ -19,8 +19,11 @@ const DEFAULT_CONFIG = {
     nsfw: true,
     negativePrompt: "worst quality, low quality, blurry, deformed, disfigured, bad anatomy, watermark, text, signature",
     llmEnabled: true,
+    llmProvider: "openrouter",
     llmModel: "openrouter/free",
+    googleLlmModel: "gemini-2.0-flash",
     visionModel: "openrouter/free",
+    googleVisionModel: "gemini-2.0-flash",
     visionModels: [
         "openrouter/free",
         "google/gemma-3-27b-it:free",
@@ -28,6 +31,12 @@ const DEFAULT_CONFIG = {
         "qwen/qwen2.5-vl-72b-instruct:free",
         "qwen/qwen2.5-vl-7b-instruct:free",
         "mistralai/pixtral-12b:free"
+    ],
+    googleVisionModels: [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro"
     ],
     clipSkip: 2,
     hiresFix: false,
@@ -67,12 +76,23 @@ NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive promp
 
 const HORDE_API = "https://stablehorde.net/api/v2";
 const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.2:tg" };
+const GOOGLE_AI_API = "https://generativelanguage.googleapis.com/v1beta";
 const PENDING_TTL_SEC = 10800;
 const TASK_TIMEOUT_MS = 10800000;
 const MAX_DELIVERY_RETRIES = 3;
 const NONE_IMG2TXT_COOLDOWN_SEC = 3600;
 
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
 function getVisionModels(config) {
+    if (config.llmProvider === "google") {
+        const base = Array.isArray(config.googleVisionModels) && config.googleVisionModels.length
+            ? config.googleVisionModels
+            : [...DEFAULT_CONFIG.googleVisionModels];
+        const preferred = config.googleVisionModel;
+        if (!preferred) return base;
+        return [preferred, ...base.filter(m => m !== preferred)];
+    }
     const base = Array.isArray(config.visionModels) && config.visionModels.length
         ? config.visionModels
         : [...DEFAULT_CONFIG.visionModels];
@@ -81,8 +101,16 @@ function getVisionModels(config) {
     return [preferred, ...base.filter(m => m !== preferred)];
 }
 
+function hasLlmProvider(env, config) {
+    const provider = config?.llmProvider || "openrouter";
+    return provider === "google" ? !!getGoogleApiKey(env) : !!env.OPENROUTER_API_KEY;
+}
+
 function escapeHtml(text) {
-    return text == null ? "" : String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return text == null ? "" : String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
 }
 
 function isHttpUrl(text) {
@@ -90,7 +118,7 @@ function isHttpUrl(text) {
 }
 
 function bufferToBase64(buffer) {
-    let binary = '';
+    let binary = "";
     const bytes = new Uint8Array(buffer);
     for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
     return btoa(binary);
@@ -120,7 +148,7 @@ function getActualCount(countConfig) {
 
 function getRandomPromptSegmentInfo(generalPrompt) {
     if (!generalPrompt) return { segment: "", index: -1, total: 0 };
-    const segments = generalPrompt.split(';').map(s => s.trim()).filter(Boolean);
+    const segments = generalPrompt.split(";").map(s => s.trim()).filter(Boolean);
     if (!segments.length) return { segment: generalPrompt, index: 0, total: 1 };
     const index = Math.floor(Math.random() * segments.length);
     return { segment: segments[index], index, total: segments.length };
@@ -133,25 +161,27 @@ function parsePromptLoras(prompt) {
     const regex = /\{([^}]*)\}/g;
     let match;
     while ((match = regex.exec(prompt)) !== null) {
-        cleanPrompt = cleanPrompt.replace(match[0], '');
-        for (const part of match[1].split(',').map(s => s.trim()).filter(Boolean)) {
+        cleanPrompt = cleanPrompt.replace(match[0], "");
+        for (const part of match[1].split(",").map(s => s.trim()).filter(Boolean)) {
             const lower = part.toLowerCase();
-            if (lower === '-llm' || lower === 'nollm') disableLlm = true;
-            else if (lower.startsWith('model:')) modelOverride = part.substring(6).trim();
-            else if (part.startsWith('-')) excludedLoras.push(part.substring(1).trim());
+            if (lower === "-llm" || lower === "nollm") disableLlm = true;
+            else if (lower.startsWith("model:")) modelOverride = part.substring(6).trim();
+            else if (part.startsWith("-")) excludedLoras.push(part.substring(1).trim());
             else {
-                const segs = part.split(':');
+                const segs = part.split(":");
                 const name = segs[0].trim();
                 if (name) extraLoras.push({ name, strength: parseFloat(segs[1]) || 1, clip: parseFloat(segs[2]) || 1 });
             }
         }
     }
-    cleanPrompt = cleanPrompt.replace(/\s{2,}/g, ' ').trim();
+    cleanPrompt = cleanPrompt.replace(/\s{2,}/g, " ").trim();
     return { cleanPrompt, extraLoras, excludedLoras, disableLlm, modelOverride };
 }
 
 function buildLorasForRequest(config, extraLoras = [], excludedLoras = []) {
-    const globalLoras = (config.loras || []).filter(l => l.global !== false && !excludedLoras.includes(String(l.name)));
+    const globalLoras = (config.loras || []).filter(l =>
+        l.global !== false && !excludedLoras.includes(String(l.name))
+    );
     return [...globalLoras, ...extraLoras];
 }
 
@@ -174,7 +204,8 @@ function checkAccess(role, cmd) {
         "/listmodels", "/searchmodel", "/setenhancer", "/setsize", "/setsteps",
         "/setcfg", "/setsampler", "/help", "/start", "/togglellm", "/setllm",
         "/settokens", "/setcaptionmode", "/setcaptionprompt", "/setvmodel", "/listvmodel",
-        "/setspoiler", "/setmodel", "/setinterval", "/setcount", "/enable", "/disable", "/clearllm"
+        "/setspoiler", "/setmodel", "/setinterval", "/setcount", "/enable", "/disable",
+        "/clearllm", "/setprovider", "/llmlist"
     ];
     const participantCmds = ["/start", "/help", "/ping", "/promptsuggest", "/img2txt"];
     if (role === "creator") return creatorCmds.includes(cmd);
@@ -185,6 +216,8 @@ function checkAccess(role, cmd) {
 function getSuggestTarget(config) {
     return config.suggestTargetChatId || config.groupId || config.adminId;
 }
+
+// ─── Telegram ────────────────────────────────────────────────────────────────
 
 class Telegram {
     constructor(token) {
@@ -236,6 +269,8 @@ class Telegram {
     }
 }
 
+// ─── KV (Upstash Redis) ──────────────────────────────────────────────────────
+
 const KV = {
     async call(env, ...args) {
         if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) return null;
@@ -276,6 +311,8 @@ async function saveConfig(env, config) {
     await KV.put(env, "config", JSON.stringify(config));
 }
 
+// ─── Horde ───────────────────────────────────────────────────────────────────
+
 async function getWorkerBlacklist(env) {
     return await KV.get(env, "worker_blacklist", "json") || [];
 }
@@ -300,6 +337,10 @@ function isCensored(gen) {
 
 function getApiKey(env) {
     return (env.HORDE_API_KEY || "").trim() || "0000000000";
+}
+
+function getGoogleApiKey(env) {
+    return (env.GOOGLE_AI_API_KEY || "").trim();
 }
 
 async function hordeCheckKey(env) {
@@ -349,7 +390,6 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         karras: config.karras !== false,
         clip_skip: config.clipSkip || 2,
         n: 1
-        
     };
 
     if (config.hiresFix) {
@@ -411,13 +451,9 @@ async function downloadImage(url) {
     } catch { return null; }
 }
 
-async function getWatermarkedUrl(imgUrl, config, env) {
-    return imgUrl;
-}
-
-async function deliverImage(tg, chatId, imgData, caption, notify, config, env) {
+async function deliverImage(tg, chatId, imgData, caption, notify, config) {
     try {
-        let buf = isHttpUrl(imgData) ? await downloadImage(imgData) : base64ToBuffer(imgData);
+        const buf = isHttpUrl(imgData) ? await downloadImage(imgData) : base64ToBuffer(imgData);
         if (!buf) {
             if (notify) await tg.send(notify, "⚠️ Не удалось загрузить изображение.");
             return { sent: false };
@@ -429,6 +465,8 @@ async function deliverImage(tg, chatId, imgData, caption, notify, config, env) {
         return { sent: false };
     }
 }
+
+// ─── LLM failure tracking ────────────────────────────────────────────────────
 
 async function checkLlmStatus(env) {
     const timeout = await KV.get(env, "llm_timeout");
@@ -453,6 +491,8 @@ async function recordLlmSuccess(env) {
     await KV.del(env, "llm_timeout");
 }
 
+// ─── OpenRouter ──────────────────────────────────────────────────────────────
+
 async function callOpenRouter(env, model, messages, maxTokens = 800, retries = 2) {
     if (!(await checkLlmStatus(env))) return null;
     let lastErr = null;
@@ -472,7 +512,7 @@ async function callOpenRouter(env, model, messages, maxTokens = 800, retries = 2
             if (!res.ok) {
                 const errBody = await res.text();
                 lastErr = `HTTP ${res.status}: ${errBody.substring(0, 300)}`;
-                console.error(`[LLM] Attempt ${attempt + 1} failed (${model}):`, lastErr);
+                console.error(`[LLM/OR] Attempt ${attempt + 1} failed (${model}):`, lastErr);
                 if (res.status === 429 || res.status >= 500) {
                     await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
                     continue;
@@ -483,7 +523,7 @@ async function callOpenRouter(env, model, messages, maxTokens = 800, retries = 2
             const data = await res.json();
             if (data.error) {
                 lastErr = data.error.message || JSON.stringify(data.error);
-                console.error(`[LLM] API error (${model}):`, lastErr);
+                console.error(`[LLM/OR] API error (${model}):`, lastErr);
                 break;
             }
 
@@ -495,14 +535,142 @@ async function callOpenRouter(env, model, messages, maxTokens = 800, retries = 2
             lastErr = "Empty response from model";
         } catch (e) {
             lastErr = e.message;
-            console.error(`[LLM] Attempt ${attempt + 1} exception (${model}):`, e.message);
+            console.error(`[LLM/OR] Attempt ${attempt + 1} exception (${model}):`, e.message);
             if (attempt < retries) await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
         }
     }
-    console.error("[LLM] All attempts failed:", lastErr);
+    console.error("[LLM/OR] All attempts failed:", lastErr);
     await recordLlmFailure(env);
     return null;
 }
+
+// ─── Google AI Studio ────────────────────────────────────────────────────────
+
+async function fetchGoogleModels(env) {
+    const key = getGoogleApiKey(env);
+    if (!key) return [];
+    try {
+        const res = await fetch(`${GOOGLE_AI_API}/models?key=${key}&pageSize=100`);
+        if (!res.ok) return [];
+        const data = await res.json();
+        return (data.models || []).filter(m =>
+            Array.isArray(m.supportedGenerationMethods) &&
+            m.supportedGenerationMethods.includes("generateContent")
+        );
+    } catch { return []; }
+}
+
+async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) {
+    const key = getGoogleApiKey(env);
+    if (!key) return null;
+    if (!(await checkLlmStatus(env))) return null;
+
+    // Convert OpenAI-style messages to Google format
+    let systemInstruction = null;
+    const contents = [];
+
+    for (const msg of messages) {
+        if (msg.role === "system") {
+            systemInstruction = { parts: [{ text: msg.content }] };
+            continue;
+        }
+        const role = msg.role === "assistant" ? "model" : "user";
+        if (typeof msg.content === "string") {
+            contents.push({ role, parts: [{ text: msg.content }] });
+        } else if (Array.isArray(msg.content)) {
+            const parts = [];
+            for (const c of msg.content) {
+                if (c.type === "text") {
+                    parts.push({ text: c.text });
+                } else if (c.type === "image_url") {
+                    const dataUrl = c.image_url?.url || "";
+                    const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+                    if (match) {
+                        parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
+                    }
+                }
+            }
+            if (parts.length) contents.push({ role, parts });
+        }
+    }
+
+    if (!contents.length) return null;
+
+    const cleanModel = model.replace(/^models\//, "");
+    const body = {
+        contents,
+        generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 }
+    };
+    if (systemInstruction) body.systemInstruction = systemInstruction;
+
+    let lastErr = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const res = await fetch(
+                `${GOOGLE_AI_API}/models/${cleanModel}:generateContent?key=${key}`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body)
+                }
+            );
+
+            if (!res.ok) {
+                const errBody = await res.text();
+                lastErr = `HTTP ${res.status}: ${errBody.substring(0, 300)}`;
+                console.error(`[LLM/Google] Attempt ${attempt + 1} failed (${cleanModel}):`, lastErr);
+                if (res.status === 429 || res.status >= 500) {
+                    await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+                    continue;
+                }
+                break;
+            }
+
+            const data = await res.json();
+            if (data.error) {
+                lastErr = data.error.message || JSON.stringify(data.error);
+                console.error(`[LLM/Google] API error (${cleanModel}):`, lastErr);
+                break;
+            }
+
+            // Check for safety blocks
+            const candidate = data.candidates?.[0];
+            if (candidate?.finishReason === "SAFETY" || candidate?.finishReason === "RECITATION") {
+                lastErr = `Blocked by safety filter (${candidate.finishReason})`;
+                console.error(`[LLM/Google] ${lastErr}`);
+                break;
+            }
+
+            const text = candidate?.content?.parts?.[0]?.text?.trim();
+            if (text && text.length > 3) {
+                await recordLlmSuccess(env);
+                return text;
+            }
+            lastErr = "Empty response from model";
+        } catch (e) {
+            lastErr = e.message;
+            console.error(`[LLM/Google] Attempt ${attempt + 1} exception (${cleanModel}):`, e.message);
+            if (attempt < retries) await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+        }
+    }
+    console.error("[LLM/Google] All attempts failed:", lastErr);
+    await recordLlmFailure(env);
+    return null;
+}
+
+// ─── Unified LLM caller ──────────────────────────────────────────────────────
+
+async function callLLM(env, config, messages, maxTokens = 800) {
+    const provider = config?.llmProvider || "openrouter";
+    if (provider === "google") {
+        const model = config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel;
+        return callGoogleAI(env, model, messages, maxTokens);
+    }
+    const model = config.llmModel || DEFAULT_CONFIG.llmModel;
+    return callOpenRouter(env, model, messages, maxTokens);
+}
+
+// ─── AI generation helpers ───────────────────────────────────────────────────
 
 async function determineResolution(prompt, env, config) {
     const presets = [
@@ -510,17 +678,17 @@ async function determineResolution(prompt, env, config) {
         [1216, 832], [832, 1216], [1344, 768],
         [768, 1344], [1536, 640]
     ];
-    if (!env.OPENROUTER_API_KEY || !config.llmEnabled) {
+    if (!hasLlmProvider(env, config) || !config.llmEnabled) {
         const r = presets[Math.floor(Math.random() * presets.length)];
         return { width: r[0], height: r[1] };
     }
     try {
-        const result = await callOpenRouter(env, config.llmModel || DEFAULT_CONFIG.llmModel, [
+        const result = await callLLM(env, config, [
             { role: "system", content: "You are an AI choosing aspect ratios. Read the prompt and output ONLY one of these exact strings based on what visually fits best: '1024x1024' (Square), '1152x896' (Slight Landscape), '896x1152' (Slight Portrait), '1216x832' (Landscape), '832x1216' (Portrait), '1344x768' (Widescreen), '768x1344' (Tall), '1536x640' (Cinematic). NO explanations, NO markdown." },
             { role: "user", content: `Prompt: ${prompt}` }
         ], 50);
         if (result) {
-            const c = result.replace(/['"`]/g, '').trim().toLowerCase();
+            const c = result.replace(/['"`]/g, "").trim().toLowerCase();
             if (c.includes("1024x1024")) return { width: 1024, height: 1024 };
             if (c.includes("1152x896")) return { width: 1152, height: 896 };
             if (c.includes("896x1152")) return { width: 896, height: 1152 };
@@ -530,14 +698,13 @@ async function determineResolution(prompt, env, config) {
             if (c.includes("768x1344")) return { width: 768, height: 1344 };
             if (c.includes("1536x640")) return { width: 1536, height: 640 };
         }
-    } catch (e) { console.error("[LLM Resolution]", e); }
+    } catch (e) { console.error("[Resolution]", e); }
     const r = presets[Math.floor(Math.random() * presets.length)];
     return { width: r[0], height: r[1] };
 }
 
 async function generatePrompt(basePrompt, env, config, meta = {}) {
-    if (!env.OPENROUTER_API_KEY || !config.llmEnabled) return basePrompt;
-    const llmModel = config.llmModel || DEFAULT_CONFIG.llmModel;
+    if (!config.llmEnabled || !hasLlmProvider(env, config)) return basePrompt;
     const baseContext = config.systemContext || DEFAULT_SYSTEM_CONTEXT;
     let sysPrompt, userPrompt;
     const match = basePrompt.match(/\[([\s\S]*?)\]/);
@@ -548,19 +715,19 @@ async function generatePrompt(basePrompt, env, config, meta = {}) {
         sysPrompt = `${baseContext}\n\nExpand the theme deeply into a full detailed tag string.`;
         userPrompt = `Create a highly detailed Stable Diffusion prompt based on this theme: ${basePrompt}`;
     }
-    const result = await callOpenRouter(env, llmModel, [
+    const result = await callLLM(env, config, [
         { role: "system", content: sysPrompt },
         { role: "user", content: userPrompt }
     ], config.maxTokens || 800);
     if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
     const num = Number.isInteger(meta.promptNumber) ? ` #${meta.promptNumber}` : "";
-    throw new Error(`OpenRouter не смог обработать prompt${num}. Проверь модель (/status) или сбрось ошибки (/clearllm).`);
+    throw new Error(`LLM (${config.llmProvider || "openrouter"}) не смог обработать prompt${num}. Проверь /status или сбрось ошибки (/clearllm).`);
 }
 
 async function generateAiCaption(imagePrompt, env, config) {
-    if (!env.OPENROUTER_API_KEY || !config.llmEnabled)
+    if (!config.llmEnabled || !hasLlmProvider(env, config))
         return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 900))}</i>`;
-    const result = await callOpenRouter(env, config.llmModel || DEFAULT_CONFIG.llmModel, [
+    const result = await callLLM(env, config, [
         { role: "system", content: config.captionPrompt || DEFAULT_CONFIG.captionPrompt },
         { role: "user", content: `Теги изображения: ${imagePrompt.substring(0, 1000)}\n\nНапиши подпись для этого AI-арта.` }
     ], 500);
@@ -570,7 +737,7 @@ async function generateAiCaption(imagePrompt, env, config) {
 }
 
 async function analyzeImageArtifacts(imgData, env, config) {
-    if (!config.artifactCheckEnabled || !env.OPENROUTER_API_KEY || !imgData)
+    if (!config.artifactCheckEnabled || !imgData || !hasLlmProvider(env, config))
         return { severe: false, severity: "none", issues: [] };
     try {
         let dataUrl;
@@ -581,31 +748,38 @@ async function analyzeImageArtifacts(imgData, env, config) {
         } else {
             dataUrl = `data:image/webp;base64,${imgData}`;
         }
-        const moderationModel = config.visionModel || getVisionModels(config)[0];
-        const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-                "HTTP-Referer": "https://t.me",
-                "X-Title": "TgImageBot"
-            },
-            body: JSON.stringify({
-                model: moderationModel,
-                messages: [
-                    { role: "system", content: 'You detect visual AI artifacts. Return strict JSON only: {"severity":"none|minor|serious","issues":["..."]}.' },
-                    { role: "user", content: [
-                        { type: "text", text: "Check this image for severe generation artifacts: bad anatomy, melted limbs, broken faces, deformed hands, text glitches, severe blur, corruption." },
-                        { type: "image_url", image_url: { url: dataUrl } }
-                    ]}
-                ],
-                max_tokens: 300,
-                temperature: 0
-            })
-        });
-        if (!res.ok) return { severe: false, severity: "none", issues: [] };
-        const data = await res.json();
-        const raw = data.choices?.[0]?.message?.content?.trim();
+
+        const messages = [
+            { role: "system", content: 'You detect visual AI artifacts. Return strict JSON only: {"severity":"none|minor|serious","issues":["..."]}.' },
+            { role: "user", content: [
+                { type: "text", text: "Check this image for severe generation artifacts: bad anatomy, melted limbs, broken faces, deformed hands, text glitches, severe blur, corruption." },
+                { type: "image_url", image_url: { url: dataUrl } }
+            ]}
+        ];
+
+        let raw;
+        const provider = config.llmProvider || "openrouter";
+
+        if (provider === "google") {
+            const model = config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel;
+            raw = await callGoogleAI(env, model, messages, 300);
+        } else {
+            const moderationModel = config.visionModel || getVisionModels(config)[0];
+            const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+                    "HTTP-Referer": "https://t.me",
+                    "X-Title": "TgImageBot"
+                },
+                body: JSON.stringify({ model: moderationModel, messages, max_tokens: 300, temperature: 0 })
+            });
+            if (!res.ok) return { severe: false, severity: "none", issues: [] };
+            const data = await res.json();
+            raw = data.choices?.[0]?.message?.content?.trim();
+        }
+
         if (!raw) return { severe: false, severity: "none", issues: [] };
         const parsed = JSON.parse(raw.replace(/^```json|```$/g, "").trim());
         const severity = String(parsed.severity || "none").toLowerCase();
@@ -617,6 +791,8 @@ async function analyzeImageArtifacts(imgData, env, config) {
         return { severe: false, severity: "none", issues: [] };
     }
 }
+
+// ─── Callback handler ─────────────────────────────────────────────────────────
 
 async function handleCallbackQuery(callbackQuery, env) {
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
@@ -651,6 +827,8 @@ async function handleCallbackQuery(callbackQuery, env) {
     await tg.api("answerCallbackQuery", { callback_query_id: callbackQuery.id, text: statusText });
 }
 
+// ─── Command handler ──────────────────────────────────────────────────────────
+
 async function handleCommand(msg, env) {
     const chatId = msg.chat.id;
     const userId = msg.from?.id;
@@ -668,7 +846,7 @@ async function handleCommand(msg, env) {
     const userRole = getUserRole(userId, config);
 
     if (!text.startsWith("/")) {
-        if ((userRole === "none" || userRole === "participant")) {
+        if (userRole === "none" || userRole === "participant") {
             const suggestionText = text.trim();
             if (!suggestionText) return;
             const targetChatId = getSuggestTarget(config);
@@ -703,6 +881,7 @@ async function handleCommand(msg, env) {
     }
 
     switch (cmd) {
+
         case "/start":
         case "/help": {
             const roleLabel = userRole || "participant";
@@ -711,7 +890,7 @@ async function handleCommand(msg, env) {
                 helpText += `<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate [номер]\n\n`;
                 helpText += `<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n/promptsuggest &lt;текст&gt;\n\n`;
                 helpText += `<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ для промпта\n\n`;
-                helpText += `<b>LLM/Vision:</b>\n/llmlist | /img2txt (на фото) | /listvmodel | /setvmodel &lt;номер|id&gt;\n/togglellm | /setllm &lt;model&gt; | /clearllm\n\n`;
+                helpText += `<b>LLM/Vision:</b>\n/setprovider &lt;openrouter|google&gt; — переключить провайдера ИИ\n/llmlist | /img2txt (на фото) | /listvmodel | /setvmodel &lt;номер|id&gt;\n/togglellm | /setllm &lt;model&gt; | /clearllm\n\n`;
                 helpText += `<b>Роли (admin):</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin&gt;\n/setsuggesttarget &lt;chat_id|group|admin&gt;\n\n`;
                 helpText += `<b>Настройки генерации:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark | /toggleartifactcheck\n\n`;
                 helpText += `<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`;
@@ -722,39 +901,84 @@ async function handleCommand(msg, env) {
             break;
         }
 
+        case "/setprovider": {
+            const p = params[0]?.toLowerCase();
+            if (!["openrouter", "google"].includes(p))
+                return await tg.send(chatId, "❌ /setprovider &lt;openrouter|google&gt;\n\n<b>openrouter</b> — OpenRouter API\n<b>google</b> — Google AI Studio API\n\n<i>Для Google: укажи GOOGLE_AI_API_KEY в переменных окружения Cloudflare Worker.</i>");
+            if (p === "google" && !getGoogleApiKey(env))
+                return await tg.send(chatId, "❌ Переменная окружения <code>GOOGLE_AI_API_KEY</code> не настроена.\n\nДобавь её в Settings → Variables → Environment Variables в Cloudflare Worker.");
+            if (p === "openrouter" && !env.OPENROUTER_API_KEY)
+                return await tg.send(chatId, "⚠️ Переменная окружения <code>OPENROUTER_API_KEY</code> не настроена, но провайдер всё равно переключается.");
+            config.llmProvider = p;
+            await saveConfig(env, config);
+            await KV.put(env, "llm_fails", "0");
+            await KV.del(env, "llm_timeout");
+            const currentModel = p === "google"
+                ? (config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel)
+                : (config.llmModel || DEFAULT_CONFIG.llmModel);
+            await tg.send(chatId, `✅ LLM провайдер: <b>${p === "google" ? "🔵 Google AI Studio" : "🟠 OpenRouter"}</b>\nМодель: <code>${escapeHtml(currentModel)}</code>\n<i>Счётчик ошибок сброшен.</i>`);
+            break;
+        }
+
         case "/llmlist": {
-            if (!env.OPENROUTER_API_KEY) return await tg.send(chatId, "❌ OPENROUTER_API_KEY не настроен.");
-            await tg.send(chatId, "⏳ Запрашиваю информацию у OpenRouter...");
-            try {
-                const authRes = await fetch("https://openrouter.ai/api/v1/auth/key", {
-                    headers: { "Authorization": `Bearer ${env.OPENROUTER_API_KEY}` }
-                });
-                let info = `🔑 <b>Статус ключа OpenRouter:</b>\n`;
-                if (authRes.ok) {
-                    const d = await authRes.json();
-                    if (d.data) {
-                        const limit = d.data.limit !== null ? `$${d.data.limit}` : "Без лимита";
-                        info += `Потрачено: $${d.data.usage.toFixed(4)} / ${limit}\nБесплатный тир: ${d.data.is_free_tier ? "Да" : "Нет"}\n`;
-                        if (d.data.rate_limit) info += `Лимит: ${d.data.rate_limit.requests} req / ${d.data.rate_limit.interval}\n`;
+            const provider = config.llmProvider || "openrouter";
+            if (provider === "google") {
+                const key = getGoogleApiKey(env);
+                if (!key) return await tg.send(chatId, "❌ GOOGLE_AI_API_KEY не настроен.");
+                await tg.send(chatId, "⏳ Загружаю модели Google AI Studio...");
+                try {
+                    const models = await fetchGoogleModels(env);
+                    if (!models.length) return await tg.send(chatId, "❌ Не удалось получить список моделей. Проверь API ключ.");
+                    const currentLlm = config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel;
+                    const currentVision = config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel;
+                    let info = `🔵 <b>Google AI Studio модели (${models.length}):</b>\n\n`;
+                    info += `Текущая LLM: <code>${escapeHtml(currentLlm)}</code>\nТекущая Vision: <code>${escapeHtml(currentVision)}</code>\n\n`;
+                    for (const m of models) {
+                        const name = m.name.replace("models/", "");
+                        const isLlm = name === currentLlm;
+                        const isVision = name === currentVision;
+                        const mark = isLlm && isVision ? "✅✅" : isLlm ? "✅" : isVision ? "👁" : "▫️";
+                        const inputLimit = m.inputTokenLimit ? ` (${Math.round(m.inputTokenLimit / 1000)}k)` : "";
+                        info += `${mark} <code>${escapeHtml(name)}</code>${inputLimit}\n`;
+                        if (info.length > 3600) { info += `<i>...и ещё ${models.length} моделей</i>`; break; }
                     }
-                } else {
-                    info += `Не удалось получить статус ключа.\n`;
-                }
-                const modelsRes = await fetch("https://openrouter.ai/api/v1/models");
-                if (modelsRes.ok) {
-                    const md = await modelsRes.json();
-                    const free = md.data.filter(m => parseFloat(m.pricing.prompt) === 0 && parseFloat(m.pricing.completion) === 0);
-                    info += `\n🆓 <b>Бесплатные модели (${free.length}):</b>\n`;
-                    free.slice(0, 40).forEach(m => { info += `<code>${m.id}</code>\n`; });
-                    if (free.length > 40) info += `<i>...и ещё ${free.length - 40}</i>`;
-                }
-                await tg.send(chatId, info);
-            } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+                    info += "\n💡 <i>/setllm &lt;имя&gt; — LLM | /setvmodel &lt;имя&gt; — Vision</i>";
+                    await tg.send(chatId, info);
+                } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+            } else {
+                if (!env.OPENROUTER_API_KEY) return await tg.send(chatId, "❌ OPENROUTER_API_KEY не настроен.");
+                await tg.send(chatId, "⏳ Запрашиваю информацию у OpenRouter...");
+                try {
+                    const authRes = await fetch("https://openrouter.ai/api/v1/auth/key", {
+                        headers: { "Authorization": `Bearer ${env.OPENROUTER_API_KEY}` }
+                    });
+                    let info = `🟠 <b>Статус ключа OpenRouter:</b>\n`;
+                    if (authRes.ok) {
+                        const d = await authRes.json();
+                        if (d.data) {
+                            const limit = d.data.limit !== null ? `$${d.data.limit}` : "Без лимита";
+                            info += `Потрачено: $${d.data.usage.toFixed(4)} / ${limit}\nБесплатный тир: ${d.data.is_free_tier ? "Да" : "Нет"}\n`;
+                            if (d.data.rate_limit) info += `Лимит: ${d.data.rate_limit.requests} req / ${d.data.rate_limit.interval}\n`;
+                        }
+                    } else {
+                        info += "Не удалось получить статус ключа.\n";
+                    }
+                    const modelsRes = await fetch("https://openrouter.ai/api/v1/models");
+                    if (modelsRes.ok) {
+                        const md = await modelsRes.json();
+                        const free = (md.data || []).filter(m => parseFloat(m.pricing?.prompt) === 0 && parseFloat(m.pricing?.completion) === 0);
+                        info += `\n🆓 <b>Бесплатные модели (${free.length}):</b>\n`;
+                        free.slice(0, 40).forEach(m => { info += `<code>${m.id}</code>\n`; });
+                        if (free.length > 40) info += `<i>...и ещё ${free.length - 40}</i>`;
+                    }
+                    await tg.send(chatId, info);
+                } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+            }
             break;
         }
 
         case "/img2txt": {
-            if (!env.OPENROUTER_API_KEY) return await tg.send(chatId, "❌ OPENROUTER_API_KEY не настроен.");
+            if (!hasLlmProvider(env, config)) return await tg.send(chatId, "❌ Не настроен API ключ LLM провайдера.");
 
             if (userRole === "none" || userRole === "participant") {
                 const cdKey = `none_img2txt_cd:${userId}`;
@@ -766,7 +990,9 @@ async function handleCommand(msg, env) {
                 await KV.put(env, cdKey, String(Date.now() + NONE_IMG2TXT_COOLDOWN_SEC * 1000), { expirationTtl: NONE_IMG2TXT_COOLDOWN_SEC });
             }
 
-            const photo = msg.photo?.[msg.photo.length - 1] ?? msg.reply_to_message?.photo?.[msg.reply_to_message.photo.length - 1] ?? null;
+            const photo = msg.photo?.[msg.photo.length - 1]
+                ?? msg.reply_to_message?.photo?.[msg.reply_to_message.photo.length - 1]
+                ?? null;
             if (!photo) return await tg.send(chatId, "❌ Прикрепи картинку к /img2txt или ответь командой на сообщение с картинкой.");
 
             await tg.send(chatId, "⏳ Скачиваю и анализирую картинку...");
@@ -780,40 +1006,52 @@ async function handleCommand(msg, env) {
 
                 const sysPrompt = "You are a specialized image analyzer for Stable Diffusion (SDXL Illustrious) and Anime art. Describe the character(s), physical features, eye/hair color, clothing, pose, background, lighting, and style using ONLY comma-separated booru-style tags. OUTPUT ONLY COMMA-SEPARATED TAGS. No introductory text, no sentences.";
 
-                const visionModels = getVisionModels(config);
+                const imageMessages = [
+                    { role: "system", content: sysPrompt },
+                    { role: "user", content: [
+                        { type: "text", text: "Extract booru tags from this image for Illustrious XL:" },
+                        { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Img}` } }
+                    ]}
+                ];
+
+                const provider = config.llmProvider || "openrouter";
                 let tags = null, usedModel = "", lastError = "";
 
-                for (const vModel of visionModels) {
-                    try {
-                        const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                                "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
-                                "HTTP-Referer": "https://t.me",
-                                "X-Title": "TgImageBot"
-                            },
-                            body: JSON.stringify({
-                                model: vModel,
-                                messages: [
-                                    { role: "system", content: sysPrompt },
-                                    { role: "user", content: [
-                                        { type: "text", text: "Extract booru tags from this image for Illustrious XL:" },
-                                        { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Img}` } }
-                                    ]}
-                                ],
-                                max_tokens: 500
-                            })
-                        });
-                        if (orRes.ok) {
-                            const orData = await orRes.json();
-                            if (orData.error) { lastError = `${vModel}: ${orData.error.message || JSON.stringify(orData.error)}`; continue; }
-                            const content = orData.choices?.[0]?.message?.content?.trim();
-                            if (content && content.length > 5) { tags = content; usedModel = vModel; break; }
-                        } else {
-                            lastError = `${vModel}: HTTP ${orRes.status}`;
+                if (provider === "google") {
+                    const visionModels = getVisionModels(config);
+                    for (const vModel of visionModels) {
+                        const result = await callGoogleAI(env, vModel, imageMessages, 500, 1);
+                        if (result && result.length > 5) {
+                            tags = result;
+                            usedModel = `Google: ${vModel}`;
+                            break;
                         }
-                    } catch (e) { lastError = `${vModel}: ${e.message}`; }
+                        lastError = `${vModel}: no result`;
+                    }
+                } else {
+                    const visionModels = getVisionModels(config);
+                    for (const vModel of visionModels) {
+                        try {
+                            const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                                method: "POST",
+                                headers: {
+                                    "Content-Type": "application/json",
+                                    "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+                                    "HTTP-Referer": "https://t.me",
+                                    "X-Title": "TgImageBot"
+                                },
+                                body: JSON.stringify({ model: vModel, messages: imageMessages, max_tokens: 500 })
+                            });
+                            if (orRes.ok) {
+                                const orData = await orRes.json();
+                                if (orData.error) { lastError = `${vModel}: ${orData.error.message || JSON.stringify(orData.error)}`; continue; }
+                                const content = orData.choices?.[0]?.message?.content?.trim();
+                                if (content && content.length > 5) { tags = content; usedModel = vModel; break; }
+                            } else {
+                                lastError = `${vModel}: HTTP ${orRes.status}`;
+                            }
+                        } catch (e) { lastError = `${vModel}: ${e.message}`; }
+                    }
                 }
 
                 if (tags) {
@@ -891,7 +1129,7 @@ async function handleCommand(msg, env) {
         case "/clearllm": {
             await KV.put(env, "llm_fails", "0");
             await KV.del(env, "llm_timeout");
-            await tg.send(chatId, "✅ LLM ошибки сброшены. Бот снова будет пытаться использовать OpenRouter.");
+            await tg.send(chatId, "✅ LLM ошибки сброшены. Бот снова будет пытаться использовать LLM провайдера.");
             break;
         }
 
@@ -900,7 +1138,10 @@ async function handleCommand(msg, env) {
             const llmFails = await KV.get(env, "llm_fails") || "0";
             const llmTimeout = await KV.get(env, "llm_timeout");
             const llmBlocked = llmTimeout && Date.now() < parseInt(llmTimeout);
-            await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 OpenRouter: ${env.OPENROUTER_API_KEY ? "✅" : "❌"} (LLM: ${config.llmEnabled ? "🟢" : "🔴"}${llmBlocked ? " ⏸ заблокирован" : ""}, ошибок: ${llmFails})`);
+            const provider = config.llmProvider || "openrouter";
+            const providerLabel = provider === "google" ? "🔵 Google" : "🟠 OpenRouter";
+            const providerKey = provider === "google" ? !!getGoogleApiKey(env) : !!env.OPENROUTER_API_KEY;
+            await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 LLM: ${providerLabel} ${providerKey ? "✅" : "❌"} (${config.llmEnabled ? "🟢 вкл" : "🔴 выкл"}${llmBlocked ? " ⏸ заблокирован" : ""}, ошибок: ${llmFails})`);
             break;
         }
 
@@ -927,7 +1168,7 @@ async function handleCommand(msg, env) {
 
         case "/addprompt": {
             if (!params.length) return await tg.send(chatId, "❌ /addprompt &lt;текст&gt;");
-            const prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p => p.trim()).filter(Boolean) : [];
+            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) : [];
             prompts.push(params.join(" "));
             config.generalPrompt = prompts.join(" ; ");
             await saveConfig(env, config);
@@ -937,7 +1178,7 @@ async function handleCommand(msg, env) {
 
         case "/delprompt": {
             if (!params.length) return await tg.send(chatId, "❌ /delprompt &lt;номер&gt;");
-            const prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p => p.trim()).filter(Boolean) : [];
+            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) : [];
             const idx = parseInt(params[0]) - 1;
             if (isNaN(idx) || idx < 0 || idx >= prompts.length) return await tg.send(chatId, `❌ Неверный номер (1–${prompts.length})`);
             prompts.splice(idx, 1);
@@ -948,7 +1189,7 @@ async function handleCommand(msg, env) {
         }
 
         case "/promptlist": {
-            const prompts = config.generalPrompt ? config.generalPrompt.split(';').map(p => p.trim()).filter(Boolean) : [];
+            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) : [];
             if (!prompts.length) return await tg.send(chatId, "📋 Список промптов пуст");
             if (params.length && !isNaN(parseInt(params[0]))) {
                 const idx = parseInt(params[0]) - 1;
@@ -969,7 +1210,7 @@ async function handleCommand(msg, env) {
         case "/setprompt":
             if (!params.length) return await tg.send(chatId, "❌ /setprompt &lt;тема1; тема2&gt;");
             config.generalPrompt = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ Промпты перезаписаны.`);
+            await tg.send(chatId, "✅ Промпты перезаписаны.");
             break;
 
         case "/setcontext":
@@ -1155,22 +1396,33 @@ async function handleCommand(msg, env) {
             await tg.send(chatId, "✅ Негативный промпт сохранён");
             break;
 
-        case "/setllm":
+        case "/setllm": {
             if (!params.length) return await tg.send(chatId, "❌ /setllm &lt;модель&gt;");
-            config.llmModel = params.join(" ");
+            const newModel = params.join(" ");
+            const provider = config.llmProvider || "openrouter";
+            if (provider === "google") {
+                config.googleLlmModel = newModel;
+            } else {
+                config.llmModel = newModel;
+            }
             await saveConfig(env, config);
             await KV.put(env, "llm_fails", "0");
             await KV.del(env, "llm_timeout");
-            await tg.send(chatId, `✅ LLM: <code>${config.llmModel}</code>\n<i>Счётчик ошибок сброшен.</i>`);
+            await tg.send(chatId, `✅ LLM (${provider === "google" ? "🔵 Google" : "🟠 OpenRouter"}): <code>${escapeHtml(newModel)}</code>\n<i>Счётчик ошибок сброшен.</i>`);
             break;
+        }
 
         case "/listvmodel": {
             const vModels = getVisionModels(config);
-            const current = config.visionModel || vModels[0] || "";
-            let txt = "👁️ <b>Vision модели для /img2txt:</b>\n\n";
+            const provider = config.llmProvider || "openrouter";
+            const current = provider === "google"
+                ? (config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel)
+                : (config.visionModel || vModels[0] || "");
+            const providerLabel = provider === "google" ? "🔵 Google AI Studio" : "🟠 OpenRouter";
+            let txt = `👁️ <b>Vision модели для /img2txt [${providerLabel}]:</b>\n\n`;
             txt += `Текущая: <code>${escapeHtml(current || "не задана")}</code>\n\n`;
             vModels.forEach((m, i) => { txt += `${m === current ? "✅" : "▫️"} ${i + 1}. <code>${escapeHtml(m)}</code>\n`; });
-            txt += "\n💡 <i>/setvmodel &lt;номер&gt; или /setvmodel &lt;model-id&gt;</i>\n<i>Можно указать любую OpenRouter vision-модель</i>";
+            txt += "\n💡 <i>/setvmodel &lt;номер&gt; или /setvmodel &lt;model-id&gt;</i>\n<i>/setprovider для смены провайдера</i>";
             await tg.send(chatId, txt);
             break;
         }
@@ -1181,9 +1433,14 @@ async function handleCommand(msg, env) {
             const raw = params.join(" ").trim();
             const idx = parseInt(raw, 10);
             const selected = (!isNaN(idx) && idx >= 1 && idx <= vModels.length) ? vModels[idx - 1] : raw;
-            config.visionModel = selected;
+            const provider = config.llmProvider || "openrouter";
+            if (provider === "google") {
+                config.googleVisionModel = selected;
+            } else {
+                config.visionModel = selected;
+            }
             await saveConfig(env, config);
-            await tg.send(chatId, `✅ Vision модель: <code>${escapeHtml(selected)}</code>`);
+            await tg.send(chatId, `✅ Vision модель (${provider === "google" ? "🔵 Google" : "🟠 OpenRouter"}): <code>${escapeHtml(selected)}</code>`);
             break;
         }
 
@@ -1247,7 +1504,7 @@ async function handleCommand(msg, env) {
             if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала добавь промпт (/addprompt)");
             let targetPromptSegment = null;
             if (params.length && !isNaN(parseInt(params[0]))) {
-                const prompts = config.generalPrompt.split(';').map(p => p.trim()).filter(Boolean);
+                const prompts = config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean);
                 const idx = parseInt(params[0]) - 1;
                 if (idx >= 0 && idx < prompts.length) targetPromptSegment = prompts[idx];
                 else return await tg.send(chatId, `❌ Неверный номер промпта. Всего: ${prompts.length}`);
@@ -1263,29 +1520,31 @@ async function handleCommand(msg, env) {
                     let segment = targetPromptSegment;
                     let promptNumber = null;
                     if (segment !== null) {
-                        const prompts = config.generalPrompt.split(';').map(p => p.trim()).filter(Boolean);
+                        const prompts = config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean);
                         promptNumber = prompts.indexOf(segment) + 1;
+                        if (promptNumber === 0) promptNumber = null;
                     } else {
                         const info = getRandomPromptSegmentInfo(config.generalPrompt);
-                        segment = info.segment; promptNumber = info.index + 1;
+                        segment = info.segment;
+                        promptNumber = info.index + 1;
                     }
                     const { cleanPrompt, extraLoras, excludedLoras, disableLlm, modelOverride } = parsePromptLoras(segment);
                     const lorasOverride = buildLorasForRequest(config, extraLoras, excludedLoras);
                     const finalPrompt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config, { promptNumber });
                     const bestRes = await determineResolution(finalPrompt, env, config);
-                    const loraInfo = lorasOverride.length > 0 ? `\n🎨 LoRA: ${lorasOverride.map(l => `${l.name}(${l.strength})`).join(', ')}` : '';
+                    const loraInfo = lorasOverride.length > 0 ? `\n🎨 LoRA: ${lorasOverride.map(l => `${l.name}(${l.strength})`).join(", ")}` : "";
                     await tg.send(chatId, `🎨 #${i + 1} (prompt #${promptNumber || "?"}):\n<code>${escapeHtml(finalPrompt.substring(0, 3500))}</code>\n📏 ${bestRes.width}x${bestRes.height}${loraInfo}${modelOverride ? `\n🧠 ${modelOverride}` : ""}`);
                     const res = await hordeSubmit(finalPrompt, config, env, { workerBlacklist: bl, width: bestRes.width, height: bestRes.height, lorasOverride, modelOverride });
                     if (res.id) {
                         await KV.put(env, `pending:${res.id}`, { targets, prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0, batchId, promptNumber, lorasOverride, modelOverride }, { expirationTtl: PENDING_TTL_SEC });
                     } else {
                         await tg.send(chatId, `❌ Horde: ${escapeHtml(JSON.stringify(res))}`);
-                        let batch = await KV.get(env, `batch:${batchId}`, "json");
+                        const batch = await KV.get(env, `batch:${batchId}`, "json");
                         if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                     }
                 } catch (e) {
                     await tg.send(chatId, `❌ Ошибка генерации: ${e.message}`);
-                    let batch = await KV.get(env, `batch:${batchId}`, "json");
+                    const batch = await KV.get(env, `batch:${batchId}`, "json");
                     if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 if (i < actualCount - 1) await new Promise(r => setTimeout(r, 2000));
@@ -1299,11 +1558,19 @@ async function handleCommand(msg, env) {
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
             const globalLoras = (config.loras || []).filter(l => l.global !== false);
             const manualLoras = (config.loras || []).filter(l => l.global === false);
-            const promptsCount = config.generalPrompt ? config.generalPrompt.split(';').filter(Boolean).length : 0;
+            const promptsCount = config.generalPrompt ? config.generalPrompt.split(";").filter(Boolean).length : 0;
             const llmFails = await KV.get(env, "llm_fails") || "0";
             const llmTimeout = await KV.get(env, "llm_timeout");
             const llmBlocked = llmTimeout && Date.now() < parseInt(llmTimeout) ? " ⏸ заблокирован" : "";
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> <code>${escapeHtml(config.llmModel || DEFAULT_CONFIG.llmModel)}</code>\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Vision:</b> <code>${escapeHtml(config.visionModel || getVisionModels(config)[0] || "не задана")}</code>\n<b>Очередь:</b> ${queueCount}`);
+            const provider = config.llmProvider || "openrouter";
+            const providerLabel = provider === "google" ? "🔵 Google AI Studio" : "🟠 OpenRouter";
+            const currentLlmModel = provider === "google"
+                ? (config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel)
+                : (config.llmModel || DEFAULT_CONFIG.llmModel);
+            const currentVisionModel = provider === "google"
+                ? (config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel)
+                : (config.visionModel || getVisionModels(config)[0] || "не задана");
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> <code>${escapeHtml(currentLlmModel)}</code>\n<b>Vision:</b> <code>${escapeHtml(currentVisionModel)}</code>\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1345,6 +1612,8 @@ async function handleCommand(msg, env) {
     }
 }
 
+// ─── Scheduled / polling loop ─────────────────────────────────────────────────
+
 async function processScheduled(env) {
     if (!env.UPSTASH_REDIS_REST_URL || !env.TELEGRAM_BOT_TOKEN) return;
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
@@ -1361,7 +1630,7 @@ async function processScheduled(env) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
                 if (task.batchId) {
-                    let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                    const batch = await KV.get(env, `batch:${task.batchId}`, "json");
                     if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
@@ -1372,7 +1641,7 @@ async function processScheduled(env) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `❌ Задача провалилась: <code>${id}</code>`);
                 if (task.batchId) {
-                    let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                    const batch = await KV.get(env, `batch:${task.batchId}`, "json");
                     if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
@@ -1384,7 +1653,7 @@ async function processScheduled(env) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации: <code>${id}</code>`);
                 if (task.batchId) {
-                    let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                    const batch = await KV.get(env, `batch:${task.batchId}`, "json");
                     if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
@@ -1395,7 +1664,7 @@ async function processScheduled(env) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `⚠️ Пустой результат: <code>${id}</code>`);
                 if (task.batchId) {
-                    let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                    const batch = await KV.get(env, `batch:${task.batchId}`, "json");
                     if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
@@ -1403,7 +1672,8 @@ async function processScheduled(env) {
 
             let censored = false, finalImageBase64 = null, workerId = "?", workerName = "?";
             for (const gen of gens) {
-                workerId = gen.worker_id || "?"; workerName = gen.worker_name || "?";
+                workerId = gen.worker_id || "?";
+                workerName = gen.worker_name || "?";
                 if (isCensored(gen)) { censored = true; break; }
                 if (gen.img) finalImageBase64 = gen.img;
             }
@@ -1422,7 +1692,7 @@ async function processScheduled(env) {
                 } else {
                     if (task.notify) await tg.send(task.notify, "❌ 3 попытки неудачны.");
                     if (task.batchId) {
-                        let batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                        const batch = await KV.get(env, `batch:${task.batchId}`, "json");
                         if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                     }
                 }
@@ -1465,7 +1735,7 @@ async function processScheduled(env) {
                             let delivered = true;
                             for (const tId of batch.targets) {
                                 if (batch.ready.length === 1) {
-                                    const sr = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config, env);
+                                    const sr = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
                                     if (!sr.sent) { delivered = false; break; }
                                 } else {
                                     const bufs = [];
@@ -1475,7 +1745,11 @@ async function processScheduled(env) {
                                     }
                                     if (!bufs.length) { delivered = false; break; }
                                     const mg = await tg.sendMediaGroup(tId, bufs, captionText);
-                                    if (!mg.ok) { delivered = false; if (batch.notify) await tg.send(batch.notify, `❌ Ошибка media group: ${escapeHtml(mg.description || "unknown")}`); break; }
+                                    if (!mg.ok) {
+                                        delivered = false;
+                                        if (batch.notify) await tg.send(batch.notify, `❌ Ошибка media group: ${escapeHtml(mg.description || "unknown")}`);
+                                        break;
+                                    }
                                 }
                             }
                             if (delivered) {
@@ -1493,7 +1767,8 @@ async function processScheduled(env) {
                             await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC });
                         }
                     } else {
-                        const fr = await deliverImage(tg, task.targets[0], finalImageBase64, "", task.notify, config, env);
+                        // Batch record lost — deliver solo
+                        const fr = await deliverImage(tg, task.targets?.[0], finalImageBase64, "", task.notify, config);
                         if (!fr.sent) shouldDeletePending = false;
                     }
                 } else {
@@ -1502,7 +1777,7 @@ async function processScheduled(env) {
                     else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
                     let deliveredAll = true;
                     for (const tId of (task.targets || [])) {
-                        const sr = await deliverImage(tg, tId, finalImageBase64, captionText, task.notify, config, env);
+                        const sr = await deliverImage(tg, tId, finalImageBase64, captionText, task.notify, config);
                         if (!sr.sent) deliveredAll = false;
                     }
                     if (!deliveredAll) {
@@ -1521,16 +1796,19 @@ async function processScheduled(env) {
         } catch (e) { console.error(`[CRON] ${id}:`, e.message); }
     }
 
+    // Flush orphaned complete batches
     const activeBatches = await KV.list(env, "batch:");
     for (const bKey of activeBatches.keys) {
-        let batch = await KV.get(env, bKey.name, "json");
+        const batch = await KV.get(env, bKey.name, "json");
         if (!batch) continue;
         if (batch.expected <= 0 && batch.ready.length > 0) {
-            const captionText = config.captionMode === 1 ? `🎨 <i>${escapeHtml(batch.prompt.substring(0, 900))}</i>` : "";
+            let captionText = "";
+            if (config.captionMode === 1) captionText = `🎨 <i>${escapeHtml((batch.prompt || "").substring(0, 900))}</i>`;
+            else if (config.captionMode === 2) captionText = await generateAiCaption(batch.prompt || "", env, config);
             let delivered = true;
             for (const tId of batch.targets) {
                 if (batch.ready.length === 1) {
-                    const sr = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config, env);
+                    const sr = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
                     if (!sr.sent) { delivered = false; break; }
                 } else {
                     const bufs = [];
@@ -1582,12 +1860,12 @@ async function processScheduled(env) {
                 queuedCount++;
             } else {
                 if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка Horde, prompt #${info.index + 1}:</b>\n<code>${escapeHtml(JSON.stringify(res))}</code>`);
-                let batch = await KV.get(env, `batch:${batchId}`, "json");
+                const batch = await KV.get(env, `batch:${batchId}`, "json");
                 if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
             }
         } catch (e) {
             if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
-            let batch = await KV.get(env, `batch:${batchId}`, "json");
+            const batch = await KV.get(env, `batch:${batchId}`, "json");
             if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
         }
         if (i < actualCount - 1) await new Promise(r => setTimeout(r, 2000));
@@ -1595,6 +1873,8 @@ async function processScheduled(env) {
 
     await KV.put(env, "last_post_time", String(queuedCount > 0 ? now : now - (config.interval * 60 * 1000) + 120000));
 }
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
 
 export default {
     async fetch(req, env, ctx) {
@@ -1605,7 +1885,13 @@ export default {
             const config = await getConfig(env);
             if (config.watermarkData) {
                 const buf = base64ToBuffer(config.watermarkData);
-                if (buf) return new Response(buf, { headers: { "Content-Type": "image/png", "Cache-Control": "public, max-age=31536000", "Access-Control-Allow-Origin": "*" } });
+                if (buf) return new Response(buf, {
+                    headers: {
+                        "Content-Type": "image/png",
+                        "Cache-Control": "public, max-age=31536000",
+                        "Access-Control-Allow-Origin": "*"
+                    }
+                });
             }
             return new Response("Not found", { status: 404 });
         }
