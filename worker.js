@@ -10,7 +10,7 @@ const DEFAULT_CONFIG = {
     systemContext: "",
     maxTokens: 800,
     model: "AlbedoBase XL (SDXL)",
-    loras: [],
+    loras:[],
     width: 1024,
     height: 1024,
     steps: 25,
@@ -24,7 +24,7 @@ const DEFAULT_CONFIG = {
     googleLlmModel: "gemini-2.0-flash",
     visionModel: "openrouter/free",
     googleVisionModel: "gemini-2.0-flash",
-    visionModels: [
+    visionModels:[
         "openrouter/free",
         "google/gemma-3-27b-it:free",
         "meta-llama/llama-3.2-11b-vision-instruct:free",
@@ -32,7 +32,7 @@ const DEFAULT_CONFIG = {
         "qwen/qwen2.5-vl-7b-instruct:free",
         "mistralai/pixtral-12b:free"
     ],
-    googleVisionModels: [
+    googleVisionModels:[
         "gemini-2.0-flash",
         "gemini-2.0-flash-lite",
         "gemini-1.5-flash",
@@ -42,7 +42,7 @@ const DEFAULT_CONFIG = {
     hiresFix: false,
     hiresFixDenoising: 0.65,
     karras: true,
-    postProcessors: [],
+    postProcessors:[],
     captionMode: 1,
     captionPrompt: "Ты пишешь подписи к AI-арту для Telegram-канала. По тегам Stable Diffusion напиши живое, атмосферное описание на 4-6 предложений. Передай настроение, опиши персонажа(ей), обстановку, освещение и атмосферу сцены. Используй эмодзи органично. Не упоминай технические теги и не начинай с вводных фраз типа «На картинке» или «Изображение».",
     useSpoiler: false,
@@ -88,7 +88,7 @@ function getVisionModels(config) {
     if (config.llmProvider === "google") {
         const base = Array.isArray(config.googleVisionModels) && config.googleVisionModels.length
             ? config.googleVisionModels
-            : [...DEFAULT_CONFIG.googleVisionModels];
+            :[...DEFAULT_CONFIG.googleVisionModels];
         const preferred = config.googleVisionModel;
         if (!preferred) return base;
         return [preferred, ...base.filter(m => m !== preferred)];
@@ -98,7 +98,7 @@ function getVisionModels(config) {
         : [...DEFAULT_CONFIG.visionModels];
     const preferred = config.visionModel;
     if (!preferred) return base;
-    return [preferred, ...base.filter(m => m !== preferred)];
+    return[preferred, ...base.filter(m => m !== preferred)];
 }
 
 function hasLlmProvider(env, config) {
@@ -156,7 +156,7 @@ function getRandomPromptSegmentInfo(generalPrompt) {
 
 function parsePromptLoras(prompt) {
     let cleanPrompt = prompt;
-    const extraLoras = [], excludedLoras = [];
+    const extraLoras = [], excludedLoras =[];
     let disableLlm = false, modelOverride = null;
     const regex = /\{([^}]*)\}/g;
     let match;
@@ -178,11 +178,11 @@ function parsePromptLoras(prompt) {
     return { cleanPrompt, extraLoras, excludedLoras, disableLlm, modelOverride };
 }
 
-function buildLorasForRequest(config, extraLoras = [], excludedLoras = []) {
-    const globalLoras = (config.loras || []).filter(l =>
+function buildLorasForRequest(config, extraLoras = [], excludedLoras =[]) {
+    const globalLoras = (config.loras ||[]).filter(l =>
         l.global !== false && !excludedLoras.includes(String(l.name))
     );
-    return [...globalLoras, ...extraLoras];
+    return[...globalLoras, ...extraLoras];
 }
 
 function getUserRole(userId, config) {
@@ -193,13 +193,13 @@ function getUserRole(userId, config) {
 
 function checkAccess(role, cmd) {
     if (role === "admin") return true;
-    const creatorCmds = [
+    const creatorCmds =[
         "/addprompt", "/delprompt", "/promptlist", "/setprompt", "/setcontext",
         "/addlora", "/listloras", "/clearloras", "/dellora", "/setneg",
         "/generate", "/help", "/start", "/ping", "/setwatermark", "/delwatermark",
         "/img2txt", "/llmlist", "/setvmodel", "/listvmodel"
     ];
-    const techCmds = [
+    const techCmds =[
         "/status", "/pending", "/cancel", "/workerbl", "/ping",
         "/listmodels", "/searchmodel", "/setenhancer", "/setsize", "/setsteps",
         "/setcfg", "/setsampler", "/help", "/start", "/togglellm", "/setllm",
@@ -207,7 +207,7 @@ function checkAccess(role, cmd) {
         "/setspoiler", "/setmodel", "/setinterval", "/setcount", "/enable", "/disable",
         "/clearllm", "/setprovider", "/llmlist"
     ];
-    const participantCmds = ["/start", "/help", "/ping", "/promptsuggest", "/img2txt"];
+    const participantCmds =["/start", "/help", "/ping", "/promptsuggest", "/img2txt"];
     if (role === "creator") return creatorCmds.includes(cmd);
     if (role === "tech") return techCmds.includes(cmd);
     return participantCmds.includes(cmd);
@@ -215,6 +215,34 @@ function checkAccess(role, cmd) {
 
 function getSuggestTarget(config) {
     return config.suggestTargetChatId || config.groupId || config.adminId;
+}
+
+function formatMessagesForModel(messages, model) {
+    if (!model || !model.toLowerCase().includes("gemma")) return messages;
+    const finalMessages =[];
+    let sysPrompt = "";
+    for (const msg of messages) {
+        if (msg.role === "system") sysPrompt += msg.content + "\n";
+        else finalMessages.push({ ...msg });
+    }
+    if (sysPrompt && finalMessages.length > 0) {
+        const firstUser = finalMessages[0];
+        if (typeof firstUser.content === "string") {
+            firstUser.content = `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n${firstUser.content}`;
+        } else if (Array.isArray(firstUser.content)) {
+            firstUser.content =[{ type: "text", text: `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n` }, ...firstUser.content];
+        }
+    } else if (sysPrompt) {
+        finalMessages.push({ role: "user", content: sysPrompt.trim() });
+    }
+    return finalMessages;
+}
+
+function pickRandomModel(modelStr) {
+    if (!modelStr) return "AlbedoBase XL (SDXL)";
+    const arr = modelStr.split(',').map(s => s.trim()).filter(Boolean);
+    if (!arr.length) return modelStr;
+    return arr[Math.floor(Math.random() * arr.length)];
 }
 
 // ─── Telegram ────────────────────────────────────────────────────────────────
@@ -245,14 +273,15 @@ class Telegram {
         if (extra.replyMarkup) form.append("reply_markup", JSON.stringify(extra.replyMarkup));
         return (await fetch(`${this.base}/sendPhoto`, { method: "POST", body: form })).json();
     }
-    async sendMediaGroup(chatId, buffers, caption = "") {
+    async sendMediaGroup(chatId, buffers, caption = "", extra = {}) {
         const form = new FormData();
         form.append("chat_id", String(chatId));
-        const media = [];
+        const media =[];
         buffers.forEach((buf, i) => {
             const filename = `photo${i}.webp`;
             form.append(filename, new Blob([buf], { type: "image/webp" }), filename);
             const item = { type: "photo", media: `attach://${filename}` };
+            if (extra.hasSpoiler) item.has_spoiler = true;
             if (i === 0 && caption) { item.caption = caption.substring(0, 1024); item.parse_mode = "HTML"; }
             media.push(item);
         });
@@ -291,13 +320,13 @@ const KV = {
     },
     async put(env, key, value, opts = {}) {
         const val = typeof value === "string" ? value : JSON.stringify(value);
-        const args = ["SET", key, val];
+        const args =["SET", key, val];
         if (opts.expirationTtl) args.push("EX", opts.expirationTtl);
         await this.call(env, ...args);
     },
     async del(env, key) { await this.call(env, "DEL", key); },
     async list(env, prefix) {
-        const keys = await this.call(env, "KEYS", `${prefix}*`) || [];
+        const keys = await this.call(env, "KEYS", `${prefix}*`) ||[];
         return { keys: keys.map(k => ({ name: k })) };
     }
 };
@@ -314,7 +343,7 @@ async function saveConfig(env, config) {
 // ─── Horde ───────────────────────────────────────────────────────────────────
 
 async function getWorkerBlacklist(env) {
-    return await KV.get(env, "worker_blacklist", "json") || [];
+    return await KV.get(env, "worker_blacklist", "json") ||[];
 }
 
 async function addWorkerToBlacklist(env, id, name) {
@@ -374,9 +403,9 @@ async function hordeGetResult(id) {
 async function hordeGetModels() {
     try {
         const res = await fetch(`${HORDE_API}/status/models?type=image`, { headers: HORDE_HEADERS });
-        if (!res.ok) return [];
+        if (!res.ok) return[];
         return await res.json();
-    } catch { return []; }
+    } catch { return[]; }
 }
 
 async function hordeSubmit(prompt, config, env, extra = {}) {
@@ -401,11 +430,11 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.post_processing = config.postProcessors;
     }
 
-    let effectiveLoras = [];
+    let effectiveLoras =[];
     if (!extra.skipLoras) {
         effectiveLoras = extra.lorasOverride !== undefined
             ? extra.lorasOverride
-            : (config.loras || []).filter(l => l.global !== false);
+            : (config.loras ||[]).filter(l => l.global !== false);
     }
 
     if (effectiveLoras.length > 0) {
@@ -423,7 +452,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         nsfw: config.nsfw !== false,
         trusted_workers: false,
         slow_workers: true,
-        models: [extra.modelOverride || config.model],
+        models: [extra.modelOverride || pickRandomModel(config.model)],
         r2: true,
         shared: false,
         allow_downgrade: true
@@ -496,6 +525,7 @@ async function recordLlmSuccess(env) {
 async function callOpenRouter(env, model, messages, maxTokens = 800, retries = 2) {
     if (!(await checkLlmStatus(env))) return null;
     let lastErr = null;
+    const formattedMessages = formatMessagesForModel(messages, model);
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
             const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -506,7 +536,7 @@ async function callOpenRouter(env, model, messages, maxTokens = 800, retries = 2
                     "HTTP-Referer": "https://t.me",
                     "X-Title": "TgImageBot"
                 },
-                body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: maxTokens })
+                body: JSON.stringify({ model, messages: formattedMessages, temperature: 0.7, max_tokens: maxTokens })
             });
 
             if (!res.ok) {
@@ -548,16 +578,16 @@ async function callOpenRouter(env, model, messages, maxTokens = 800, retries = 2
 
 async function fetchGoogleModels(env) {
     const key = getGoogleApiKey(env);
-    if (!key) return [];
+    if (!key) return[];
     try {
         const res = await fetch(`${GOOGLE_AI_API}/models?key=${key}&pageSize=100`);
         if (!res.ok) return [];
         const data = await res.json();
-        return (data.models || []).filter(m =>
+        return (data.models ||[]).filter(m =>
             Array.isArray(m.supportedGenerationMethods) &&
             m.supportedGenerationMethods.includes("generateContent")
         );
-    } catch { return []; }
+    } catch { return[]; }
 }
 
 async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) {
@@ -565,20 +595,27 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
     if (!key) return null;
     if (!(await checkLlmStatus(env))) return null;
 
-    // Convert OpenAI-style messages to Google format
+    const cleanModel = model.replace(/^models\//, "");
+    const isGemma = cleanModel.toLowerCase().includes("gemma");
+
     let systemInstruction = null;
-    const contents = [];
+    const contents =[];
 
     for (const msg of messages) {
         if (msg.role === "system") {
-            systemInstruction = { parts: [{ text: msg.content }] };
+            if (isGemma) {
+                contents.push({ role: "user", parts: [{ text: `[System Instruction]\n${msg.content}` }] });
+                contents.push({ role: "model", parts: [{ text: `Understood. I will strictly follow the instruction.` }] });
+            } else {
+                systemInstruction = { parts: [{ text: msg.content }] };
+            }
             continue;
         }
         const role = msg.role === "assistant" ? "model" : "user";
         if (typeof msg.content === "string") {
             contents.push({ role, parts: [{ text: msg.content }] });
         } else if (Array.isArray(msg.content)) {
-            const parts = [];
+            const parts =[];
             for (const c of msg.content) {
                 if (c.type === "text") {
                     parts.push({ text: c.text });
@@ -596,7 +633,6 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
 
     if (!contents.length) return null;
 
-    const cleanModel = model.replace(/^models\//, "");
     const body = {
         contents,
         generationConfig: { maxOutputTokens: maxTokens, temperature: 0.7 }
@@ -673,17 +709,15 @@ async function callLLM(env, config, messages, maxTokens = 800) {
 // ─── AI generation helpers ───────────────────────────────────────────────────
 
 async function determineResolution(prompt, env, config) {
-    const presets = [
-        [1024, 1024], [1152, 896], [896, 1152],
-        [1216, 832], [832, 1216], [1344, 768],
-        [768, 1344], [1536, 640]
+    const presets = [[1024, 1024], [1152, 896],[896, 1152],
+        [1216, 832],[832, 1216], [1344, 768],[768, 1344], [1536, 640]
     ];
     if (!hasLlmProvider(env, config) || !config.llmEnabled) {
         const r = presets[Math.floor(Math.random() * presets.length)];
         return { width: r[0], height: r[1] };
     }
     try {
-        const result = await callLLM(env, config, [
+        const result = await callLLM(env, config,[
             { role: "system", content: "You are an AI choosing aspect ratios. Read the prompt and output ONLY one of these exact strings based on what visually fits best: '1024x1024' (Square), '1152x896' (Slight Landscape), '896x1152' (Slight Portrait), '1216x832' (Landscape), '832x1216' (Portrait), '1344x768' (Widescreen), '768x1344' (Tall), '1536x640' (Cinematic). NO explanations, NO markdown." },
             { role: "user", content: `Prompt: ${prompt}` }
         ], 50);
@@ -715,7 +749,7 @@ async function generatePrompt(basePrompt, env, config, meta = {}) {
         sysPrompt = `${baseContext}\n\nExpand the theme deeply into a full detailed tag string.`;
         userPrompt = `Create a highly detailed Stable Diffusion prompt based on this theme: ${basePrompt}`;
     }
-    const result = await callLLM(env, config, [
+    const result = await callLLM(env, config,[
         { role: "system", content: sysPrompt },
         { role: "user", content: userPrompt }
     ], config.maxTokens || 800);
@@ -727,7 +761,7 @@ async function generatePrompt(basePrompt, env, config, meta = {}) {
 async function generateAiCaption(imagePrompt, env, config) {
     if (!config.llmEnabled || !hasLlmProvider(env, config))
         return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 900))}</i>`;
-    const result = await callLLM(env, config, [
+    const result = await callLLM(env, config,[
         { role: "system", content: config.captionPrompt || DEFAULT_CONFIG.captionPrompt },
         { role: "user", content: `Теги изображения: ${imagePrompt.substring(0, 1000)}\n\nНапиши подпись для этого AI-арта.` }
     ], 500);
@@ -738,20 +772,20 @@ async function generateAiCaption(imagePrompt, env, config) {
 
 async function analyzeImageArtifacts(imgData, env, config) {
     if (!config.artifactCheckEnabled || !imgData || !hasLlmProvider(env, config))
-        return { severe: false, severity: "none", issues: [] };
+        return { severe: false, severity: "none", issues:[] };
     try {
         let dataUrl;
         if (isHttpUrl(imgData)) {
             const buf = await downloadImage(imgData);
-            if (!buf) return { severe: false, severity: "none", issues: [] };
+            if (!buf) return { severe: false, severity: "none", issues:[] };
             dataUrl = `data:image/webp;base64,${bufferToBase64(buf)}`;
         } else {
             dataUrl = `data:image/webp;base64,${imgData}`;
         }
 
-        const messages = [
+        const messages =[
             { role: "system", content: 'You detect visual AI artifacts. Return strict JSON only: {"severity":"none|minor|serious","issues":["..."]}.' },
-            { role: "user", content: [
+            { role: "user", content:[
                 { type: "text", text: "Check this image for severe generation artifacts: bad anatomy, melted limbs, broken faces, deformed hands, text glitches, severe blur, corruption." },
                 { type: "image_url", image_url: { url: dataUrl } }
             ]}
@@ -765,6 +799,7 @@ async function analyzeImageArtifacts(imgData, env, config) {
             raw = await callGoogleAI(env, model, messages, 300);
         } else {
             const moderationModel = config.visionModel || getVisionModels(config)[0];
+            const formattedMessages = formatMessagesForModel(messages, moderationModel);
             const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
                 method: "POST",
                 headers: {
@@ -773,14 +808,14 @@ async function analyzeImageArtifacts(imgData, env, config) {
                     "HTTP-Referer": "https://t.me",
                     "X-Title": "TgImageBot"
                 },
-                body: JSON.stringify({ model: moderationModel, messages, max_tokens: 300, temperature: 0 })
+                body: JSON.stringify({ model: moderationModel, messages: formattedMessages, max_tokens: 300, temperature: 0 })
             });
-            if (!res.ok) return { severe: false, severity: "none", issues: [] };
+            if (!res.ok) return { severe: false, severity: "none", issues:[] };
             const data = await res.json();
             raw = data.choices?.[0]?.message?.content?.trim();
         }
 
-        if (!raw) return { severe: false, severity: "none", issues: [] };
+        if (!raw) return { severe: false, severity: "none", issues:[] };
         const parsed = JSON.parse(raw.replace(/^```json|```$/g, "").trim());
         const severity = String(parsed.severity || "none").toLowerCase();
         const threshold = String(config.artifactSeverityThreshold || "serious").toLowerCase();
@@ -788,7 +823,7 @@ async function analyzeImageArtifacts(imgData, env, config) {
         return { severe, severity, issues: Array.isArray(parsed.issues) ? parsed.issues : [] };
     } catch (e) {
         console.error("[artifact-check]", e.message);
-        return { severe: false, severity: "none", issues: [] };
+        return { severe: false, severity: "none", issues:[] };
     }
 }
 
@@ -846,7 +881,7 @@ async function handleCommand(msg, env) {
     const userRole = getUserRole(userId, config);
 
     if (!text.startsWith("/")) {
-        if (userRole === "none" || userRole === "participant") {
+        if ((userRole === "none" || userRole === "participant") && msg.chat?.type === "private") {
             const suggestionText = text.trim();
             if (!suggestionText) return;
             const targetChatId = getSuggestTarget(config);
@@ -892,7 +927,7 @@ async function handleCommand(msg, env) {
                 helpText += `<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ для промпта\n\n`;
                 helpText += `<b>LLM/Vision:</b>\n/setprovider &lt;openrouter|google&gt; — переключить провайдера ИИ\n/llmlist | /img2txt (на фото) | /listvmodel | /setvmodel &lt;номер|id&gt;\n/togglellm | /setllm &lt;model&gt; | /clearllm\n\n`;
                 helpText += `<b>Роли (admin):</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin&gt;\n/setsuggesttarget &lt;chat_id|group|admin&gt;\n\n`;
-                helpText += `<b>Настройки генерации:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip] [global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark | /toggleartifactcheck\n\n`;
+                helpText += `<b>Настройки генерации:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip][global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark | /toggleartifactcheck\n\n`;
                 helpText += `<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`;
             } else {
                 helpText += `/promptsuggest &lt;текст&gt; — предложить промпт\n/img2txt — описать картинку (ответ на фото)\n/ping — проверка бота`;
@@ -966,7 +1001,7 @@ async function handleCommand(msg, env) {
                     const modelsRes = await fetch("https://openrouter.ai/api/v1/models");
                     if (modelsRes.ok) {
                         const md = await modelsRes.json();
-                        const free = (md.data || []).filter(m => parseFloat(m.pricing?.prompt) === 0 && parseFloat(m.pricing?.completion) === 0);
+                        const free = (md.data ||[]).filter(m => parseFloat(m.pricing?.prompt) === 0 && parseFloat(m.pricing?.completion) === 0);
                         info += `\n🆓 <b>Бесплатные модели (${free.length}):</b>\n`;
                         free.slice(0, 40).forEach(m => { info += `<code>${m.id}</code>\n`; });
                         if (free.length > 40) info += `<i>...и ещё ${free.length - 40}</i>`;
@@ -1006,9 +1041,9 @@ async function handleCommand(msg, env) {
 
                 const sysPrompt = "You are a specialized image analyzer for Stable Diffusion (SDXL Illustrious) and Anime art. Describe the character(s), physical features, eye/hair color, clothing, pose, background, lighting, and style using ONLY comma-separated booru-style tags. OUTPUT ONLY COMMA-SEPARATED TAGS. No introductory text, no sentences.";
 
-                const imageMessages = [
+                const imageMessages =[
                     { role: "system", content: sysPrompt },
-                    { role: "user", content: [
+                    { role: "user", content:[
                         { type: "text", text: "Extract booru tags from this image for Illustrious XL:" },
                         { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Img}` } }
                     ]}
@@ -1032,6 +1067,7 @@ async function handleCommand(msg, env) {
                     const visionModels = getVisionModels(config);
                     for (const vModel of visionModels) {
                         try {
+                            const formattedMessages = formatMessagesForModel(imageMessages, vModel);
                             const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
                                 method: "POST",
                                 headers: {
@@ -1040,7 +1076,7 @@ async function handleCommand(msg, env) {
                                     "HTTP-Referer": "https://t.me",
                                     "X-Title": "TgImageBot"
                                 },
-                                body: JSON.stringify({ model: vModel, messages: imageMessages, max_tokens: 500 })
+                                body: JSON.stringify({ model: vModel, messages: formattedMessages, max_tokens: 500 })
                             });
                             if (orRes.ok) {
                                 const orData = await orRes.json();
@@ -1168,7 +1204,7 @@ async function handleCommand(msg, env) {
 
         case "/addprompt": {
             if (!params.length) return await tg.send(chatId, "❌ /addprompt &lt;текст&gt;");
-            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) : [];
+            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) :[];
             prompts.push(params.join(" "));
             config.generalPrompt = prompts.join(" ; ");
             await saveConfig(env, config);
@@ -1189,7 +1225,7 @@ async function handleCommand(msg, env) {
         }
 
         case "/promptlist": {
-            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) : [];
+            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) :[];
             if (!prompts.length) return await tg.send(chatId, "📋 Список промптов пуст");
             if (params.length && !isNaN(parseInt(params[0]))) {
                 const idx = parseInt(params[0]) - 1;
@@ -1268,7 +1304,7 @@ async function handleCommand(msg, env) {
         case "/setenhancer": {
             if (!params.length) return await tg.send(chatId, "❌ /setenhancer <FaceFix|Upscale|AnimeUpscale|CodeFormers|clear>");
             if (params[0].toLowerCase() === "clear") {
-                config.postProcessors = [];
+                config.postProcessors =[];
                 await tg.send(chatId, "✅ Улучшайзеры сброшены");
             } else {
                 const map = { facefix: "GFPGAN", upscale: "RealESRGAN_x4plus", animeupscale: "RealESRGAN_x4plus_anime_6B", codeformers: "CodeFormers" };
@@ -1309,10 +1345,10 @@ async function handleCommand(msg, env) {
         }
 
         case "/addlora": {
-            if (!params.length) return await tg.send(chatId, "❌ /addlora &lt;ID&gt; [strength=1] [clip=1] [global|manual]");
+            if (!params.length) return await tg.send(chatId, "❌ /addlora &lt;ID&gt; [strength=1][clip=1] [global|manual]");
             const loraId = params[0], loraStr = parseFloat(params[1]) || 1, loraClip = parseFloat(params[2]) || 1;
             const isGlobal = (params[3] || "global").toLowerCase() !== "manual";
-            if (!config.loras) config.loras = [];
+            if (!config.loras) config.loras =[];
             if (config.loras.find(l => String(l.name) === String(loraId)))
                 return await tg.send(chatId, `⚠️ LoRA <code>${loraId}</code> уже в списке`);
             let compatMsg = "", loraTitle = loraId;
@@ -1357,7 +1393,7 @@ async function handleCommand(msg, env) {
             break;
 
         case "/clearloras":
-            config.loras = []; await saveConfig(env, config);
+            config.loras =[]; await saveConfig(env, config);
             await tg.send(chatId, "✅ Список LoRA очищен");
             break;
 
@@ -1514,7 +1550,7 @@ async function handleCommand(msg, env) {
             const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
             const batchId = Date.now() + "_" + Math.random().toString(36).substring(2, 7);
             const targets = [chatId];
-            await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
+            await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready:[], targets, notify: chatId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
             for (let i = 0; i < actualCount; i++) {
                 try {
                     let segment = targetPromptSegment;
@@ -1533,7 +1569,8 @@ async function handleCommand(msg, env) {
                     const finalPrompt = disableLlm ? cleanPrompt : await generatePrompt(cleanPrompt, env, config, { promptNumber });
                     const bestRes = await determineResolution(finalPrompt, env, config);
                     const loraInfo = lorasOverride.length > 0 ? `\n🎨 LoRA: ${lorasOverride.map(l => `${l.name}(${l.strength})`).join(", ")}` : "";
-                    await tg.send(chatId, `🎨 #${i + 1} (prompt #${promptNumber || "?"}):\n<code>${escapeHtml(finalPrompt.substring(0, 3500))}</code>\n📏 ${bestRes.width}x${bestRes.height}${loraInfo}${modelOverride ? `\n🧠 ${modelOverride}` : ""}`);
+                    const mOverride = modelOverride || pickRandomModel(config.model);
+                    await tg.send(chatId, `🎨 #${i + 1} (prompt #${promptNumber || "?"}):\n<code>${escapeHtml(finalPrompt.substring(0, 3500))}</code>\n📏 ${bestRes.width}x${bestRes.height}${loraInfo}\n🧠 ${mOverride}`);
                     const res = await hordeSubmit(finalPrompt, config, env, { workerBlacklist: bl, width: bestRes.width, height: bestRes.height, lorasOverride, modelOverride });
                     if (res.id) {
                         await KV.put(env, `pending:${res.id}`, { targets, prompt: finalPrompt, at: Date.now(), notify: chatId, retries: 0, batchId, promptNumber, lorasOverride, modelOverride }, { expirationTtl: PENDING_TTL_SEC });
@@ -1556,8 +1593,8 @@ async function handleCommand(msg, env) {
             let queueCount = 0;
             try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
-            const globalLoras = (config.loras || []).filter(l => l.global !== false);
-            const manualLoras = (config.loras || []).filter(l => l.global === false);
+            const globalLoras = (config.loras ||[]).filter(l => l.global !== false);
+            const manualLoras = (config.loras ||[]).filter(l => l.global === false);
             const promptsCount = config.generalPrompt ? config.generalPrompt.split(";").filter(Boolean).length : 0;
             const llmFails = await KV.get(env, "llm_fails") || "0";
             const llmTimeout = await KV.get(env, "llm_timeout");
@@ -1659,7 +1696,7 @@ async function processScheduled(env) {
                 continue;
             }
 
-            const gens = res.generations || [];
+            const gens = res.generations ||[];
             if (!gens.length) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `⚠️ Пустой результат: <code>${id}</code>`);
@@ -1738,13 +1775,13 @@ async function processScheduled(env) {
                                     const sr = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
                                     if (!sr.sent) { delivered = false; break; }
                                 } else {
-                                    const bufs = [];
+                                    const bufs =[];
                                     for (const b64 of batch.ready) {
                                         const buf = isHttpUrl(b64) ? await downloadImage(b64) : base64ToBuffer(b64);
                                         if (buf) bufs.push(buf);
                                     }
                                     if (!bufs.length) { delivered = false; break; }
-                                    const mg = await tg.sendMediaGroup(tId, bufs, captionText);
+                                    const mg = await tg.sendMediaGroup(tId, bufs, captionText, { hasSpoiler: config.useSpoiler });
                                     if (!mg.ok) {
                                         delivered = false;
                                         if (batch.notify) await tg.send(batch.notify, `❌ Ошибка media group: ${escapeHtml(mg.description || "unknown")}`);
@@ -1776,7 +1813,7 @@ async function processScheduled(env) {
                     if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 900))}</i>` : "";
                     else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
                     let deliveredAll = true;
-                    for (const tId of (task.targets || [])) {
+                    for (const tId of (task.targets ||[])) {
                         const sr = await deliverImage(tg, tId, finalImageBase64, captionText, task.notify, config);
                         if (!sr.sent) deliveredAll = false;
                     }
@@ -1811,13 +1848,13 @@ async function processScheduled(env) {
                     const sr = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
                     if (!sr.sent) { delivered = false; break; }
                 } else {
-                    const bufs = [];
+                    const bufs =[];
                     for (const b64 of batch.ready) {
                         const buf = isHttpUrl(b64) ? await downloadImage(b64) : base64ToBuffer(b64);
                         if (buf) bufs.push(buf);
                     }
                     if (!bufs.length) { delivered = false; break; }
-                    const mg = await tg.sendMediaGroup(tId, bufs, captionText);
+                    const mg = await tg.sendMediaGroup(tId, bufs, captionText, { hasSpoiler: config.useSpoiler });
                     if (!mg.ok) { delivered = false; break; }
                 }
             }
@@ -1844,7 +1881,7 @@ async function processScheduled(env) {
     const targets = [config.groupId, config.channelId].filter(Boolean);
     const batchId = Date.now() + "_" + Math.random().toString(36).substring(2, 7);
     const actualCount = getActualCount(config.count);
-    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
+    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready:[], targets, notify: config.adminId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
     let queuedCount = 0;
 
     for (let i = 0; i < actualCount; i++) {
@@ -1913,7 +1950,7 @@ export default {
             const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url: webhookUrl, allowed_updates: ["message", "callback_query"], drop_pending_updates: true })
+                body: JSON.stringify({ url: webhookUrl, allowed_updates:["message", "callback_query"], drop_pending_updates: true })
             });
             return new Response(`Webhook: ${webhookUrl}\n\n${JSON.stringify(await res.json(), null, 2)}`);
         }
