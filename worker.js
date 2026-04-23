@@ -217,9 +217,11 @@ function getSuggestTarget(config) {
     return config.suggestTargetChatId || config.groupId || config.adminId;
 }
 
+// ─── ИСПРАВЛЕНИЕ: для Gemma слиянием system-инструкции с первым text-элементом,
+//     а не вставкой нового блока перед массивом — иначе vision-модели теряют контекст
 function formatMessagesForModel(messages, model) {
     if (!model || !model.toLowerCase().includes("gemma")) return messages;
-    const finalMessages =[];
+    const finalMessages = [];
     let sysPrompt = "";
     for (const msg of messages) {
         if (msg.role === "system") sysPrompt += msg.content + "\n";
@@ -230,7 +232,19 @@ function formatMessagesForModel(messages, model) {
         if (typeof firstUser.content === "string") {
             firstUser.content = `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n${firstUser.content}`;
         } else if (Array.isArray(firstUser.content)) {
-            firstUser.content =[{ type: "text", text: `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n` }, ...firstUser.content];
+            // Копируем массив, чтобы не мутировать оригинал
+            firstUser.content = [...firstUser.content];
+            // Ищем первый текстовый блок и вливаем туда system-инструкцию
+            const firstTextIdx = firstUser.content.findIndex(c => c.type === "text");
+            if (firstTextIdx !== -1) {
+                firstUser.content[firstTextIdx] = {
+                    type: "text",
+                    text: `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n${firstUser.content[firstTextIdx].text}`
+                };
+            } else {
+                // Текстового блока нет — добавляем в начало
+                firstUser.content.unshift({ type: "text", text: `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n` });
+            }
         }
     } else if (sysPrompt) {
         finalMessages.push({ role: "user", content: sysPrompt.trim() });
@@ -927,7 +941,7 @@ async function handleCommand(msg, env) {
                 helpText += `<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ для промпта\n\n`;
                 helpText += `<b>LLM/Vision:</b>\n/setprovider &lt;openrouter|google&gt; — переключить провайдера ИИ\n/llmlist | /img2txt (на фото) | /listvmodel | /setvmodel &lt;номер|id&gt;\n/togglellm | /setllm &lt;model&gt; | /clearllm\n\n`;
                 helpText += `<b>Роли (admin):</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin&gt;\n/setsuggesttarget &lt;chat_id|group|admin&gt;\n\n`;
-                helpText += `<b>Настройки генерации:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt;\n/setmodel &lt;имя&gt; | /listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip][global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark | /toggleartifactcheck\n\n`;
+                helpText += `<b>Настройки генерации:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt;\n/setmodel &lt;имя&gt; <i>(через запятую — случайная из списка)</i>\n/listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip][global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark | /toggleartifactcheck\n\n`;
                 helpText += `<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`;
             } else {
                 helpText += `/promptsuggest &lt;текст&gt; — предложить промпт\n/img2txt — описать картинку (ответ на фото)\n/ping — проверка бота`;
@@ -1039,11 +1053,13 @@ async function handleCommand(msg, env) {
                 const base64Img = bufferToBase64(arrayBuffer);
                 const mimeType = fileReq.result.file_path?.endsWith(".png") ? "image/png" : "image/jpeg";
 
-                const sysPrompt = "You are a specialized image analyzer for Stable Diffusion (SDXL Illustrious) and Anime art. Describe the character(s), physical features, eye/hair color, clothing, pose, background, lighting, and style using ONLY comma-separated booru-style tags. OUTPUT ONLY COMMA-SEPARATED TAGS. No introductory text, no sentences.";
+                // Системный промпт для img2txt — не используем role:"system",
+                // чтобы formatMessagesForModel правильно слил его в первый text-блок для Gemma
+                const sysContent = "You are a specialized image analyzer for Stable Diffusion (SDXL Illustrious) and Anime art. Describe the character(s), physical features, eye/hair color, clothing, pose, background, lighting, and style using ONLY comma-separated booru-style tags. OUTPUT ONLY COMMA-SEPARATED TAGS. No introductory text, no sentences.";
 
-                const imageMessages =[
-                    { role: "system", content: sysPrompt },
-                    { role: "user", content:[
+                const imageMessages = [
+                    { role: "system", content: sysContent },
+                    { role: "user", content: [
                         { type: "text", text: "Extract booru tags from this image for Illustrious XL:" },
                         { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Img}` } }
                     ]}
@@ -1067,6 +1083,7 @@ async function handleCommand(msg, env) {
                     const visionModels = getVisionModels(config);
                     for (const vModel of visionModels) {
                         try {
+                            // formatMessagesForModel корректно сливает system в первый text-блок для Gemma
                             const formattedMessages = formatMessagesForModel(imageMessages, vModel);
                             const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
                                 method: "POST",
@@ -1315,11 +1332,19 @@ async function handleCommand(msg, env) {
             break;
         }
 
-        case "/setmodel":
-            if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;");
-            config.model = params.join(" "); await saveConfig(env, config);
-            await tg.send(chatId, `✅ Модель: <code>${escapeHtml(config.model)}</code>`);
+        case "/setmodel": {
+            if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;\n\n💡 <i>Несколько моделей через запятую — при каждой генерации будет выбираться случайная:</i>\n<code>/setmodel Model A, Model B, Model C</code>");
+            config.model = params.join(" ");
+            await saveConfig(env, config);
+            const modelArr = config.model.split(',').map(s => s.trim()).filter(Boolean);
+            if (modelArr.length > 1) {
+                const listStr = modelArr.map((m, i) => `${i + 1}. <code>${escapeHtml(m)}</code>`).join("\n");
+                await tg.send(chatId, `✅ Модели (случайная при каждой генерации, ${modelArr.length} шт.):\n${listStr}`);
+            } else {
+                await tg.send(chatId, `✅ Модель: <code>${escapeHtml(config.model)}</code>`);
+            }
             break;
+        }
 
         case "/listmodels":
             await tg.send(chatId, "⏳ Загружаю топ-40 моделей...");
@@ -1607,7 +1632,12 @@ async function handleCommand(msg, env) {
             const currentVisionModel = provider === "google"
                 ? (config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel)
                 : (config.visionModel || getVisionModels(config)[0] || "не задана");
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> <code>${escapeHtml(currentLlmModel)}</code>\n<b>Vision:</b> <code>${escapeHtml(currentVisionModel)}</code>\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> <code>${escapeHtml(config.model)}</code>\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
+            // Отображение модели: если задано несколько через запятую — показываем первую + счётчик
+            const modelArr = config.model.split(',').map(s => s.trim()).filter(Boolean);
+            const modelDisplay = modelArr.length > 1
+                ? `<code>${escapeHtml(modelArr[0])}</code> <i>+${modelArr.length - 1} (рандом)</i>`
+                : `<code>${escapeHtml(config.model)}</code>`;
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> <code>${escapeHtml(currentLlmModel)}</code>\n<b>Vision:</b> <code>${escapeHtml(currentVisionModel)}</code>\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> ${modelDisplay}\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
