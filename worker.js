@@ -24,6 +24,7 @@ const DEFAULT_CONFIG = {
     googleLlmModel: "gemini-2.0-flash",
     visionModel: "openrouter/free",
     googleVisionModel: "gemini-2.0-flash",
+    hordeApiKey: "", // Добавлено для хранения ключа прямо в конфиге бота
     visionModels:[
         "openrouter/free",
         "google/gemma-3-27b-it:free",
@@ -74,7 +75,8 @@ HYBRID STYLE: Blend short tags with natural-language phrases for complex actions
 
 NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive prompt.`;
 
-const HORDE_API = "https://stablehorde.net/api/v2";
+// ИСПРАВЛЕНО: Новый домен API
+const HORDE_API = "https://aihorde.net/api/v2";
 const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.2:tg" };
 const GOOGLE_AI_API = "https://generativelanguage.googleapis.com/v1beta";
 const PENDING_TTL_SEC = 10800;
@@ -84,21 +86,25 @@ const NONE_IMG2TXT_COOLDOWN_SEC = 3600;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function getVisionModels(config) {
-    if (config.llmProvider === "google") {
-        const base = Array.isArray(config.googleVisionModels) && config.googleVisionModels.length
-            ? config.googleVisionModels
-            :[...DEFAULT_CONFIG.googleVisionModels];
-        const preferred = config.googleVisionModel;
-        if (!preferred) return base;
-        return [preferred, ...base.filter(m => m !== preferred)];
+function getVisionModels(config, currentPreferred = null) {
+    const provider = config.llmProvider || "openrouter";
+    const base = provider === "google"
+        ? (Array.isArray(config.googleVisionModels) && config.googleVisionModels.length ? config.googleVisionModels : [...DEFAULT_CONFIG.googleVisionModels])
+        : (Array.isArray(config.visionModels) && config.visionModels.length ? config.visionModels : [...DEFAULT_CONFIG.visionModels]);
+
+    let preferredStr = provider === "google" ? config.googleVisionModel : config.visionModel;
+    if (!preferredStr) return base;
+
+    const preferredArr = preferredStr.split(',').map(s => s.trim()).filter(Boolean);
+
+    if (currentPreferred) {
+        // Убираем текущую модель из базового списка и ставим в самое начало для fallback-механики
+        const remainingBase = base.filter(m => m !== currentPreferred);
+        return [currentPreferred, ...remainingBase];
+    } else if (preferredArr.length > 0) {
+        return [...new Set([...preferredArr, ...base])];
     }
-    const base = Array.isArray(config.visionModels) && config.visionModels.length
-        ? config.visionModels
-        : [...DEFAULT_CONFIG.visionModels];
-    const preferred = config.visionModel;
-    if (!preferred) return base;
-    return[preferred, ...base.filter(m => m !== preferred)];
+    return base;
 }
 
 function hasLlmProvider(env, config) {
@@ -205,7 +211,7 @@ function checkAccess(role, cmd) {
         "/setcfg", "/setsampler", "/help", "/start", "/togglellm", "/setllm",
         "/settokens", "/setcaptionmode", "/setcaptionprompt", "/setvmodel", "/listvmodel",
         "/setspoiler", "/setmodel", "/setinterval", "/setcount", "/enable", "/disable",
-        "/clearllm", "/setprovider", "/llmlist"
+        "/clearllm", "/setprovider", "/llmlist", "/sethordekey"
     ];
     const participantCmds =["/start", "/help", "/ping", "/promptsuggest", "/img2txt"];
     if (role === "creator") return creatorCmds.includes(cmd);
@@ -217,11 +223,9 @@ function getSuggestTarget(config) {
     return config.suggestTargetChatId || config.groupId || config.adminId;
 }
 
-// ─── ИСПРАВЛЕНИЕ: для Gemma слиянием system-инструкции с первым text-элементом,
-//     а не вставкой нового блока перед массивом — иначе vision-модели теряют контекст
 function formatMessagesForModel(messages, model) {
     if (!model || !model.toLowerCase().includes("gemma")) return messages;
-    const finalMessages = [];
+    const finalMessages =[];
     let sysPrompt = "";
     for (const msg of messages) {
         if (msg.role === "system") sysPrompt += msg.content + "\n";
@@ -232,9 +236,7 @@ function formatMessagesForModel(messages, model) {
         if (typeof firstUser.content === "string") {
             firstUser.content = `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n${firstUser.content}`;
         } else if (Array.isArray(firstUser.content)) {
-            // Копируем массив, чтобы не мутировать оригинал
-            firstUser.content = [...firstUser.content];
-            // Ищем первый текстовый блок и вливаем туда system-инструкцию
+            firstUser.content =[...firstUser.content];
             const firstTextIdx = firstUser.content.findIndex(c => c.type === "text");
             if (firstTextIdx !== -1) {
                 firstUser.content[firstTextIdx] = {
@@ -242,7 +244,6 @@ function formatMessagesForModel(messages, model) {
                     text: `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n${firstUser.content[firstTextIdx].text}`
                 };
             } else {
-                // Текстового блока нет — добавляем в начало
                 firstUser.content.unshift({ type: "text", text: `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n` });
             }
         }
@@ -327,6 +328,10 @@ const KV = {
         if (data.error) throw new Error(data.error);
         return data.result;
     },
+    async incr(env, key) {
+        const res = await this.call(env, "INCR", key);
+        return parseInt(res) || 0;
+    },
     async get(env, key, type = "text") {
         const res = await this.call(env, "GET", key);
         if (res == null) return null;
@@ -354,6 +359,17 @@ async function saveConfig(env, config) {
     await KV.put(env, "config", JSON.stringify(config));
 }
 
+// ─── ИСПРАВЛЕНО: Секвентальный выбор моделей (по очереди) ───────────────────
+async function getNextModel(env, modelString, kvKey) {
+    if (!modelString) return "";
+    const models = modelString.split(',').map(s => s.trim()).filter(Boolean);
+    if (models.length <= 1) return models[0] || modelString;
+    // Используем INCR для строгого чередования без конфликтов запросов
+    const idx = await KV.incr(env, kvKey);
+    // idx начинается с 1 при первом INCR, поэтому Math.abs(idx - 1)
+    return models[Math.abs(idx - 1) % models.length];
+}
+
 // ─── Horde ───────────────────────────────────────────────────────────────────
 
 async function getWorkerBlacklist(env) {
@@ -378,16 +394,16 @@ function isCensored(gen) {
     return !!(gen && (gen.gen_metadata?.some(m => m.type === "censorship") || gen.censored === true || gen.state === "censored"));
 }
 
-function getApiKey(env) {
-    return (env.HORDE_API_KEY || "").trim() || "0000000000";
+function getApiKey(env, config) {
+    return (config?.hordeApiKey || env.HORDE_API_KEY || "").trim() || "0000000000";
 }
 
 function getGoogleApiKey(env) {
     return (env.GOOGLE_AI_API_KEY || "").trim();
 }
 
-async function hordeCheckKey(env) {
-    const key = getApiKey(env);
+async function hordeCheckKey(env, config) {
+    const key = getApiKey(env, config);
     try {
         const res = await fetch(`${HORDE_API}/find_user`, { headers: { apikey: key, ...HORDE_HEADERS } });
         if (res.status === 401 || res.status === 403) return { ok: false, anon: key === "0000000000" };
@@ -423,7 +439,7 @@ async function hordeGetModels() {
 }
 
 async function hordeSubmit(prompt, config, env, extra = {}) {
-    const key = getApiKey(env);
+    const key = getApiKey(env, config);
     const params = {
         sampler_name: config.sampler,
         cfg_scale: config.cfgScale,
@@ -466,7 +482,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         nsfw: config.nsfw !== false,
         trusted_workers: false,
         slow_workers: true,
-        models: [extra.modelOverride || pickRandomModel(config.model)],
+        models:[extra.modelOverride || pickRandomModel(config.model)],
         r2: true,
         shared: false,
         allow_downgrade: true
@@ -595,7 +611,7 @@ async function fetchGoogleModels(env) {
     if (!key) return[];
     try {
         const res = await fetch(`${GOOGLE_AI_API}/models?key=${key}&pageSize=100`);
-        if (!res.ok) return [];
+        if (!res.ok) return[];
         const data = await res.json();
         return (data.models ||[]).filter(m =>
             Array.isArray(m.supportedGenerationMethods) &&
@@ -619,7 +635,7 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
         if (msg.role === "system") {
             if (isGemma) {
                 contents.push({ role: "user", parts: [{ text: `[System Instruction]\n${msg.content}` }] });
-                contents.push({ role: "model", parts: [{ text: `Understood. I will strictly follow the instruction.` }] });
+                contents.push({ role: "model", parts:[{ text: `Understood. I will strictly follow the instruction.` }] });
             } else {
                 systemInstruction = { parts: [{ text: msg.content }] };
             }
@@ -683,7 +699,6 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
                 break;
             }
 
-            // Check for safety blocks
             const candidate = data.candidates?.[0];
             if (candidate?.finishReason === "SAFETY" || candidate?.finishReason === "RECITATION") {
                 lastErr = `Blocked by safety filter (${candidate.finishReason})`;
@@ -713,10 +728,12 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
 async function callLLM(env, config, messages, maxTokens = 800) {
     const provider = config?.llmProvider || "openrouter";
     if (provider === "google") {
-        const model = config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel;
+        const modelStr = config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel;
+        const model = await getNextModel(env, modelStr, "llm_model_idx");
         return callGoogleAI(env, model, messages, maxTokens);
     }
-    const model = config.llmModel || DEFAULT_CONFIG.llmModel;
+    const modelStr = config.llmModel || DEFAULT_CONFIG.llmModel;
+    const model = await getNextModel(env, modelStr, "llm_model_idx");
     return callOpenRouter(env, model, messages, maxTokens);
 }
 
@@ -809,10 +826,12 @@ async function analyzeImageArtifacts(imgData, env, config) {
         const provider = config.llmProvider || "openrouter";
 
         if (provider === "google") {
-            const model = config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel;
+            const modelStr = config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel;
+            const model = await getNextModel(env, modelStr, "vision_model_idx");
             raw = await callGoogleAI(env, model, messages, 300);
         } else {
-            const moderationModel = config.visionModel || getVisionModels(config)[0];
+            const modelStr = config.visionModel || getVisionModels(config)[0];
+            const moderationModel = await getNextModel(env, modelStr, "vision_model_idx");
             const formattedMessages = formatMessagesForModel(messages, moderationModel);
             const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
                 method: "POST",
@@ -939,7 +958,8 @@ async function handleCommand(msg, env) {
                 helpText += `<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate [номер]\n\n`;
                 helpText += `<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n/promptsuggest &lt;текст&gt;\n\n`;
                 helpText += `<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ для промпта\n\n`;
-                helpText += `<b>LLM/Vision:</b>\n/setprovider &lt;openrouter|google&gt; — переключить провайдера ИИ\n/llmlist | /img2txt (на фото) | /listvmodel | /setvmodel &lt;номер|id&gt;\n/togglellm | /setllm &lt;model&gt; | /clearllm\n\n`;
+                helpText += `<b>Настройки API:</b>\n/sethordekey &lt;ключ&gt; — сохранить ключ AI Horde\n/setprovider &lt;openrouter|google&gt; — переключить ИИ\n\n`;
+                helpText += `<b>LLM/Vision:</b>\n/llmlist | /img2txt (на фото) | /listvmodel | /setvmodel &lt;номер|id&gt;\n/togglellm | /setllm &lt;model&gt; | /clearllm\n\n`;
                 helpText += `<b>Роли (admin):</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin&gt;\n/setsuggesttarget &lt;chat_id|group|admin&gt;\n\n`;
                 helpText += `<b>Настройки генерации:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt;\n/setmodel &lt;имя&gt; <i>(через запятую — случайная из списка)</i>\n/listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip][global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark | /toggleartifactcheck\n\n`;
                 helpText += `<b>Статус:</b>\n/status | /pending | /cancel | /workerbl | /ping`;
@@ -947,6 +967,19 @@ async function handleCommand(msg, env) {
                 helpText += `/promptsuggest &lt;текст&gt; — предложить промпт\n/img2txt — описать картинку (ответ на фото)\n/ping — проверка бота`;
             }
             await tg.send(chatId, helpText);
+            break;
+        }
+
+        case "/sethordekey": {
+            if (!params[0]) return await tg.send(chatId, "❌ Укажите ключ: /sethordekey <ключ>\nИли '0000000000' для анонимного.");
+            config.hordeApiKey = params[0].trim();
+            await saveConfig(env, config);
+            const check = await hordeCheckKey(env, config);
+            if (check.ok && !check.anon) {
+                await tg.send(chatId, `✅ Ключ Horde установлен! Пользователь: <b>${check.user}</b>, Kudos: <b>${check.kudos}</b>`);
+            } else {
+                await tg.send(chatId, `✅ Ключ установлен, но проверка вернула: ${check.anon ? "Анонимный аккаунт" : "Ошибка (" + check.err + ")"}.\nУбедитесь, что ключ верный.`);
+            }
             break;
         }
 
@@ -1053,13 +1086,11 @@ async function handleCommand(msg, env) {
                 const base64Img = bufferToBase64(arrayBuffer);
                 const mimeType = fileReq.result.file_path?.endsWith(".png") ? "image/png" : "image/jpeg";
 
-                // Системный промпт для img2txt — не используем role:"system",
-                // чтобы formatMessagesForModel правильно слил его в первый text-блок для Gemma
                 const sysContent = "You are a specialized image analyzer for Stable Diffusion (SDXL Illustrious) and Anime art. Describe the character(s), physical features, eye/hair color, clothing, pose, background, lighting, and style using ONLY comma-separated booru-style tags. OUTPUT ONLY COMMA-SEPARATED TAGS. No introductory text, no sentences.";
 
-                const imageMessages = [
+                const imageMessages =[
                     { role: "system", content: sysContent },
-                    { role: "user", content: [
+                    { role: "user", content:[
                         { type: "text", text: "Extract booru tags from this image for Illustrious XL:" },
                         { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Img}` } }
                     ]}
@@ -1068,8 +1099,11 @@ async function handleCommand(msg, env) {
                 const provider = config.llmProvider || "openrouter";
                 let tags = null, usedModel = "", lastError = "";
 
+                let preferredModelStr = provider === "google" ? config.googleVisionModel : config.visionModel;
+                const currentPreferred = await getNextModel(env, preferredModelStr || "", "vision_model_idx");
+
                 if (provider === "google") {
-                    const visionModels = getVisionModels(config);
+                    const visionModels = getVisionModels(config, currentPreferred);
                     for (const vModel of visionModels) {
                         const result = await callGoogleAI(env, vModel, imageMessages, 500, 1);
                         if (result && result.length > 5) {
@@ -1080,10 +1114,9 @@ async function handleCommand(msg, env) {
                         lastError = `${vModel}: no result`;
                     }
                 } else {
-                    const visionModels = getVisionModels(config);
+                    const visionModels = getVisionModels(config, currentPreferred);
                     for (const vModel of visionModels) {
                         try {
-                            // formatMessagesForModel корректно сливает system в первый text-блок для Gemma
                             const formattedMessages = formatMessagesForModel(imageMessages, vModel);
                             const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
                                 method: "POST",
@@ -1187,14 +1220,14 @@ async function handleCommand(msg, env) {
         }
 
         case "/ping": {
-            const key = getApiKey(env);
+            const key = getApiKey(env, config);
             const llmFails = await KV.get(env, "llm_fails") || "0";
             const llmTimeout = await KV.get(env, "llm_timeout");
             const llmBlocked = llmTimeout && Date.now() < parseInt(llmTimeout);
             const provider = config.llmProvider || "openrouter";
             const providerLabel = provider === "google" ? "🔵 Google" : "🟠 OpenRouter";
             const providerKey = provider === "google" ? !!getGoogleApiKey(env) : !!env.OPENROUTER_API_KEY;
-            await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 LLM: ${providerLabel} ${providerKey ? "✅" : "❌"} (${config.llmEnabled ? "🟢 вкл" : "🔴 выкл"}${llmBlocked ? " ⏸ заблокирован" : ""}, ошибок: ${llmFails})`);
+            await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde API: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 LLM: ${providerLabel} ${providerKey ? "✅" : "❌"} (${config.llmEnabled ? "🟢 вкл" : "🔴 выкл"}${llmBlocked ? " ⏸ заблокирован" : ""}, ошибок: ${llmFails})`);
             break;
         }
 
@@ -1231,7 +1264,7 @@ async function handleCommand(msg, env) {
 
         case "/delprompt": {
             if (!params.length) return await tg.send(chatId, "❌ /delprompt &lt;номер&gt;");
-            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) : [];
+            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) :[];
             const idx = parseInt(params[0]) - 1;
             if (isNaN(idx) || idx < 0 || idx >= prompts.length) return await tg.send(chatId, `❌ Неверный номер (1–${prompts.length})`);
             prompts.splice(idx, 1);
@@ -1370,7 +1403,7 @@ async function handleCommand(msg, env) {
         }
 
         case "/addlora": {
-            if (!params.length) return await tg.send(chatId, "❌ /addlora &lt;ID&gt; [strength=1][clip=1] [global|manual]");
+            if (!params.length) return await tg.send(chatId, "❌ /addlora &lt;ID&gt;[strength=1][clip=1] [global|manual]");
             const loraId = params[0], loraStr = parseFloat(params[1]) || 1, loraClip = parseFloat(params[2]) || 1;
             const isGlobal = (params[3] || "global").toLowerCase() !== "manual";
             if (!config.loras) config.loras =[];
@@ -1458,7 +1491,7 @@ async function handleCommand(msg, env) {
             break;
 
         case "/setllm": {
-            if (!params.length) return await tg.send(chatId, "❌ /setllm &lt;модель&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setllm &lt;модель&gt;\n\n💡 <i>Можно перечислить несколько через запятую — они будут браться строго по очереди!</i>");
             const newModel = params.join(" ");
             const provider = config.llmProvider || "openrouter";
             if (provider === "google") {
@@ -1469,27 +1502,28 @@ async function handleCommand(msg, env) {
             await saveConfig(env, config);
             await KV.put(env, "llm_fails", "0");
             await KV.del(env, "llm_timeout");
-            await tg.send(chatId, `✅ LLM (${provider === "google" ? "🔵 Google" : "🟠 OpenRouter"}): <code>${escapeHtml(newModel)}</code>\n<i>Счётчик ошибок сброшен.</i>`);
+            const multiMsg = newModel.includes(",") ? "\n🔄 <i>Указано несколько моделей — они будут переключаться по очереди.</i>" : "";
+            await tg.send(chatId, `✅ LLM (${provider === "google" ? "🔵 Google" : "🟠 OpenRouter"}): <code>${escapeHtml(newModel)}</code>\n<i>Счётчик ошибок сброшен.</i>${multiMsg}`);
             break;
         }
 
         case "/listvmodel": {
             const vModels = getVisionModels(config);
             const provider = config.llmProvider || "openrouter";
-            const current = provider === "google"
+            const currentRaw = provider === "google"
                 ? (config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel)
                 : (config.visionModel || vModels[0] || "");
             const providerLabel = provider === "google" ? "🔵 Google AI Studio" : "🟠 OpenRouter";
-            let txt = `👁️ <b>Vision модели для /img2txt [${providerLabel}]:</b>\n\n`;
-            txt += `Текущая: <code>${escapeHtml(current || "не задана")}</code>\n\n`;
-            vModels.forEach((m, i) => { txt += `${m === current ? "✅" : "▫️"} ${i + 1}. <code>${escapeHtml(m)}</code>\n`; });
-            txt += "\n💡 <i>/setvmodel &lt;номер&gt; или /setvmodel &lt;model-id&gt;</i>\n<i>/setprovider для смены провайдера</i>";
+            let txt = `👁️ <b>Vision модели для /img2txt[${providerLabel}]:</b>\n\n`;
+            txt += `Текущая настройка: <code>${escapeHtml(currentRaw || "не задана")}</code>\n\n`;
+            vModels.forEach((m, i) => { txt += `${m === currentRaw ? "✅" : "▫️"} ${i + 1}. <code>${escapeHtml(m)}</code>\n`; });
+            txt += "\n💡 <i>/setvmodel &lt;номер&gt; или /setvmodel &lt;имена через запятую&gt;</i>\n<i>/setprovider для смены провайдера</i>";
             await tg.send(chatId, txt);
             break;
         }
 
         case "/setvmodel": {
-            if (!params.length) return await tg.send(chatId, "❌ /setvmodel &lt;номер|id&gt;");
+            if (!params.length) return await tg.send(chatId, "❌ /setvmodel &lt;номер|id&gt;\n\n💡 <i>Можно перечислить несколько имён через запятую — они будут браться по очереди.</i>");
             const vModels = getVisionModels(config);
             const raw = params.join(" ").trim();
             const idx = parseInt(raw, 10);
@@ -1501,7 +1535,8 @@ async function handleCommand(msg, env) {
                 config.visionModel = selected;
             }
             await saveConfig(env, config);
-            await tg.send(chatId, `✅ Vision модель (${provider === "google" ? "🔵 Google" : "🟠 OpenRouter"}): <code>${escapeHtml(selected)}</code>`);
+            const multiMsg = selected.includes(",") ? "\n🔄 <i>Указано несколько моделей — они будут переключаться по очереди.</i>" : "";
+            await tg.send(chatId, `✅ Vision модель (${provider === "google" ? "🔵 Google" : "🟠 OpenRouter"}): <code>${escapeHtml(selected)}</code>${multiMsg}`);
             break;
         }
 
@@ -1626,18 +1661,25 @@ async function handleCommand(msg, env) {
             const llmBlocked = llmTimeout && Date.now() < parseInt(llmTimeout) ? " ⏸ заблокирован" : "";
             const provider = config.llmProvider || "openrouter";
             const providerLabel = provider === "google" ? "🔵 Google AI Studio" : "🟠 OpenRouter";
-            const currentLlmModel = provider === "google"
+            
+            const currentLlmModelRaw = provider === "google"
                 ? (config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel)
                 : (config.llmModel || DEFAULT_CONFIG.llmModel);
-            const currentVisionModel = provider === "google"
+            const llmArr = currentLlmModelRaw.split(',').map(s=>s.trim()).filter(Boolean);
+            const llmDisplay = llmArr.length > 1 ? `<code>${escapeHtml(llmArr[0])}</code> <i>+${llmArr.length-1} (по очереди)</i>` : `<code>${escapeHtml(currentLlmModelRaw)}</code>`;
+            
+            const currentVisionModelRaw = provider === "google"
                 ? (config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel)
                 : (config.visionModel || getVisionModels(config)[0] || "не задана");
-            // Отображение модели: если задано несколько через запятую — показываем первую + счётчик
+            const vArr = currentVisionModelRaw.split(',').map(s=>s.trim()).filter(Boolean);
+            const vDisplay = vArr.length > 1 ? `<code>${escapeHtml(vArr[0])}</code> <i>+${vArr.length-1} (по очереди)</i>` : `<code>${escapeHtml(currentVisionModelRaw)}</code>`;
+            
             const modelArr = config.model.split(',').map(s => s.trim()).filter(Boolean);
             const modelDisplay = modelArr.length > 1
                 ? `<code>${escapeHtml(modelArr[0])}</code> <i>+${modelArr.length - 1} (рандом)</i>`
                 : `<code>${escapeHtml(config.model)}</code>`;
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> <code>${escapeHtml(currentLlmModel)}</code>\n<b>Vision:</b> <code>${escapeHtml(currentVisionModel)}</code>\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> ${modelDisplay}\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
+                
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> ${llmDisplay}\n<b>Vision:</b> ${vDisplay}\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> ${modelDisplay}\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1908,7 +1950,7 @@ async function processScheduled(env) {
     if (now - lastPost < config.interval * 60 * 1000) return;
 
     const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
-    const targets = [config.groupId, config.channelId].filter(Boolean);
+    const targets =[config.groupId, config.channelId].filter(Boolean);
     const batchId = Date.now() + "_" + Math.random().toString(36).substring(2, 7);
     const actualCount = getActualCount(config.count);
     await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready:[], targets, notify: config.adminId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
@@ -1992,4 +2034,4 @@ export default {
         try { await processScheduled(env); }
         catch (e) { console.error("[CRON] CRASH:", e.message); }
     }
-};
+}; 
