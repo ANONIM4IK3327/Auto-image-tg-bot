@@ -75,8 +75,11 @@ HYBRID STYLE: Blend short tags with natural-language phrases for complex actions
 
 NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive prompt.`;
 
-const HORDE_API = "https://aihorde.net/api/v2";
-const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.2:tg" };
+const HORDE_API = "https://stablehorde.net/api/v2";
+const HORDE_HEADERS = { 
+    "Client-Agent": "TgImageBot:18.2:tg",
+    "Accept": "application/json"
+};
 const GOOGLE_AI_API = "https://generativelanguage.googleapis.com/v1beta";
 const PENDING_TTL_SEC = 10800;
 const TASK_TIMEOUT_MS = 10800000;
@@ -89,7 +92,7 @@ function getVisionModels(config, currentPreferred = null) {
     const provider = config.llmProvider || "openrouter";
     const base = provider === "google"
         ? (Array.isArray(config.googleVisionModels) && config.googleVisionModels.length ? config.googleVisionModels : [...DEFAULT_CONFIG.googleVisionModels])
-        : (Array.isArray(config.visionModels) && config.visionModels.length ? config.visionModels : [...DEFAULT_CONFIG.visionModels]);
+        : (Array.isArray(config.visionModels) && config.visionModels.length ? config.visionModels :[...DEFAULT_CONFIG.visionModels]);
 
     let preferredStr = provider === "google" ? config.googleVisionModel : config.visionModel;
     if (!preferredStr) return base;
@@ -98,7 +101,7 @@ function getVisionModels(config, currentPreferred = null) {
 
     if (currentPreferred) {
         const remainingBase = base.filter(m => m !== currentPreferred);
-        return [currentPreferred, ...remainingBase];
+        return[currentPreferred, ...remainingBase];
     } else if (preferredArr.length > 0) {
         return [...new Set([...preferredArr, ...base])];
     }
@@ -389,14 +392,12 @@ function isCensored(gen) {
     return !!(gen && (gen.gen_metadata?.some(m => m.type === "censorship") || gen.censored === true || gen.state === "censored"));
 }
 
-// ── ИСПРАВЛЕНО: Безопасное извлечение ключа (убираем случайные пробелы и кавычки) ──
 function getApiKey(env, config) {
     let key = config?.hordeApiKey;
     if (!key || typeof key !== "string" || key.trim() === "") {
         key = env.HORDE_API_KEY;
     }
     if (typeof key === "string") {
-        // Убираем пробелы и случайные кавычки (частая ошибка при настройке ENV)
         key = key.trim().replace(/^["']+|["']+$/g, "");
     }
     return (key && key.length > 0) ? key : "0000000000";
@@ -427,13 +428,13 @@ async function hordeGetResult(id, apiKey) {
     } catch { return { faulted: true }; }
 }
 
-// ── ИСПРАВЛЕНО: Добавлен учет HTTP 404 и 401 для правильного логирования ──
 async function hordeCheckKey(env, config) {
     const key = getApiKey(env, config);
     try {
         const res = await fetch(`${HORDE_API}/find_user`, { 
             headers: { 
                 "Client-Agent": HORDE_HEADERS["Client-Agent"],
+                "Accept": HORDE_HEADERS["Accept"],
                 "apikey": key
             } 
         });
@@ -511,11 +512,11 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
     }
 
     try {
-        // ── ИСПРАВЛЕНО: Явное задание заголовков без смешивания ──
         const res = await fetch(`${HORDE_API}/generate/async`, {
             method: "POST",
             headers: {
                 "Client-Agent": HORDE_HEADERS["Client-Agent"],
+                "Accept": HORDE_HEADERS["Accept"],
                 "Content-Type": "application/json",
                 "apikey": key
             },
@@ -1002,30 +1003,28 @@ async function handleCommand(msg, env) {
             break;
         }
 
-        // ── ИСПРАВЛЕНО: Безопасное сохранение ключа с проверкой ──
         case "/sethordekey": {
             if (!params[0]) return await tg.send(chatId, "❌ Укажите ключ: /sethordekey <ключ>\nИли '0000000000' для анонимного.");
             
-            // Чистим ключ от скрытых кавычек и лишних пробелов, которые делают ключ невалидным
+            // Чистим ключ от скрытых символов, пробелов и случайных кавычек
             const newKey = params.join("").trim().replace(/^["']+|["']+$/g, "");
-            const oldKey = config.hordeApiKey; // Бэкапим старый
             
+            // СРАЗУ СОХРАНЯЕМ ключ. 
+            // Это решает проблему, когда проверка временно падает, из-за чего бот мог откатиться на анонимный 0000000000.
             config.hordeApiKey = newKey;
+            await saveConfig(env, config);
             
-            // Сначала проверяем ключ на сервере
+            if (newKey === "0000000000") {
+                return await tg.send(chatId, `✅ Установлен анонимный режим (0000000000).`);
+            }
+
+            // После сохранения делаем запрос к профилю чтобы проверить, всё ли ок.
             const check = await hordeCheckKey(env, config);
             
             if (check.ok && !check.anon) {
-                // Ключ подтверждён сервером — сохраняем
-                await saveConfig(env, config);
-                await tg.send(chatId, `✅ Ключ Horde установлен и подтверждён сервером!\nПользователь: <b>${escapeHtml(check.user)}</b>, Kudos: <b>${check.kudos}</b>`);
-            } else if (newKey === "0000000000") {
-                await saveConfig(env, config);
-                await tg.send(chatId, `✅ Установлен анонимный режим (0000000000).`);
+                await tg.send(chatId, `✅ Ключ Horde сохранён и подтверждён сервером!\nПользователь: <b>${escapeHtml(check.user)}</b>, Kudos: <b>${check.kudos}</b>`);
             } else {
-                // Если ключ отклонен — возвращаем старый и НЕ сохраняем ошибку
-                config.hordeApiKey = oldKey;
-                await tg.send(chatId, `❌ Ошибка: Сервер Horde не принял этот ключ (ошибка: ${check.err || 'неверный ключ'}). Запросы с ним будут обрабатываться как анонимные.\n\nУбедитесь, что скопировали его полностью (22 символа без кавычек) и попробуйте снова.`);
+                await tg.send(chatId, `⚠️ Ключ сохранён, но сервер Horde вернул ошибку при его проверке (ошибка: ${check.err || 'неизвестно'}). Возможно, сервер временно недоступен или скопирован не весь ключ. Тем не менее, бот будет использовать именно его!`);
             }
             break;
         }
