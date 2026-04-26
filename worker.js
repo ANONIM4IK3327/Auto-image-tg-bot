@@ -24,7 +24,7 @@ const DEFAULT_CONFIG = {
     googleLlmModel: "gemini-2.0-flash",
     visionModel: "openrouter/free",
     googleVisionModel: "gemini-2.0-flash",
-    hordeApiKey: "", // Добавлено для хранения ключа прямо в конфиге бота
+    hordeApiKey: "",
     visionModels:[
         "openrouter/free",
         "google/gemma-3-27b-it:free",
@@ -75,7 +75,6 @@ HYBRID STYLE: Blend short tags with natural-language phrases for complex actions
 
 NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive prompt.`;
 
-// ИСПРАВЛЕНО: Новый домен API
 const HORDE_API = "https://aihorde.net/api/v2";
 const HORDE_HEADERS = { "Client-Agent": "TgImageBot:18.2:tg" };
 const GOOGLE_AI_API = "https://generativelanguage.googleapis.com/v1beta";
@@ -98,7 +97,6 @@ function getVisionModels(config, currentPreferred = null) {
     const preferredArr = preferredStr.split(',').map(s => s.trim()).filter(Boolean);
 
     if (currentPreferred) {
-        // Убираем текущую модель из базового списка и ставим в самое начало для fallback-механики
         const remainingBase = base.filter(m => m !== currentPreferred);
         return [currentPreferred, ...remainingBase];
     } else if (preferredArr.length > 0) {
@@ -359,14 +357,11 @@ async function saveConfig(env, config) {
     await KV.put(env, "config", JSON.stringify(config));
 }
 
-// ─── ИСПРАВЛЕНО: Секвентальный выбор моделей (по очереди) ───────────────────
 async function getNextModel(env, modelString, kvKey) {
     if (!modelString) return "";
     const models = modelString.split(',').map(s => s.trim()).filter(Boolean);
     if (models.length <= 1) return models[0] || modelString;
-    // Используем INCR для строгого чередования без конфликтов запросов
     const idx = await KV.incr(env, kvKey);
-    // idx начинается с 1 при первом INCR, поэтому Math.abs(idx - 1)
     return models[Math.abs(idx - 1) % models.length];
 }
 
@@ -402,6 +397,30 @@ function getGoogleApiKey(env) {
     return (env.GOOGLE_AI_API_KEY || "").trim();
 }
 
+// ── ИСПРАВЛЕНО: передаём apiKey, обрабатываем 404 (задача не найдена) ────────
+async function hordeCheck(id, apiKey) {
+    try {
+        const headers = { ...HORDE_HEADERS };
+        if (apiKey && apiKey !== "0000000000") headers["apikey"] = apiKey;
+        const res = await fetch(`${HORDE_API}/generate/check/${id}`, { headers });
+        // 404 = задача протухла или никогда не существовала на Horde
+        if (res.status === 404) return { done: false, not_found: true };
+        if (!res.ok) return { done: false };
+        return await res.json();
+    } catch { return { done: false }; }
+}
+
+// ── ИСПРАВЛЕНО: передаём apiKey ───────────────────────────────────────────────
+async function hordeGetResult(id, apiKey) {
+    try {
+        const headers = { ...HORDE_HEADERS };
+        if (apiKey && apiKey !== "0000000000") headers["apikey"] = apiKey;
+        const res = await fetch(`${HORDE_API}/generate/status/${id}`, { headers });
+        if (!res.ok) return { faulted: true };
+        return await res.json();
+    } catch { return { faulted: true }; }
+}
+
 async function hordeCheckKey(env, config) {
     const key = getApiKey(env, config);
     try {
@@ -412,22 +431,6 @@ async function hordeCheckKey(env, config) {
     } catch (e) {
         return { ok: false, anon: key === "0000000000", err: e.message };
     }
-}
-
-async function hordeCheck(id) {
-    try {
-        const res = await fetch(`${HORDE_API}/generate/check/${id}`, { headers: HORDE_HEADERS });
-        if (!res.ok) return { done: false };
-        return await res.json();
-    } catch { return { done: false }; }
-}
-
-async function hordeGetResult(id) {
-    try {
-        const res = await fetch(`${HORDE_API}/generate/status/${id}`, { headers: HORDE_HEADERS });
-        if (!res.ok) return { faulted: true };
-        return await res.json();
-    } catch { return { faulted: true }; }
 }
 
 async function hordeGetModels() {
@@ -488,7 +491,13 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         allow_downgrade: true
     };
 
-    if (extra.workerBlacklist?.length) body.blacklist = extra.workerBlacklist;
+    // ── ИСПРАВЛЕНО: правильные поля API Horde для блэклиста воркеров ──────────
+    // Было: body.blacklist = [...] — такого поля не существует, игнорировалось
+    // Надо: body.workers + body.worker_blacklist = true
+    if (extra.workerBlacklist?.length) {
+        body.workers = extra.workerBlacklist;
+        body.worker_blacklist = true;
+    }
 
     try {
         const res = await fetch(`${HORDE_API}/generate/async`, {
@@ -496,8 +505,17 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
             headers: { ...HORDE_HEADERS, "Content-Type": "application/json", "apikey": key },
             body: JSON.stringify(body)
         });
-        return await res.json();
+
+        const data = await res.json();
+
+        // ── ИСПРАВЛЕНО: логируем ошибки API Horde ─────────────────────────────
+        if (!res.ok || data.errors || data.message) {
+            console.error(`[Horde] Submit failed (HTTP ${res.status}):`, JSON.stringify(data).substring(0, 500));
+        }
+
+        return data;
     } catch (e) {
+        console.error("[Horde] Submit exception:", e.message);
         return { error: e.message };
     }
 }
@@ -976,7 +994,7 @@ async function handleCommand(msg, env) {
             await saveConfig(env, config);
             const check = await hordeCheckKey(env, config);
             if (check.ok && !check.anon) {
-                await tg.send(chatId, `✅ Ключ Horde установлен! Пользователь: <b>${check.user}</b>, Kudos: <b>${check.kudos}</b>`);
+                await tg.send(chatId, `✅ Ключ Horde установлен! Пользователь: <b>${escapeHtml(check.user)}</b>, Kudos: <b>${check.kudos}</b>`);
             } else {
                 await tg.send(chatId, `✅ Ключ установлен, но проверка вернула: ${check.anon ? "Анонимный аккаунт" : "Ошибка (" + check.err + ")"}.\nУбедитесь, что ключ верный.`);
             }
@@ -1661,29 +1679,34 @@ async function handleCommand(msg, env) {
             const llmBlocked = llmTimeout && Date.now() < parseInt(llmTimeout) ? " ⏸ заблокирован" : "";
             const provider = config.llmProvider || "openrouter";
             const providerLabel = provider === "google" ? "🔵 Google AI Studio" : "🟠 OpenRouter";
-            
+
             const currentLlmModelRaw = provider === "google"
                 ? (config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel)
                 : (config.llmModel || DEFAULT_CONFIG.llmModel);
             const llmArr = currentLlmModelRaw.split(',').map(s=>s.trim()).filter(Boolean);
             const llmDisplay = llmArr.length > 1 ? `<code>${escapeHtml(llmArr[0])}</code> <i>+${llmArr.length-1} (по очереди)</i>` : `<code>${escapeHtml(currentLlmModelRaw)}</code>`;
-            
+
             const currentVisionModelRaw = provider === "google"
                 ? (config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel)
                 : (config.visionModel || getVisionModels(config)[0] || "не задана");
             const vArr = currentVisionModelRaw.split(',').map(s=>s.trim()).filter(Boolean);
             const vDisplay = vArr.length > 1 ? `<code>${escapeHtml(vArr[0])}</code> <i>+${vArr.length-1} (по очереди)</i>` : `<code>${escapeHtml(currentVisionModelRaw)}</code>`;
-            
+
             const modelArr = config.model.split(',').map(s => s.trim()).filter(Boolean);
             const modelDisplay = modelArr.length > 1
                 ? `<code>${escapeHtml(modelArr[0])}</code> <i>+${modelArr.length - 1} (рандом)</i>`
                 : `<code>${escapeHtml(config.model)}</code>`;
-                
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> ${llmDisplay}\n<b>Vision:</b> ${vDisplay}\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> ${modelDisplay}\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
+
+            const apiKey = getApiKey(env, config);
+            const keyDisplay = apiKey === "0000000000" ? "🔴 анонимный" : "✅ задан";
+
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Horde API Key:</b> ${keyDisplay}\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> ${llmDisplay}\n<b>Vision:</b> ${vDisplay}\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> ${modelDisplay}\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
-        case "/pending":
+        case "/pending": {
+            const config2 = await getConfig(env);
+            const apiKey = getApiKey(env, config2);
             try {
                 const pendList = await KV.list(env, "pending:");
                 if (!pendList.keys.length) return await tg.send(chatId, "⏳ В очереди: 0 генераций");
@@ -1692,14 +1715,20 @@ async function handleCommand(msg, env) {
                 for (const k of pendList.keys) {
                     if (count >= 5) { statusTxt += `\n<i>...и ещё ${pendList.keys.length - 5}</i>`; break; }
                     const id = k.name.replace("pending:", "");
-                    const checkData = await hordeCheck(id);
-                    const status = checkData.done ? "✅ Готово" : checkData.faulted ? "❌ Ошибка" : "⏳ Ждёт";
-                    statusTxt += `🔹 <code>${id.substring(0, 8)}...</code> | ${status} | ~${checkData.wait_time || "?"}с | позиция: ${checkData.queue_position ?? "?"}\n`;
+                    // ── ИСПРАВЛЕНО: передаём apiKey ──────────────────────────
+                    const checkData = await hordeCheck(id, apiKey);
+                    let status;
+                    if (checkData.not_found) status = "❓ Не найдена";
+                    else if (checkData.done) status = "✅ Готово";
+                    else if (checkData.faulted) status = "❌ Ошибка";
+                    else status = "⏳ Ждёт";
+                    statusTxt += `🔹 <code>${id.substring(0, 8)}...</code> | ${status} | ~${checkData.wait_time ?? "?"}с | позиция: ${checkData.queue_position ?? "?"}\n`;
                     count++;
                 }
                 await tg.send(chatId, `📊 <b>Очередь:</b>\n\n${statusTxt}`);
             } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             break;
+        }
 
         case "/cancel":
             try {
@@ -1727,6 +1756,8 @@ async function processScheduled(env) {
     if (!env.UPSTASH_REDIS_REST_URL || !env.TELEGRAM_BOT_TOKEN) return;
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
     const config = await getConfig(env);
+    // ── ИСПРАВЛЕНО: получаем apiKey один раз, передаём во все Horde-вызовы ──
+    const apiKey = getApiKey(env, config);
 
     const pendingList = await KV.list(env, "pending:");
     for (const keyObj of pendingList.keys) {
@@ -1745,7 +1776,21 @@ async function processScheduled(env) {
                 continue;
             }
 
-            const check = await hordeCheck(id);
+            // ── ИСПРАВЛЕНО: передаём apiKey, обрабатываем not_found ──────────
+            const check = await hordeCheck(id, apiKey);
+
+            // ── НОВОЕ: задача не найдена на Horde (протухла или не существует) ─
+            if (check.not_found) {
+                console.warn(`[CRON] Task ${id} not found on Horde, cleaning up`);
+                await KV.del(env, keyObj.name);
+                if (task.notify) await tg.send(task.notify, `⚠️ Задача <code>${id.substring(0, 8)}...</code> не найдена на Horde. Возможно, воркеры не взяли её или она протухла.`);
+                if (task.batchId) {
+                    const batch = await KV.get(env, `batch:${task.batchId}`, "json");
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
+                }
+                continue;
+            }
+
             if (check.faulted === true) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `❌ Задача провалилась: <code>${id}</code>`);
@@ -1757,7 +1802,8 @@ async function processScheduled(env) {
             }
             if (!check.done) continue;
 
-            const res = await hordeGetResult(id);
+            // ── ИСПРАВЛЕНО: передаём apiKey ───────────────────────────────────
+            const res = await hordeGetResult(id, apiKey);
             if (res.faulted === true) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `❌ Ошибка генерации: <code>${id}</code>`);
@@ -1876,7 +1922,6 @@ async function processScheduled(env) {
                             await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC });
                         }
                     } else {
-                        // Batch record lost — deliver solo
                         const fr = await deliverImage(tg, task.targets?.[0], finalImageBase64, "", task.notify, config);
                         if (!fr.sent) shouldDeletePending = false;
                     }
@@ -1975,7 +2020,7 @@ async function processScheduled(env) {
         } catch (e) {
             if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
             const batch = await KV.get(env, `batch:${batchId}`, "json");
-            if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
+            if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
         }
         if (i < actualCount - 1) await new Promise(r => setTimeout(r, 2000));
     }
@@ -2034,4 +2079,4 @@ export default {
         try { await processScheduled(env); }
         catch (e) { console.error("[CRON] CRASH:", e.message); }
     }
-}; 
+};
