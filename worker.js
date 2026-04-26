@@ -182,7 +182,7 @@ function parsePromptLoras(prompt) {
     return { cleanPrompt, extraLoras, excludedLoras, disableLlm, modelOverride };
 }
 
-function buildLorasForRequest(config, extraLoras = [], excludedLoras =[]) {
+function buildLorasForRequest(config, extraLoras =[], excludedLoras =[]) {
     const globalLoras = (config.loras ||[]).filter(l =>
         l.global !== false && !excludedLoras.includes(String(l.name))
     );
@@ -389,28 +389,34 @@ function isCensored(gen) {
     return !!(gen && (gen.gen_metadata?.some(m => m.type === "censorship") || gen.censored === true || gen.state === "censored"));
 }
 
+// ── ИСПРАВЛЕНО: Безопасное извлечение ключа (убираем случайные пробелы и кавычки) ──
 function getApiKey(env, config) {
-    return (config?.hordeApiKey || env.HORDE_API_KEY || "").trim() || "0000000000";
+    let key = config?.hordeApiKey;
+    if (!key || typeof key !== "string" || key.trim() === "") {
+        key = env.HORDE_API_KEY;
+    }
+    if (typeof key === "string") {
+        // Убираем пробелы и случайные кавычки (частая ошибка при настройке ENV)
+        key = key.trim().replace(/^["']+|["']+$/g, "");
+    }
+    return (key && key.length > 0) ? key : "0000000000";
 }
 
 function getGoogleApiKey(env) {
     return (env.GOOGLE_AI_API_KEY || "").trim();
 }
 
-// ── ИСПРАВЛЕНО: передаём apiKey, обрабатываем 404 (задача не найдена) ────────
 async function hordeCheck(id, apiKey) {
     try {
         const headers = { ...HORDE_HEADERS };
         if (apiKey && apiKey !== "0000000000") headers["apikey"] = apiKey;
         const res = await fetch(`${HORDE_API}/generate/check/${id}`, { headers });
-        // 404 = задача протухла или никогда не существовала на Horde
         if (res.status === 404) return { done: false, not_found: true };
         if (!res.ok) return { done: false };
         return await res.json();
     } catch { return { done: false }; }
 }
 
-// ── ИСПРАВЛЕНО: передаём apiKey ───────────────────────────────────────────────
 async function hordeGetResult(id, apiKey) {
     try {
         const headers = { ...HORDE_HEADERS };
@@ -421,11 +427,19 @@ async function hordeGetResult(id, apiKey) {
     } catch { return { faulted: true }; }
 }
 
+// ── ИСПРАВЛЕНО: Добавлен учет HTTP 404 и 401 для правильного логирования ──
 async function hordeCheckKey(env, config) {
     const key = getApiKey(env, config);
     try {
-        const res = await fetch(`${HORDE_API}/find_user`, { headers: { apikey: key, ...HORDE_HEADERS } });
-        if (res.status === 401 || res.status === 403) return { ok: false, anon: key === "0000000000" };
+        const res = await fetch(`${HORDE_API}/find_user`, { 
+            headers: { 
+                "Client-Agent": HORDE_HEADERS["Client-Agent"],
+                "apikey": key
+            } 
+        });
+        if (!res.ok) {
+            return { ok: false, anon: key === "0000000000", err: `HTTP ${res.status}` };
+        }
         const data = await res.json();
         return { ok: true, anon: key === "0000000000", user: data.username, kudos: data.kudos, trusted: data.trusted, flagged: data.flagged };
     } catch (e) {
@@ -491,24 +505,25 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         allow_downgrade: true
     };
 
-    // ── ИСПРАВЛЕНО: правильные поля API Horde для блэклиста воркеров ──────────
-    // Было: body.blacklist = [...] — такого поля не существует, игнорировалось
-    // Надо: body.workers + body.worker_blacklist = true
     if (extra.workerBlacklist?.length) {
         body.workers = extra.workerBlacklist;
         body.worker_blacklist = true;
     }
 
     try {
+        // ── ИСПРАВЛЕНО: Явное задание заголовков без смешивания ──
         const res = await fetch(`${HORDE_API}/generate/async`, {
             method: "POST",
-            headers: { ...HORDE_HEADERS, "Content-Type": "application/json", "apikey": key },
+            headers: {
+                "Client-Agent": HORDE_HEADERS["Client-Agent"],
+                "Content-Type": "application/json",
+                "apikey": key
+            },
             body: JSON.stringify(body)
         });
 
         const data = await res.json();
 
-        // ── ИСПРАВЛЕНО: логируем ошибки API Horde ─────────────────────────────
         if (!res.ok || data.errors || data.message) {
             console.error(`[Horde] Submit failed (HTTP ${res.status}):`, JSON.stringify(data).substring(0, 500));
         }
@@ -652,7 +667,7 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
     for (const msg of messages) {
         if (msg.role === "system") {
             if (isGemma) {
-                contents.push({ role: "user", parts: [{ text: `[System Instruction]\n${msg.content}` }] });
+                contents.push({ role: "user", parts:[{ text: `[System Instruction]\n${msg.content}` }] });
                 contents.push({ role: "model", parts:[{ text: `Understood. I will strictly follow the instruction.` }] });
             } else {
                 systemInstruction = { parts: [{ text: msg.content }] };
@@ -661,7 +676,7 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
         }
         const role = msg.role === "assistant" ? "model" : "user";
         if (typeof msg.content === "string") {
-            contents.push({ role, parts: [{ text: msg.content }] });
+            contents.push({ role, parts:[{ text: msg.content }] });
         } else if (Array.isArray(msg.content)) {
             const parts =[];
             for (const c of msg.content) {
@@ -758,8 +773,7 @@ async function callLLM(env, config, messages, maxTokens = 800) {
 // ─── AI generation helpers ───────────────────────────────────────────────────
 
 async function determineResolution(prompt, env, config) {
-    const presets = [[1024, 1024], [1152, 896],[896, 1152],
-        [1216, 832],[832, 1216], [1344, 768],[768, 1344], [1536, 640]
+    const presets = [[1024, 1024],[1152, 896],[896, 1152],[1216, 832],[832, 1216], [1344, 768],[768, 1344], [1536, 640]
     ];
     if (!hasLlmProvider(env, config) || !config.llmEnabled) {
         const r = presets[Math.floor(Math.random() * presets.length)];
@@ -871,7 +885,7 @@ async function analyzeImageArtifacts(imgData, env, config) {
         const severity = String(parsed.severity || "none").toLowerCase();
         const threshold = String(config.artifactSeverityThreshold || "serious").toLowerCase();
         const severe = severity === "serious" || (threshold === "minor" && severity === "minor");
-        return { severe, severity, issues: Array.isArray(parsed.issues) ? parsed.issues : [] };
+        return { severe, severity, issues: Array.isArray(parsed.issues) ? parsed.issues :[] };
     } catch (e) {
         console.error("[artifact-check]", e.message);
         return { severe: false, severity: "none", issues:[] };
@@ -988,15 +1002,30 @@ async function handleCommand(msg, env) {
             break;
         }
 
+        // ── ИСПРАВЛЕНО: Безопасное сохранение ключа с проверкой ──
         case "/sethordekey": {
             if (!params[0]) return await tg.send(chatId, "❌ Укажите ключ: /sethordekey <ключ>\nИли '0000000000' для анонимного.");
-            config.hordeApiKey = params[0].trim();
-            await saveConfig(env, config);
+            
+            // Чистим ключ от скрытых кавычек и лишних пробелов, которые делают ключ невалидным
+            const newKey = params.join("").trim().replace(/^["']+|["']+$/g, "");
+            const oldKey = config.hordeApiKey; // Бэкапим старый
+            
+            config.hordeApiKey = newKey;
+            
+            // Сначала проверяем ключ на сервере
             const check = await hordeCheckKey(env, config);
+            
             if (check.ok && !check.anon) {
-                await tg.send(chatId, `✅ Ключ Horde установлен! Пользователь: <b>${escapeHtml(check.user)}</b>, Kudos: <b>${check.kudos}</b>`);
+                // Ключ подтверждён сервером — сохраняем
+                await saveConfig(env, config);
+                await tg.send(chatId, `✅ Ключ Horde установлен и подтверждён сервером!\nПользователь: <b>${escapeHtml(check.user)}</b>, Kudos: <b>${check.kudos}</b>`);
+            } else if (newKey === "0000000000") {
+                await saveConfig(env, config);
+                await tg.send(chatId, `✅ Установлен анонимный режим (0000000000).`);
             } else {
-                await tg.send(chatId, `✅ Ключ установлен, но проверка вернула: ${check.anon ? "Анонимный аккаунт" : "Ошибка (" + check.err + ")"}.\nУбедитесь, что ключ верный.`);
+                // Если ключ отклонен — возвращаем старый и НЕ сохраняем ошибку
+                config.hordeApiKey = oldKey;
+                await tg.send(chatId, `❌ Ошибка: Сервер Horde не принял этот ключ (ошибка: ${check.err || 'неверный ключ'}). Запросы с ним будут обрабатываться как анонимные.\n\nУбедитесь, что скопировали его полностью (22 символа без кавычек) и попробуйте снова.`);
             }
             break;
         }
@@ -1715,7 +1744,6 @@ async function handleCommand(msg, env) {
                 for (const k of pendList.keys) {
                     if (count >= 5) { statusTxt += `\n<i>...и ещё ${pendList.keys.length - 5}</i>`; break; }
                     const id = k.name.replace("pending:", "");
-                    // ── ИСПРАВЛЕНО: передаём apiKey ──────────────────────────
                     const checkData = await hordeCheck(id, apiKey);
                     let status;
                     if (checkData.not_found) status = "❓ Не найдена";
@@ -1756,7 +1784,8 @@ async function processScheduled(env) {
     if (!env.UPSTASH_REDIS_REST_URL || !env.TELEGRAM_BOT_TOKEN) return;
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
     const config = await getConfig(env);
-    // ── ИСПРАВЛЕНО: получаем apiKey один раз, передаём во все Horde-вызовы ──
+    
+    // Получаем очищенный API-ключ для всех вызовов
     const apiKey = getApiKey(env, config);
 
     const pendingList = await KV.list(env, "pending:");
@@ -1776,10 +1805,8 @@ async function processScheduled(env) {
                 continue;
             }
 
-            // ── ИСПРАВЛЕНО: передаём apiKey, обрабатываем not_found ──────────
             const check = await hordeCheck(id, apiKey);
 
-            // ── НОВОЕ: задача не найдена на Horde (протухла или не существует) ─
             if (check.not_found) {
                 console.warn(`[CRON] Task ${id} not found on Horde, cleaning up`);
                 await KV.del(env, keyObj.name);
@@ -1802,7 +1829,6 @@ async function processScheduled(env) {
             }
             if (!check.done) continue;
 
-            // ── ИСПРАВЛЕНО: передаём apiKey ───────────────────────────────────
             const res = await hordeGetResult(id, apiKey);
             if (res.faulted === true) {
                 await KV.del(env, keyObj.name);
