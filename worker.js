@@ -398,7 +398,7 @@ function getApiKey(env, config) {
         key = env.HORDE_API_KEY;
     }
     if (typeof key === "string") {
-        key = key.trim().replace(/^["']+|["']+$/g, "");
+        key = key.trim().replace(/^["']+|["']+$/g, "").replace(/\s+/g, "");
     }
     return (key && key.length > 0) ? key : "0000000000";
 }
@@ -410,7 +410,7 @@ function getGoogleApiKey(env) {
 async function hordeCheck(id, apiKey) {
     try {
         const headers = { ...HORDE_HEADERS };
-        if (apiKey && apiKey !== "0000000000") headers["apikey"] = apiKey;
+        if (apiKey) headers["apikey"] = apiKey;
         const res = await fetch(`${HORDE_API}/generate/check/${id}`, { headers });
         if (res.status === 404) return { done: false, not_found: true };
         if (!res.ok) return { done: false };
@@ -421,7 +421,7 @@ async function hordeCheck(id, apiKey) {
 async function hordeGetResult(id, apiKey) {
     try {
         const headers = { ...HORDE_HEADERS };
-        if (apiKey && apiKey !== "0000000000") headers["apikey"] = apiKey;
+        if (apiKey) headers["apikey"] = apiKey;
         const res = await fetch(`${HORDE_API}/generate/status/${id}`, { headers });
         if (!res.ok) return { faulted: true };
         return await res.json();
@@ -512,6 +512,8 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
     }
 
     try {
+        const maskedKey = key === "0000000000" ? "anon" : (key.substring(0, 4) + "..." + key.substring(key.length - 4));
+        console.log(`[Horde] Submitting with apikey: ${maskedKey}`);
         const res = await fetch(`${HORDE_API}/generate/async`, {
             method: "POST",
             headers: {
@@ -1007,12 +1009,16 @@ async function handleCommand(msg, env) {
             if (!params[0]) return await tg.send(chatId, "❌ Укажите ключ: /sethordekey <ключ>\nИли '0000000000' для анонимного.");
             
             // Чистим ключ от скрытых символов, пробелов и случайных кавычек
-            const newKey = params.join("").trim().replace(/^["']+|["']+$/g, "");
+            let rawKey = params.join(" ").trim();
+            const newKey = rawKey.replace(/^["']+|["']+$/g, "").replace(/\s+/g, "");
             
             // СРАЗУ СОХРАНЯЕМ ключ. 
             // Это решает проблему, когда проверка временно падает, из-за чего бот мог откатиться на анонимный 0000000000.
             config.hordeApiKey = newKey;
             await saveConfig(env, config);
+            
+            const masked = newKey === "0000000000" ? "anon" : (newKey.substring(0, 4) + "..." + newKey.substring(newKey.length - 4));
+            console.log(`[Horde] Key set: ${masked}`);
             
             if (newKey === "0000000000") {
                 return await tg.send(chatId, `✅ Установлен анонимный режим (0000000000).`);
@@ -1726,9 +1732,18 @@ async function handleCommand(msg, env) {
                 : `<code>${escapeHtml(config.model)}</code>`;
 
             const apiKey = getApiKey(env, config);
-            const keyDisplay = apiKey === "0000000000" ? "🔴 анонимный" : "✅ задан";
+            let keyDisplay = apiKey === "0000000000" ? "🔴 анонимный" : "✅ задан";
+            let keyExtra = "";
+            try {
+                const keyInfo = await hordeCheckKey(env, config);
+                if (keyInfo.ok && !keyInfo.anon) {
+                    keyDisplay = `✅ ${escapeHtml(keyInfo.user || "пользователь")} (${keyInfo.kudos ?? 0} kudos)`;
+                } else if (!keyInfo.ok && !keyInfo.anon) {
+                    keyExtra = `\n⚠️ Ошибка проверки ключа: ${escapeHtml(keyInfo.err || "неизвестно")}`;
+                }
+            } catch (e) { keyExtra = `\n⚠️ Не удалось проверить ключ`; }
 
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Horde API Key:</b> ${keyDisplay}\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> ${llmDisplay}\n<b>Vision:</b> ${vDisplay}\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> ${modelDisplay}\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Horde API Key:</b> ${keyDisplay}${keyExtra}\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> ${llmDisplay}\n<b>Vision:</b> ${vDisplay}\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> ${modelDisplay}\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1799,7 +1814,7 @@ async function processScheduled(env) {
                 if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
                 if (task.batchId) {
                     const batch = await KV.get(env, `batch:${task.batchId}`, "json");
-                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
             }
@@ -2045,7 +2060,7 @@ async function processScheduled(env) {
         } catch (e) {
             if (config.adminId) await tg.send(config.adminId, `❌ <b>Ошибка автогенерации:</b>\n${escapeHtml(e.message)}`);
             const batch = await KV.get(env, `batch:${batchId}`, "json");
-            if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
+            if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
         }
         if (i < actualCount - 1) await new Promise(r => setTimeout(r, 2000));
     }
