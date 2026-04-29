@@ -10,7 +10,7 @@ const DEFAULT_CONFIG = {
     systemContext: "",
     maxTokens: 800,
     model: "AlbedoBase XL (SDXL)",
-    loras:[],
+    loras: [],
     width: 1024,
     height: 1024,
     steps: 25,
@@ -22,10 +22,15 @@ const DEFAULT_CONFIG = {
     llmProvider: "openrouter",
     llmModel: "openrouter/free",
     googleLlmModel: "gemini-2.0-flash",
+    mistralLlmModel: "mistral-small-latest",
     visionModel: "openrouter/free",
     googleVisionModel: "gemini-2.0-flash",
+    mistralVisionModel: "pixtral-12b-latest",
     hordeApiKey: "",
-    visionModels:[
+    openrouterApiKey: "",
+    googleApiKey: "",
+    mistralApiKey: "",
+    visionModels: [
         "openrouter/free",
         "google/gemma-3-27b-it:free",
         "meta-llama/llama-3.2-11b-vision-instruct:free",
@@ -33,17 +38,22 @@ const DEFAULT_CONFIG = {
         "qwen/qwen2.5-vl-7b-instruct:free",
         "mistralai/pixtral-12b:free"
     ],
-    googleVisionModels:[
+    googleVisionModels: [
         "gemini-2.0-flash",
         "gemini-2.0-flash-lite",
         "gemini-1.5-flash",
         "gemini-1.5-pro"
     ],
+    mistralVisionModels: [
+        "pixtral-12b-latest",
+        "pixtral-12b-2409",
+        "mistral-small-latest"
+    ],
     clipSkip: 2,
     hiresFix: false,
     hiresFixDenoising: 0.65,
     karras: true,
-    postProcessors:[],
+    postProcessors: [],
     captionMode: 1,
     captionPrompt: "Ты пишешь подписи к AI-арту для Telegram-канала. По тегам Stable Diffusion напиши живое, атмосферное описание на 4-6 предложений. Передай настроение, опиши персонажа(ей), обстановку, освещение и атмосферу сцены. Используй эмодзи органично. Не упоминай технические теги и не начинай с вводных фраз типа «На картинке» или «Изображение».",
     useSpoiler: false,
@@ -76,32 +86,75 @@ HYBRID STYLE: Blend short tags with natural-language phrases for complex actions
 NEGATIVE PROMPT: Do NOT output a negative prompt. Output only the positive prompt.`;
 
 const HORDE_API = "https://stablehorde.net/api/v2";
-const HORDE_HEADERS = { 
+const HORDE_HEADERS = {
     "Client-Agent": "TgImageBot:18.2:tg",
     "Accept": "application/json"
 };
 const GOOGLE_AI_API = "https://generativelanguage.googleapis.com/v1beta";
+const MISTRAL_API = "https://api.mistral.ai/v1";
 const PENDING_TTL_SEC = 10800;
 const TASK_TIMEOUT_MS = 10800000;
 const MAX_DELIVERY_RETRIES = 3;
 const NONE_IMG2TXT_COOLDOWN_SEC = 3600;
+const DEFAULT_FETCH_TIMEOUT_MS = 30000;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+function cleanApiKey(raw) {
+    if (!raw || typeof raw !== "string") return "";
+    return raw.trim().replace(/^["']+|["']+$/g, "").replace(/\s+/g, "");
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, { ...options, signal: controller.signal });
+        return res;
+    } catch (e) {
+        if (e.name === "AbortError") throw new Error(`Request timeout after ${timeoutMs}ms`);
+        throw e;
+    } finally {
+        clearTimeout(id);
+    }
+}
+
+function getProviderLabel(provider) {
+    const map = {
+        openrouter: "🟠 OpenRouter",
+        google: "🔵 Google AI Studio",
+        mistral: "🟣 Mistral AI"
+    };
+    return map[provider] || `⚪ ${provider}`;
+}
+
 function getVisionModels(config, currentPreferred = null) {
     const provider = config.llmProvider || "openrouter";
-    const base = provider === "google"
-        ? (Array.isArray(config.googleVisionModels) && config.googleVisionModels.length ? config.googleVisionModels : [...DEFAULT_CONFIG.googleVisionModels])
-        : (Array.isArray(config.visionModels) && config.visionModels.length ? config.visionModels :[...DEFAULT_CONFIG.visionModels]);
+    let base;
+    if (provider === "google") {
+        base = Array.isArray(config.googleVisionModels) && config.googleVisionModels.length
+            ? [...config.googleVisionModels]
+            : [...DEFAULT_CONFIG.googleVisionModels];
+    } else if (provider === "mistral") {
+        base = Array.isArray(config.mistralVisionModels) && config.mistralVisionModels.length
+            ? [...config.mistralVisionModels]
+            : [...DEFAULT_CONFIG.mistralVisionModels];
+    } else {
+        base = Array.isArray(config.visionModels) && config.visionModels.length
+            ? [...config.visionModels]
+            : [...DEFAULT_CONFIG.visionModels];
+    }
 
-    let preferredStr = provider === "google" ? config.googleVisionModel : config.visionModel;
+    const preferredStr = provider === "google" ? config.googleVisionModel
+        : provider === "mistral" ? config.mistralVisionModel
+            : config.visionModel;
     if (!preferredStr) return base;
 
-    const preferredArr = preferredStr.split(',').map(s => s.trim()).filter(Boolean);
+    const preferredArr = preferredStr.split(",").map(s => s.trim()).filter(Boolean);
 
     if (currentPreferred) {
         const remainingBase = base.filter(m => m !== currentPreferred);
-        return[currentPreferred, ...remainingBase];
+        return [currentPreferred, ...remainingBase];
     } else if (preferredArr.length > 0) {
         return [...new Set([...preferredArr, ...base])];
     }
@@ -110,7 +163,33 @@ function getVisionModels(config, currentPreferred = null) {
 
 function hasLlmProvider(env, config) {
     const provider = config?.llmProvider || "openrouter";
-    return provider === "google" ? !!getGoogleApiKey(env) : !!env.OPENROUTER_API_KEY;
+    if (provider === "google") return !!getGoogleApiKey(env, config);
+    if (provider === "mistral") return !!getMistralApiKey(env, config);
+    return !!getOpenRouterApiKey(env, config);
+}
+
+function getOpenRouterApiKey(env, config) {
+    const fromConfig = config?.openrouterApiKey;
+    if (fromConfig && typeof fromConfig === "string" && fromConfig.trim().length > 0) {
+        return fromConfig.trim();
+    }
+    return (env.OPENROUTER_API_KEY || "").trim();
+}
+
+function getGoogleApiKey(env, config) {
+    const fromConfig = config?.googleApiKey;
+    if (fromConfig && typeof fromConfig === "string" && fromConfig.trim().length > 0) {
+        return fromConfig.trim();
+    }
+    return (env.GOOGLE_AI_API_KEY || "").trim();
+}
+
+function getMistralApiKey(env, config) {
+    const fromConfig = config?.mistralApiKey;
+    if (fromConfig && typeof fromConfig === "string" && fromConfig.trim().length > 0) {
+        return fromConfig.trim();
+    }
+    return (env.MISTRAL_API_KEY || "").trim();
 }
 
 function escapeHtml(text) {
@@ -145,12 +224,12 @@ function getActualCount(countConfig) {
     if (str.startsWith("random")) {
         const match = str.match(/random\s+(\d+)\s*-\s*(\d+)/);
         if (match) {
-            const min = parseInt(match[1]), max = parseInt(match[2]);
-            if (!isNaN(min) && !isNaN(max) && min <= max)
+            const min = parseInt(match[1], 10), max = parseInt(match[2], 10);
+            if (!isNaN(min) && !isNaN(max) && min > 0 && max <= 10 && min <= max)
                 return Math.floor(Math.random() * (max - min + 1)) + min;
         }
     }
-    return parseInt(str) || 1;
+    return parseInt(str, 10) || 1;
 }
 
 function getRandomPromptSegmentInfo(generalPrompt) {
@@ -162,14 +241,18 @@ function getRandomPromptSegmentInfo(generalPrompt) {
 }
 
 function parsePromptLoras(prompt) {
-    let cleanPrompt = prompt;
-    const extraLoras = [], excludedLoras =[];
+    const extraLoras = [], excludedLoras = [];
     let disableLlm = false, modelOverride = null;
+    const matches = [];
     const regex = /\{([^}]*)\}/g;
     let match;
     while ((match = regex.exec(prompt)) !== null) {
-        cleanPrompt = cleanPrompt.replace(match[0], "");
-        for (const part of match[1].split(",").map(s => s.trim()).filter(Boolean)) {
+        matches.push(match);
+    }
+    let cleanPrompt = prompt;
+    for (const m of matches) {
+        cleanPrompt = cleanPrompt.replace(m[0], "");
+        for (const part of m[1].split(",").map(s => s.trim()).filter(Boolean)) {
             const lower = part.toLowerCase();
             if (lower === "-llm" || lower === "nollm") disableLlm = true;
             else if (lower.startsWith("model:")) modelOverride = part.substring(6).trim();
@@ -185,11 +268,11 @@ function parsePromptLoras(prompt) {
     return { cleanPrompt, extraLoras, excludedLoras, disableLlm, modelOverride };
 }
 
-function buildLorasForRequest(config, extraLoras =[], excludedLoras =[]) {
-    const globalLoras = (config.loras ||[]).filter(l =>
+function buildLorasForRequest(config, extraLoras = [], excludedLoras = []) {
+    const globalLoras = (config.loras || []).filter(l =>
         l.global !== false && !excludedLoras.includes(String(l.name))
     );
-    return[...globalLoras, ...extraLoras];
+    return [...globalLoras, ...extraLoras];
 }
 
 function getUserRole(userId, config) {
@@ -200,21 +283,22 @@ function getUserRole(userId, config) {
 
 function checkAccess(role, cmd) {
     if (role === "admin") return true;
-    const creatorCmds =[
+    const creatorCmds = [
         "/addprompt", "/delprompt", "/promptlist", "/setprompt", "/setcontext",
         "/addlora", "/listloras", "/clearloras", "/dellora", "/setneg",
         "/generate", "/help", "/start", "/ping", "/setwatermark", "/delwatermark",
         "/img2txt", "/llmlist", "/setvmodel", "/listvmodel"
     ];
-    const techCmds =[
+    const techCmds = [
         "/status", "/pending", "/cancel", "/workerbl", "/ping",
         "/listmodels", "/searchmodel", "/setenhancer", "/setsize", "/setsteps",
         "/setcfg", "/setsampler", "/help", "/start", "/togglellm", "/setllm",
         "/settokens", "/setcaptionmode", "/setcaptionprompt", "/setvmodel", "/listvmodel",
         "/setspoiler", "/setmodel", "/setinterval", "/setcount", "/enable", "/disable",
-        "/clearllm", "/setprovider", "/llmlist", "/sethordekey"
+        "/clearllm", "/setprovider", "/llmlist", "/sethordekey",
+        "/setopenrouterkey", "/setgooglekey", "/setmistralkey"
     ];
-    const participantCmds =["/start", "/help", "/ping", "/promptsuggest", "/img2txt"];
+    const participantCmds = ["/start", "/help", "/ping", "/promptsuggest", "/img2txt"];
     if (role === "creator") return creatorCmds.includes(cmd);
     if (role === "tech") return techCmds.includes(cmd);
     return participantCmds.includes(cmd);
@@ -226,7 +310,7 @@ function getSuggestTarget(config) {
 
 function formatMessagesForModel(messages, model) {
     if (!model || !model.toLowerCase().includes("gemma")) return messages;
-    const finalMessages =[];
+    const finalMessages = [];
     let sysPrompt = "";
     for (const msg of messages) {
         if (msg.role === "system") sysPrompt += msg.content + "\n";
@@ -237,7 +321,7 @@ function formatMessagesForModel(messages, model) {
         if (typeof firstUser.content === "string") {
             firstUser.content = `[System Instruction]\n${sysPrompt.trim()}\n\n[User Input]\n${firstUser.content}`;
         } else if (Array.isArray(firstUser.content)) {
-            firstUser.content =[...firstUser.content];
+            firstUser.content = [...firstUser.content];
             const firstTextIdx = firstUser.content.findIndex(c => c.type === "text");
             if (firstTextIdx !== -1) {
                 firstUser.content[firstTextIdx] = {
@@ -256,10 +340,11 @@ function formatMessagesForModel(messages, model) {
 
 function pickRandomModel(modelStr) {
     if (!modelStr) return "AlbedoBase XL (SDXL)";
-    const arr = modelStr.split(',').map(s => s.trim()).filter(Boolean);
+    const arr = modelStr.split(",").map(s => s.trim()).filter(Boolean);
     if (!arr.length) return modelStr;
     return arr[Math.floor(Math.random() * arr.length)];
 }
+
 
 // ─── Telegram ────────────────────────────────────────────────────────────────
 
@@ -268,11 +353,11 @@ class Telegram {
         this.base = `https://api.telegram.org/bot${token}`;
     }
     async api(method, body) {
-        const res = await fetch(`${this.base}/${method}`, {
+        const res = await fetchWithTimeout(`${this.base}/${method}`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body)
-        });
+        }, 30000);
         const data = await res.json();
         if (!data.ok) console.error(`[TG] ${method}:`, JSON.stringify(data).substring(0, 400));
         return data;
@@ -287,12 +372,13 @@ class Telegram {
         if (caption) { form.append("caption", caption.substring(0, 1024)); form.append("parse_mode", "HTML"); }
         if (extra.hasSpoiler) form.append("has_spoiler", "true");
         if (extra.replyMarkup) form.append("reply_markup", JSON.stringify(extra.replyMarkup));
-        return (await fetch(`${this.base}/sendPhoto`, { method: "POST", body: form })).json();
+        const res = await fetchWithTimeout(`${this.base}/sendPhoto`, { method: "POST", body: form }, 60000);
+        return res.json();
     }
     async sendMediaGroup(chatId, buffers, caption = "", extra = {}) {
         const form = new FormData();
         form.append("chat_id", String(chatId));
-        const media =[];
+        const media = [];
         buffers.forEach((buf, i) => {
             const filename = `photo${i}.webp`;
             form.append(filename, new Blob([buf], { type: "image/webp" }), filename);
@@ -302,7 +388,8 @@ class Telegram {
             media.push(item);
         });
         form.append("media", JSON.stringify(media));
-        return (await fetch(`${this.base}/sendMediaGroup`, { method: "POST", body: form })).json();
+        const res = await fetchWithTimeout(`${this.base}/sendMediaGroup`, { method: "POST", body: form }, 60000);
+        return res.json();
     }
     async sendDocument(chatId, buffer, caption = "", extra = {}) {
         const form = new FormData();
@@ -310,7 +397,8 @@ class Telegram {
         form.append("document", new Blob([buffer], { type: "image/webp" }), "image.webp");
         if (caption) { form.append("caption", caption.substring(0, 1024)); form.append("parse_mode", "HTML"); }
         if (extra.replyMarkup) form.append("reply_markup", JSON.stringify(extra.replyMarkup));
-        return (await fetch(`${this.base}/sendDocument`, { method: "POST", body: form })).json();
+        const res = await fetchWithTimeout(`${this.base}/sendDocument`, { method: "POST", body: form }, 60000);
+        return res.json();
     }
 }
 
@@ -320,14 +408,19 @@ const KV = {
     async call(env, ...args) {
         if (!env.UPSTASH_REDIS_REST_URL || !env.UPSTASH_REDIS_REST_TOKEN) return null;
         const base = env.UPSTASH_REDIS_REST_URL.replace(/\/$/, "");
-        const res = await fetch(base, {
-            method: "POST",
-            headers: { "Authorization": `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}` },
-            body: JSON.stringify(args)
-        });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        return data.result;
+        try {
+            const res = await fetchWithTimeout(base, {
+                method: "POST",
+                headers: { "Authorization": `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}` },
+                body: JSON.stringify(args)
+            }, 15000);
+            const data = await res.json();
+            if (data.error) throw new Error(data.error);
+            return data.result;
+        } catch (e) {
+            console.error("[KV] error:", e.message);
+            return null;
+        }
     },
     async incr(env, key) {
         const res = await this.call(env, "INCR", key);
@@ -340,13 +433,13 @@ const KV = {
     },
     async put(env, key, value, opts = {}) {
         const val = typeof value === "string" ? value : JSON.stringify(value);
-        const args =["SET", key, val];
+        const args = ["SET", key, val];
         if (opts.expirationTtl) args.push("EX", opts.expirationTtl);
         await this.call(env, ...args);
     },
     async del(env, key) { await this.call(env, "DEL", key); },
     async list(env, prefix) {
-        const keys = await this.call(env, "KEYS", `${prefix}*`) ||[];
+        const keys = await this.call(env, "KEYS", `${prefix}*`) || [];
         return { keys: keys.map(k => ({ name: k })) };
     }
 };
@@ -362,16 +455,17 @@ async function saveConfig(env, config) {
 
 async function getNextModel(env, modelString, kvKey) {
     if (!modelString) return "";
-    const models = modelString.split(',').map(s => s.trim()).filter(Boolean);
+    const models = modelString.split(",").map(s => s.trim()).filter(Boolean);
     if (models.length <= 1) return models[0] || modelString;
     const idx = await KV.incr(env, kvKey);
-    return models[Math.abs(idx - 1) % models.length];
+    return models[(Math.abs(idx) - 1) % models.length];
 }
+
 
 // ─── Horde ───────────────────────────────────────────────────────────────────
 
 async function getWorkerBlacklist(env) {
-    return await KV.get(env, "worker_blacklist", "json") ||[];
+    return await KV.get(env, "worker_blacklist", "json") || [];
 }
 
 async function addWorkerToBlacklist(env, id, name) {
@@ -397,21 +491,15 @@ function getApiKey(env, config) {
     if (!key || typeof key !== "string" || key.trim() === "") {
         key = env.HORDE_API_KEY;
     }
-    if (typeof key === "string") {
-        key = key.trim().replace(/^["']+|["']+$/g, "").replace(/\s+/g, "");
-    }
-    return (key && key.length > 0) ? key : "0000000000";
-}
-
-function getGoogleApiKey(env) {
-    return (env.GOOGLE_AI_API_KEY || "").trim();
+    key = cleanApiKey(key || "");
+    return key.length > 0 ? key : "0000000000";
 }
 
 async function hordeCheck(id, apiKey) {
     try {
         const headers = { ...HORDE_HEADERS };
         if (apiKey) headers["apikey"] = apiKey;
-        const res = await fetch(`${HORDE_API}/generate/check/${id}`, { headers });
+        const res = await fetchWithTimeout(`${HORDE_API}/generate/check/${id}`, { headers }, 20000);
         if (res.status === 404) return { done: false, not_found: true };
         if (!res.ok) return { done: false };
         return await res.json();
@@ -422,7 +510,7 @@ async function hordeGetResult(id, apiKey) {
     try {
         const headers = { ...HORDE_HEADERS };
         if (apiKey) headers["apikey"] = apiKey;
-        const res = await fetch(`${HORDE_API}/generate/status/${id}`, { headers });
+        const res = await fetchWithTimeout(`${HORDE_API}/generate/status/${id}`, { headers }, 20000);
         if (!res.ok) return { faulted: true };
         return await res.json();
     } catch { return { faulted: true }; }
@@ -431,13 +519,13 @@ async function hordeGetResult(id, apiKey) {
 async function hordeCheckKey(env, config) {
     const key = getApiKey(env, config);
     try {
-        const res = await fetch(`${HORDE_API}/find_user`, { 
-            headers: { 
+        const res = await fetchWithTimeout(`${HORDE_API}/find_user`, {
+            headers: {
                 "Client-Agent": HORDE_HEADERS["Client-Agent"],
                 "Accept": HORDE_HEADERS["Accept"],
                 "apikey": key
-            } 
-        });
+            }
+        }, 20000);
         if (!res.ok) {
             return { ok: false, anon: key === "0000000000", err: `HTTP ${res.status}` };
         }
@@ -450,10 +538,10 @@ async function hordeCheckKey(env, config) {
 
 async function hordeGetModels() {
     try {
-        const res = await fetch(`${HORDE_API}/status/models?type=image`, { headers: HORDE_HEADERS });
-        if (!res.ok) return[];
+        const res = await fetchWithTimeout(`${HORDE_API}/status/models?type=image`, { headers: HORDE_HEADERS }, 20000);
+        if (!res.ok) return [];
         return await res.json();
-    } catch { return[]; }
+    } catch { return []; }
 }
 
 async function hordeSubmit(prompt, config, env, extra = {}) {
@@ -478,11 +566,11 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         params.post_processing = config.postProcessors;
     }
 
-    let effectiveLoras =[];
+    let effectiveLoras = [];
     if (!extra.skipLoras) {
         effectiveLoras = extra.lorasOverride !== undefined
             ? extra.lorasOverride
-            : (config.loras ||[]).filter(l => l.global !== false);
+            : (config.loras || []).filter(l => l.global !== false);
     }
 
     if (effectiveLoras.length > 0) {
@@ -500,7 +588,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
         nsfw: config.nsfw !== false,
         trusted_workers: false,
         slow_workers: true,
-        models:[extra.modelOverride || pickRandomModel(config.model)],
+        models: [extra.modelOverride || pickRandomModel(config.model)],
         r2: true,
         shared: false,
         allow_downgrade: true
@@ -514,7 +602,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
     try {
         const maskedKey = key === "0000000000" ? "anon" : (key.substring(0, 4) + "..." + key.substring(key.length - 4));
         console.log(`[Horde] Submitting with apikey: ${maskedKey}`);
-        const res = await fetch(`${HORDE_API}/generate/async`, {
+        const res = await fetchWithTimeout(`${HORDE_API}/generate/async`, {
             method: "POST",
             headers: {
                 "Client-Agent": HORDE_HEADERS["Client-Agent"],
@@ -523,7 +611,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
                 "apikey": key
             },
             body: JSON.stringify(body)
-        });
+        }, 30000);
 
         const data = await res.json();
 
@@ -540,7 +628,7 @@ async function hordeSubmit(prompt, config, env, extra = {}) {
 
 async function downloadImage(url) {
     try {
-        const res = await fetch(url);
+        const res = await fetchWithTimeout(url, {}, 30000);
         if (!res.ok) return null;
         return await res.arrayBuffer();
     } catch { return null; }
@@ -570,7 +658,7 @@ async function checkLlmStatus(env) {
 }
 
 async function recordLlmFailure(env) {
-    let fails = parseInt(await KV.get(env, "llm_fails") || "0");
+    let fails = parseInt(await KV.get(env, "llm_fails") || "0", 10);
     fails++;
     if (fails >= 3) {
         await KV.put(env, "llm_timeout", String(Date.now() + 3600000));
@@ -586,24 +674,27 @@ async function recordLlmSuccess(env) {
     await KV.del(env, "llm_timeout");
 }
 
+
 // ─── OpenRouter ──────────────────────────────────────────────────────────────
 
-async function callOpenRouter(env, model, messages, maxTokens = 800, retries = 2) {
+async function callOpenRouter(env, config, model, messages, maxTokens = 800, retries = 2) {
+    const apiKey = getOpenRouterApiKey(env, config);
+    if (!apiKey) return null;
     if (!(await checkLlmStatus(env))) return null;
     let lastErr = null;
     const formattedMessages = formatMessagesForModel(messages, model);
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
-            const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            const res = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+                    "Authorization": `Bearer ${apiKey}`,
                     "HTTP-Referer": "https://t.me",
                     "X-Title": "TgImageBot"
                 },
                 body: JSON.stringify({ model, messages: formattedMessages, temperature: 0.7, max_tokens: maxTokens })
-            });
+            }, 30000);
 
             if (!res.ok) {
                 const errBody = await res.text();
@@ -642,22 +733,22 @@ async function callOpenRouter(env, model, messages, maxTokens = 800, retries = 2
 
 // ─── Google AI Studio ────────────────────────────────────────────────────────
 
-async function fetchGoogleModels(env) {
-    const key = getGoogleApiKey(env);
-    if (!key) return[];
+async function fetchGoogleModels(env, config) {
+    const key = getGoogleApiKey(env, config);
+    if (!key) return [];
     try {
-        const res = await fetch(`${GOOGLE_AI_API}/models?key=${key}&pageSize=100`);
-        if (!res.ok) return[];
+        const res = await fetchWithTimeout(`${GOOGLE_AI_API}/models?key=${key}&pageSize=100`, {}, 20000);
+        if (!res.ok) return [];
         const data = await res.json();
-        return (data.models ||[]).filter(m =>
+        return (data.models || []).filter(m =>
             Array.isArray(m.supportedGenerationMethods) &&
             m.supportedGenerationMethods.includes("generateContent")
         );
-    } catch { return[]; }
+    } catch { return []; }
 }
 
-async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) {
-    const key = getGoogleApiKey(env);
+async function callGoogleAI(env, config, model, messages, maxTokens = 800, retries = 2) {
+    const key = getGoogleApiKey(env, config);
     if (!key) return null;
     if (!(await checkLlmStatus(env))) return null;
 
@@ -665,13 +756,13 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
     const isGemma = cleanModel.toLowerCase().includes("gemma");
 
     let systemInstruction = null;
-    const contents =[];
+    const contents = [];
 
     for (const msg of messages) {
         if (msg.role === "system") {
             if (isGemma) {
-                contents.push({ role: "user", parts:[{ text: `[System Instruction]\n${msg.content}` }] });
-                contents.push({ role: "model", parts:[{ text: `Understood. I will strictly follow the instruction.` }] });
+                contents.push({ role: "user", parts: [{ text: `[System Instruction]\n${msg.content}` }] });
+                contents.push({ role: "model", parts: [{ text: `Understood. I will strictly follow the instruction.` }] });
             } else {
                 systemInstruction = { parts: [{ text: msg.content }] };
             }
@@ -679,9 +770,9 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
         }
         const role = msg.role === "assistant" ? "model" : "user";
         if (typeof msg.content === "string") {
-            contents.push({ role, parts:[{ text: msg.content }] });
+            contents.push({ role, parts: [{ text: msg.content }] });
         } else if (Array.isArray(msg.content)) {
-            const parts =[];
+            const parts = [];
             for (const c of msg.content) {
                 if (c.type === "text") {
                     parts.push({ text: c.text });
@@ -708,13 +799,14 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
     let lastErr = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
-            const res = await fetch(
+            const res = await fetchWithTimeout(
                 `${GOOGLE_AI_API}/models/${cleanModel}:generateContent?key=${key}`,
                 {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(body)
-                }
+                },
+                30000
             );
 
             if (!res.ok) {
@@ -759,6 +851,60 @@ async function callGoogleAI(env, model, messages, maxTokens = 800, retries = 2) 
     return null;
 }
 
+// ─── Mistral AI ──────────────────────────────────────────────────────────────
+
+async function callMistral(env, config, model, messages, maxTokens = 800, retries = 2) {
+    const apiKey = getMistralApiKey(env, config);
+    if (!apiKey) return null;
+    if (!(await checkLlmStatus(env))) return null;
+    let lastErr = null;
+    const formattedMessages = formatMessagesForModel(messages, model);
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const res = await fetchWithTimeout(`${MISTRAL_API}/chat/completions`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${apiKey}`
+                },
+                body: JSON.stringify({ model, messages: formattedMessages, temperature: 0.7, max_tokens: maxTokens })
+            }, 30000);
+
+            if (!res.ok) {
+                const errBody = await res.text();
+                lastErr = `HTTP ${res.status}: ${errBody.substring(0, 300)}`;
+                console.error(`[LLM/Mistral] Attempt ${attempt + 1} failed (${model}):`, lastErr);
+                if (res.status === 429 || res.status >= 500) {
+                    await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+                    continue;
+                }
+                break;
+            }
+
+            const data = await res.json();
+            if (data.error) {
+                lastErr = data.error.message || JSON.stringify(data.error);
+                console.error(`[LLM/Mistral] API error (${model}):`, lastErr);
+                break;
+            }
+
+            const text = data.choices?.[0]?.message?.content?.trim();
+            if (text && text.length > 3) {
+                await recordLlmSuccess(env);
+                return text;
+            }
+            lastErr = "Empty response from model";
+        } catch (e) {
+            lastErr = e.message;
+            console.error(`[LLM/Mistral] Attempt ${attempt + 1} exception (${model}):`, e.message);
+            if (attempt < retries) await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+        }
+    }
+    console.error("[LLM/Mistral] All attempts failed:", lastErr);
+    await recordLlmFailure(env);
+    return null;
+}
+
 // ─── Unified LLM caller ──────────────────────────────────────────────────────
 
 async function callLLM(env, config, messages, maxTokens = 800) {
@@ -766,24 +912,32 @@ async function callLLM(env, config, messages, maxTokens = 800) {
     if (provider === "google") {
         const modelStr = config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel;
         const model = await getNextModel(env, modelStr, "llm_model_idx");
-        return callGoogleAI(env, model, messages, maxTokens);
+        return callGoogleAI(env, config, model, messages, maxTokens);
+    }
+    if (provider === "mistral") {
+        const modelStr = config.mistralLlmModel || DEFAULT_CONFIG.mistralLlmModel;
+        const model = await getNextModel(env, modelStr, "llm_model_idx");
+        return callMistral(env, config, model, messages, maxTokens);
     }
     const modelStr = config.llmModel || DEFAULT_CONFIG.llmModel;
     const model = await getNextModel(env, modelStr, "llm_model_idx");
-    return callOpenRouter(env, model, messages, maxTokens);
+    return callOpenRouter(env, config, model, messages, maxTokens);
 }
+
 
 // ─── AI generation helpers ───────────────────────────────────────────────────
 
 async function determineResolution(prompt, env, config) {
-    const presets = [[1024, 1024],[1152, 896],[896, 1152],[1216, 832],[832, 1216], [1344, 768],[768, 1344], [1536, 640]
+    const presets = [
+        [1024, 1024], [1152, 896], [896, 1152], [1216, 832], [832, 1216],
+        [1344, 768], [768, 1344], [1536, 640]
     ];
     if (!hasLlmProvider(env, config) || !config.llmEnabled) {
         const r = presets[Math.floor(Math.random() * presets.length)];
         return { width: r[0], height: r[1] };
     }
     try {
-        const result = await callLLM(env, config,[
+        const result = await callLLM(env, config, [
             { role: "system", content: "You are an AI choosing aspect ratios. Read the prompt and output ONLY one of these exact strings based on what visually fits best: '1024x1024' (Square), '1152x896' (Slight Landscape), '896x1152' (Slight Portrait), '1216x832' (Landscape), '832x1216' (Portrait), '1344x768' (Widescreen), '768x1344' (Tall), '1536x640' (Cinematic). NO explanations, NO markdown." },
             { role: "user", content: `Prompt: ${prompt}` }
         ], 50);
@@ -815,7 +969,7 @@ async function generatePrompt(basePrompt, env, config, meta = {}) {
         sysPrompt = `${baseContext}\n\nExpand the theme deeply into a full detailed tag string.`;
         userPrompt = `Create a highly detailed Stable Diffusion prompt based on this theme: ${basePrompt}`;
     }
-    const result = await callLLM(env, config,[
+    const result = await callLLM(env, config, [
         { role: "system", content: sysPrompt },
         { role: "user", content: userPrompt }
     ], config.maxTokens || 800);
@@ -827,7 +981,7 @@ async function generatePrompt(basePrompt, env, config, meta = {}) {
 async function generateAiCaption(imagePrompt, env, config) {
     if (!config.llmEnabled || !hasLlmProvider(env, config))
         return `🎨 <i>${escapeHtml(imagePrompt.substring(0, 900))}</i>`;
-    const result = await callLLM(env, config,[
+    const result = await callLLM(env, config, [
         { role: "system", content: config.captionPrompt || DEFAULT_CONFIG.captionPrompt },
         { role: "user", content: `Теги изображения: ${imagePrompt.substring(0, 1000)}\n\nНапиши подпись для этого AI-арта.` }
     ], 500);
@@ -838,23 +992,25 @@ async function generateAiCaption(imagePrompt, env, config) {
 
 async function analyzeImageArtifacts(imgData, env, config) {
     if (!config.artifactCheckEnabled || !imgData || !hasLlmProvider(env, config))
-        return { severe: false, severity: "none", issues:[] };
+        return { severe: false, severity: "none", issues: [] };
     try {
         let dataUrl;
         if (isHttpUrl(imgData)) {
             const buf = await downloadImage(imgData);
-            if (!buf) return { severe: false, severity: "none", issues:[] };
+            if (!buf) return { severe: false, severity: "none", issues: [] };
             dataUrl = `data:image/webp;base64,${bufferToBase64(buf)}`;
         } else {
             dataUrl = `data:image/webp;base64,${imgData}`;
         }
 
-        const messages =[
+        const messages = [
             { role: "system", content: 'You detect visual AI artifacts. Return strict JSON only: {"severity":"none|minor|serious","issues":["..."]}.' },
-            { role: "user", content:[
-                { type: "text", text: "Check this image for severe generation artifacts: bad anatomy, melted limbs, broken faces, deformed hands, text glitches, severe blur, corruption." },
-                { type: "image_url", image_url: { url: dataUrl } }
-            ]}
+            {
+                role: "user", content: [
+                    { type: "text", text: "Check this image for severe generation artifacts: bad anatomy, melted limbs, broken faces, deformed hands, text glitches, severe blur, corruption." },
+                    { type: "image_url", image_url: { url: dataUrl } }
+                ]
+            }
         ];
 
         let raw;
@@ -863,35 +1019,41 @@ async function analyzeImageArtifacts(imgData, env, config) {
         if (provider === "google") {
             const modelStr = config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel;
             const model = await getNextModel(env, modelStr, "vision_model_idx");
-            raw = await callGoogleAI(env, model, messages, 300);
+            raw = await callGoogleAI(env, config, model, messages, 300);
+        } else if (provider === "mistral") {
+            const modelStr = config.mistralVisionModel || DEFAULT_CONFIG.mistralVisionModel;
+            const model = await getNextModel(env, modelStr, "vision_model_idx");
+            raw = await callMistral(env, config, model, messages, 300);
         } else {
             const modelStr = config.visionModel || getVisionModels(config)[0];
             const moderationModel = await getNextModel(env, modelStr, "vision_model_idx");
             const formattedMessages = formatMessagesForModel(messages, moderationModel);
-            const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+            const apiKey = getOpenRouterApiKey(env, config);
+            if (!apiKey) return { severe: false, severity: "none", issues: [] };
+            const res = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
                 method: "POST",
                 headers: {
                     "Content-Type": "application/json",
-                    "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+                    "Authorization": `Bearer ${apiKey}`,
                     "HTTP-Referer": "https://t.me",
                     "X-Title": "TgImageBot"
                 },
                 body: JSON.stringify({ model: moderationModel, messages: formattedMessages, max_tokens: 300, temperature: 0 })
-            });
-            if (!res.ok) return { severe: false, severity: "none", issues:[] };
+            }, 30000);
+            if (!res.ok) return { severe: false, severity: "none", issues: [] };
             const data = await res.json();
             raw = data.choices?.[0]?.message?.content?.trim();
         }
 
-        if (!raw) return { severe: false, severity: "none", issues:[] };
+        if (!raw) return { severe: false, severity: "none", issues: [] };
         const parsed = JSON.parse(raw.replace(/^```json|```$/g, "").trim());
         const severity = String(parsed.severity || "none").toLowerCase();
         const threshold = String(config.artifactSeverityThreshold || "serious").toLowerCase();
         const severe = severity === "serious" || (threshold === "minor" && severity === "minor");
-        return { severe, severity, issues: Array.isArray(parsed.issues) ? parsed.issues :[] };
+        return { severe, severity, issues: Array.isArray(parsed.issues) ? parsed.issues : [] };
     } catch (e) {
         console.error("[artifact-check]", e.message);
-        return { severe: false, severity: "none", issues:[] };
+        return { severe: false, severity: "none", issues: [] };
     }
 }
 
@@ -930,6 +1092,7 @@ async function handleCallbackQuery(callbackQuery, env) {
     await tg.api("answerCallbackQuery", { callback_query_id: callbackQuery.id, text: statusText });
 }
 
+
 // ─── Command handler ──────────────────────────────────────────────────────────
 
 async function handleCommand(msg, env) {
@@ -964,11 +1127,13 @@ async function handleCommand(msg, env) {
                 createdAt: Date.now()
             };
             await KV.put(env, `suggest:${suggestionId}`, payload, { expirationTtl: 2592000 });
-            const replyMarkup = { inline_keyboard: [[
-                { text: "✅ Одобрить", callback_data: `ps:approve:${suggestionId}` },
-                { text: "🛠 На доработку", callback_data: `ps:rework:${suggestionId}` },
-                { text: "❌ Отклонить", callback_data: `ps:reject:${suggestionId}` }
-            ]]};
+            const replyMarkup = {
+                inline_keyboard: [[
+                    { text: "✅ Одобрить", callback_data: `ps:approve:${suggestionId}` },
+                    { text: "🛠 На доработку", callback_data: `ps:rework:${suggestionId}` },
+                    { text: "❌ Отклонить", callback_data: `ps:reject:${suggestionId}` }
+                ]]
+            };
             await tg.send(targetChatId, `🧠 <b>Новое предложение #${suggestionId}</b>\nОт: <code>${escapeHtml(payload.authorName)}</code> (ID: <code>${userId}</code>)\n\n<code>${escapeHtml(suggestionText)}</code>`, { reply_markup: replyMarkup });
             await tg.send(chatId, `✅ Текст отправлен как предложение #${suggestionId}.`);
         }
@@ -993,7 +1158,7 @@ async function handleCommand(msg, env) {
                 helpText += `<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate [номер]\n\n`;
                 helpText += `<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n/promptsuggest &lt;текст&gt;\n\n`;
                 helpText += `<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ для промпта\n\n`;
-                helpText += `<b>Настройки API:</b>\n/sethordekey &lt;ключ&gt; — сохранить ключ AI Horde\n/setprovider &lt;openrouter|google&gt; — переключить ИИ\n\n`;
+                helpText += `<b>Настройки API:</b>\n/sethordekey &lt;ключ&gt; — сохранить ключ AI Horde\n/setopenrouterkey &lt;ключ&gt; — сохранить ключ OpenRouter\n/setgooglekey &lt;ключ&gt; — сохранить ключ Google AI\n/setmistralkey &lt;ключ&gt; — сохранить ключ Mistral AI\n/setprovider &lt;openrouter|google|mistral&gt; — переключить ИИ\n\n`;
                 helpText += `<b>LLM/Vision:</b>\n/llmlist | /img2txt (на фото) | /listvmodel | /setvmodel &lt;номер|id&gt;\n/togglellm | /setllm &lt;model&gt; | /clearllm\n\n`;
                 helpText += `<b>Роли (admin):</b>\n/setrole &lt;ID&gt; &lt;creator|tech|admin&gt;\n/setsuggesttarget &lt;chat_id|group|admin&gt;\n\n`;
                 helpText += `<b>Настройки генерации:</b>\n/setcaptionmode &lt;0|1|2&gt; | /setcaptionprompt &lt;инстр&gt;\n/setmodel &lt;имя&gt; <i>(через запятую — случайная из списка)</i>\n/listmodels | /searchmodel\n/addlora &lt;id&gt; [str] [clip][global|manual] | /listloras | /clearloras | /dellora &lt;номер&gt;\n/setenhancer | /setsize | /setsteps | /setcfg | /setsampler | /setspoiler | /setwatermark | /delwatermark | /toggleartifactcheck\n\n`;
@@ -1007,26 +1172,15 @@ async function handleCommand(msg, env) {
 
         case "/sethordekey": {
             if (!params[0]) return await tg.send(chatId, "❌ Укажите ключ: /sethordekey <ключ>\nИли '0000000000' для анонимного.");
-            
-            // Чистим ключ от скрытых символов, пробелов и случайных кавычек
-            let rawKey = params.join(" ").trim();
-            const newKey = rawKey.replace(/^["']+|["']+$/g, "").replace(/\s+/g, "");
-            
-            // СРАЗУ СОХРАНЯЕМ ключ. 
-            // Это решает проблему, когда проверка временно падает, из-за чего бот мог откатиться на анонимный 0000000000.
+            const newKey = cleanApiKey(params.join(" "));
             config.hordeApiKey = newKey;
             await saveConfig(env, config);
-            
             const masked = newKey === "0000000000" ? "anon" : (newKey.substring(0, 4) + "..." + newKey.substring(newKey.length - 4));
             console.log(`[Horde] Key set: ${masked}`);
-            
             if (newKey === "0000000000") {
                 return await tg.send(chatId, `✅ Установлен анонимный режим (0000000000).`);
             }
-
-            // После сохранения делаем запрос к профилю чтобы проверить, всё ли ок.
             const check = await hordeCheckKey(env, config);
-            
             if (check.ok && !check.anon) {
                 await tg.send(chatId, `✅ Ключ Horde сохранён и подтверждён сервером!\nПользователь: <b>${escapeHtml(check.user)}</b>, Kudos: <b>${check.kudos}</b>`);
             } else {
@@ -1035,33 +1189,86 @@ async function handleCommand(msg, env) {
             break;
         }
 
+        case "/setopenrouterkey": {
+            if (!params[0]) return await tg.send(chatId, "❌ Укажите ключ: /setopenrouterkey <ключ>\nИли 'clear' чтобы удалить.");
+            const raw = params.join(" ");
+            if (raw.toLowerCase().trim() === "clear") {
+                config.openrouterApiKey = "";
+                await saveConfig(env, config);
+                return await tg.send(chatId, "✅ Ключ OpenRouter удалён из конфига. Будет использована переменная окружения OPENROUTER_API_KEY, если она задана.");
+            }
+            const newKey = cleanApiKey(raw);
+            config.openrouterApiKey = newKey;
+            await saveConfig(env, config);
+            const masked = newKey.substring(0, 4) + "..." + newKey.substring(newKey.length - 4);
+            console.log(`[OpenRouter] Key set: ${masked}`);
+            await tg.send(chatId, `✅ Ключ OpenRouter сохранён (${masked}).`);
+            break;
+        }
+
+        case "/setgooglekey": {
+            if (!params[0]) return await tg.send(chatId, "❌ Укажите ключ: /setgooglekey <ключ>\nИли 'clear' чтобы удалить.");
+            const raw = params.join(" ");
+            if (raw.toLowerCase().trim() === "clear") {
+                config.googleApiKey = "";
+                await saveConfig(env, config);
+                return await tg.send(chatId, "✅ Ключ Google AI удалён из конфига. Будет использована переменная окружения GOOGLE_AI_API_KEY, если она задана.");
+            }
+            const newKey = cleanApiKey(raw);
+            config.googleApiKey = newKey;
+            await saveConfig(env, config);
+            const masked = newKey.substring(0, 4) + "..." + newKey.substring(newKey.length - 4);
+            console.log(`[Google] Key set: ${masked}`);
+            await tg.send(chatId, `✅ Ключ Google AI сохранён (${masked}).`);
+            break;
+        }
+
+        case "/setmistralkey": {
+            if (!params[0]) return await tg.send(chatId, "❌ Укажите ключ: /setmistralkey <ключ>\nИли 'clear' чтобы удалить.");
+            const raw = params.join(" ");
+            if (raw.toLowerCase().trim() === "clear") {
+                config.mistralApiKey = "";
+                await saveConfig(env, config);
+                return await tg.send(chatId, "✅ Ключ Mistral AI удалён из конфига. Будет использована переменная окружения MISTRAL_API_KEY, если она задана.");
+            }
+            const newKey = cleanApiKey(raw);
+            config.mistralApiKey = newKey;
+            await saveConfig(env, config);
+            const masked = newKey.substring(0, 4) + "..." + newKey.substring(newKey.length - 4);
+            console.log(`[Mistral] Key set: ${masked}`);
+            await tg.send(chatId, `✅ Ключ Mistral AI сохранён (${masked}).`);
+            break;
+        }
+
         case "/setprovider": {
             const p = params[0]?.toLowerCase();
-            if (!["openrouter", "google"].includes(p))
-                return await tg.send(chatId, "❌ /setprovider &lt;openrouter|google&gt;\n\n<b>openrouter</b> — OpenRouter API\n<b>google</b> — Google AI Studio API\n\n<i>Для Google: укажи GOOGLE_AI_API_KEY в переменных окружения Cloudflare Worker.</i>");
-            if (p === "google" && !getGoogleApiKey(env))
-                return await tg.send(chatId, "❌ Переменная окружения <code>GOOGLE_AI_API_KEY</code> не настроена.\n\nДобавь её в Settings → Variables → Environment Variables в Cloudflare Worker.");
-            if (p === "openrouter" && !env.OPENROUTER_API_KEY)
-                return await tg.send(chatId, "⚠️ Переменная окружения <code>OPENROUTER_API_KEY</code> не настроена, но провайдер всё равно переключается.");
+            const validProviders = ["openrouter", "google", "mistral"];
+            if (!validProviders.includes(p))
+                return await tg.send(chatId, `❌ /setprovider &lt;${validProviders.join("|")}&gt;\n\n<b>openrouter</b> — OpenRouter API\n<b>google</b> — Google AI Studio API\n<b>mistral</b> — Mistral AI API\n\n<i>API ключ можно задать через бота: /setopenrouterkey, /setgooglekey, /setmistralkey — или через переменные окружения.</i>`);
+            const keyCheck = p === "google" ? !!getGoogleApiKey(env, config)
+                : p === "mistral" ? !!getMistralApiKey(env, config)
+                    : !!getOpenRouterApiKey(env, config);
             config.llmProvider = p;
             await saveConfig(env, config);
             await KV.put(env, "llm_fails", "0");
             await KV.del(env, "llm_timeout");
-            const currentModel = p === "google"
-                ? (config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel)
-                : (config.llmModel || DEFAULT_CONFIG.llmModel);
-            await tg.send(chatId, `✅ LLM провайдер: <b>${p === "google" ? "🔵 Google AI Studio" : "🟠 OpenRouter"}</b>\nМодель: <code>${escapeHtml(currentModel)}</code>\n<i>Счётчик ошибок сброшен.</i>`);
+            let currentModel;
+            if (p === "google") currentModel = config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel;
+            else if (p === "mistral") currentModel = config.mistralLlmModel || DEFAULT_CONFIG.mistralLlmModel;
+            else currentModel = config.llmModel || DEFAULT_CONFIG.llmModel;
+            const keyStatus = keyCheck ? "✅" : "⚠️ не задан";
+            await tg.send(chatId, `✅ LLM провайдер: <b>${getProviderLabel(p)}</b>\nМодель: <code>${escapeHtml(currentModel)}</code>\nКлюч: ${keyStatus}\n<i>Счётчик ошибок сброшен.</i>`);
             break;
         }
 
         case "/llmlist": {
             const provider = config.llmProvider || "openrouter";
             if (provider === "google") {
-                const key = getGoogleApiKey(env);
-                if (!key) return await tg.send(chatId, "❌ GOOGLE_AI_API_KEY не настроен.");
+                const key = getGoogleApiKey(env, config);
+                if (!key) return await tg.send(chatId, "❌ Google API ключ не настроен. Используй /setgooglekey или переменную окружения GOOGLE_AI_API_KEY.");
                 await tg.send(chatId, "⏳ Загружаю модели Google AI Studio...");
                 try {
-                    const models = await fetchGoogleModels(env);
+                    const models = await fetchGoogleModels(env, config);
                     if (!models.length) return await tg.send(chatId, "❌ Не удалось получить список моделей. Проверь API ключ.");
                     const currentLlm = config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel;
                     const currentVision = config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel;
@@ -1079,13 +1286,45 @@ async function handleCommand(msg, env) {
                     info += "\n💡 <i>/setllm &lt;имя&gt; — LLM | /setvmodel &lt;имя&gt; — Vision</i>";
                     await tg.send(chatId, info);
                 } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
+            } else if (provider === "mistral") {
+                const key = getMistralApiKey(env, config);
+                if (!key) return await tg.send(chatId, "❌ Mistral API ключ не настроен. Используй /setmistralkey или переменную окружения MISTRAL_API_KEY.");
+                await tg.send(chatId, "⏳ Загружаю модели Mistral AI...");
+                try {
+                    const res = await fetchWithTimeout(`${MISTRAL_API}/models`, {
+                        headers: { "Authorization": `Bearer ${key}` }
+                    }, 20000);
+                    if (!res.ok) return await tg.send(chatId, `❌ Ошибка HTTP ${res.status} при запросе к Mistral API.`);
+                    const data = await res.json();
+                    const models = (data.data || []);
+                    if (!models.length) return await tg.send(chatId, "❌ Список моделей пуст. Проверь API ключ.");
+                    const currentLlm = config.mistralLlmModel || DEFAULT_CONFIG.mistralLlmModel;
+                    const currentVision = config.mistralVisionModel || DEFAULT_CONFIG.mistralVisionModel;
+                    let info = `🟣 <b>Mistral AI модели (${models.length}):</b>\n\n`;
+                    info += `Текущая LLM: <code>${escapeHtml(currentLlm)}</code>\nТекущая Vision: <code>${escapeHtml(currentVision)}</code>\n\n`;
+                    for (const m of models) {
+                        const name = m.id;
+                        const isLlm = name === currentLlm;
+                        const isVision = name === currentVision;
+                        const mark = isLlm && isVision ? "✅✅" : isLlm ? "✅" : isVision ? "👁" : "▫️";
+                        const cap = m.capabilities || {};
+                        const features = [];
+                        if (cap.vision) features.push("👁");
+                        if (cap.tool_calling) features.push("🔧");
+                        info += `${mark} <code>${escapeHtml(name)}</code>${features.length ? " " + features.join("") : ""}\n`;
+                        if (info.length > 3600) { info += `<i>...и ещё моделей</i>`; break; }
+                    }
+                    info += "\n💡 <i>/setllm &lt;имя&gt; — LLM | /setvmodel &lt;имя&gt; — Vision</i>";
+                    await tg.send(chatId, info);
+                } catch (e) { await tg.send(chatId, `❌ Ошибка: ${e.message}`); }
             } else {
-                if (!env.OPENROUTER_API_KEY) return await tg.send(chatId, "❌ OPENROUTER_API_KEY не настроен.");
+                const key = getOpenRouterApiKey(env, config);
+                if (!key) return await tg.send(chatId, "❌ OpenRouter API ключ не настроен. Используй /setopenrouterkey или переменную окружения OPENROUTER_API_KEY.");
                 await tg.send(chatId, "⏳ Запрашиваю информацию у OpenRouter...");
                 try {
-                    const authRes = await fetch("https://openrouter.ai/api/v1/auth/key", {
-                        headers: { "Authorization": `Bearer ${env.OPENROUTER_API_KEY}` }
-                    });
+                    const authRes = await fetchWithTimeout("https://openrouter.ai/api/v1/auth/key", {
+                        headers: { "Authorization": `Bearer ${key}` }
+                    }, 20000);
                     let info = `🟠 <b>Статус ключа OpenRouter:</b>\n`;
                     if (authRes.ok) {
                         const d = await authRes.json();
@@ -1097,10 +1336,10 @@ async function handleCommand(msg, env) {
                     } else {
                         info += "Не удалось получить статус ключа.\n";
                     }
-                    const modelsRes = await fetch("https://openrouter.ai/api/v1/models");
+                    const modelsRes = await fetchWithTimeout("https://openrouter.ai/api/v1/models", {}, 20000);
                     if (modelsRes.ok) {
                         const md = await modelsRes.json();
-                        const free = (md.data ||[]).filter(m => parseFloat(m.pricing?.prompt) === 0 && parseFloat(m.pricing?.completion) === 0);
+                        const free = (md.data || []).filter(m => parseFloat(m.pricing?.prompt) === 0 && parseFloat(m.pricing?.completion) === 0);
                         info += `\n🆓 <b>Бесплатные модели (${free.length}):</b>\n`;
                         free.slice(0, 40).forEach(m => { info += `<code>${m.id}</code>\n`; });
                         if (free.length > 40) info += `<i>...и ещё ${free.length - 40}</i>`;
@@ -1110,6 +1349,7 @@ async function handleCommand(msg, env) {
             }
             break;
         }
+
 
         case "/img2txt": {
             if (!hasLlmProvider(env, config)) return await tg.send(chatId, "❌ Не настроен API ключ LLM провайдера.");
@@ -1134,33 +1374,48 @@ async function handleCommand(msg, env) {
                 const fileReq = await tg.api("getFile", { file_id: photo.file_id });
                 if (!fileReq.ok) throw new Error(`Ошибка TG API: ${fileReq.description}`);
                 const fileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileReq.result.file_path}`;
-                const arrayBuffer = await (await fetch(fileUrl)).arrayBuffer();
+                const arrayBuffer = await (await fetchWithTimeout(fileUrl, {}, 30000)).arrayBuffer();
                 const base64Img = bufferToBase64(arrayBuffer);
                 const mimeType = fileReq.result.file_path?.endsWith(".png") ? "image/png" : "image/jpeg";
 
                 const sysContent = "You are a specialized image analyzer for Stable Diffusion (SDXL Illustrious) and Anime art. Describe the character(s), physical features, eye/hair color, clothing, pose, background, lighting, and style using ONLY comma-separated booru-style tags. OUTPUT ONLY COMMA-SEPARATED TAGS. No introductory text, no sentences.";
 
-                const imageMessages =[
+                const imageMessages = [
                     { role: "system", content: sysContent },
-                    { role: "user", content:[
-                        { type: "text", text: "Extract booru tags from this image for Illustrious XL:" },
-                        { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Img}` } }
-                    ]}
+                    {
+                        role: "user", content: [
+                            { type: "text", text: "Extract booru tags from this image for Illustrious XL:" },
+                            { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Img}` } }
+                        ]
+                    }
                 ];
 
                 const provider = config.llmProvider || "openrouter";
                 let tags = null, usedModel = "", lastError = "";
 
-                let preferredModelStr = provider === "google" ? config.googleVisionModel : config.visionModel;
+                let preferredModelStr = provider === "google" ? config.googleVisionModel
+                    : provider === "mistral" ? config.mistralVisionModel
+                        : config.visionModel;
                 const currentPreferred = await getNextModel(env, preferredModelStr || "", "vision_model_idx");
 
                 if (provider === "google") {
                     const visionModels = getVisionModels(config, currentPreferred);
                     for (const vModel of visionModels) {
-                        const result = await callGoogleAI(env, vModel, imageMessages, 500, 1);
+                        const result = await callGoogleAI(env, config, vModel, imageMessages, 500, 1);
                         if (result && result.length > 5) {
                             tags = result;
                             usedModel = `Google: ${vModel}`;
+                            break;
+                        }
+                        lastError = `${vModel}: no result`;
+                    }
+                } else if (provider === "mistral") {
+                    const visionModels = getVisionModels(config, currentPreferred);
+                    for (const vModel of visionModels) {
+                        const result = await callMistral(env, config, vModel, imageMessages, 500, 1);
+                        if (result && result.length > 5) {
+                            tags = result;
+                            usedModel = `Mistral: ${vModel}`;
                             break;
                         }
                         lastError = `${vModel}: no result`;
@@ -1170,16 +1425,17 @@ async function handleCommand(msg, env) {
                     for (const vModel of visionModels) {
                         try {
                             const formattedMessages = formatMessagesForModel(imageMessages, vModel);
-                            const orRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+                            const apiKey = getOpenRouterApiKey(env, config);
+                            const orRes = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
                                 method: "POST",
                                 headers: {
                                     "Content-Type": "application/json",
-                                    "Authorization": `Bearer ${env.OPENROUTER_API_KEY}`,
+                                    "Authorization": `Bearer ${apiKey}`,
                                     "HTTP-Referer": "https://t.me",
                                     "X-Title": "TgImageBot"
                                 },
                                 body: JSON.stringify({ model: vModel, messages: formattedMessages, max_tokens: 500 })
-                            });
+                            }, 30000);
                             if (orRes.ok) {
                                 const orData = await orRes.json();
                                 if (orData.error) { lastError = `${vModel}: ${orData.error.message || JSON.stringify(orData.error)}`; continue; }
@@ -1228,11 +1484,13 @@ async function handleCommand(msg, env) {
                 createdAt: Date.now()
             };
             await KV.put(env, `suggest:${suggestionId}`, payload, { expirationTtl: 2592000 });
-            const replyMarkup = { inline_keyboard: [[
-                { text: "✅ Одобрить", callback_data: `ps:approve:${suggestionId}` },
-                { text: "🛠 На доработку", callback_data: `ps:rework:${suggestionId}` },
-                { text: "❌ Отклонить", callback_data: `ps:reject:${suggestionId}` }
-            ]]};
+            const replyMarkup = {
+                inline_keyboard: [[
+                    { text: "✅ Одобрить", callback_data: `ps:approve:${suggestionId}` },
+                    { text: "🛠 На доработку", callback_data: `ps:rework:${suggestionId}` },
+                    { text: "❌ Отклонить", callback_data: `ps:reject:${suggestionId}` }
+                ]]
+            };
             await tg.send(targetChatId, `🧠 <b>Новое предложение #${suggestionId}</b>\nОт: <code>${escapeHtml(payload.authorName)}</code> (ID: <code>${userId}</code>)\n\n<code>${escapeHtml(suggestionText)}</code>`, { reply_markup: replyMarkup });
             await tg.send(chatId, `✅ Предложение #${suggestionId} отправлено на модерацию.`);
             break;
@@ -1277,9 +1535,17 @@ async function handleCommand(msg, env) {
             const llmTimeout = await KV.get(env, "llm_timeout");
             const llmBlocked = llmTimeout && Date.now() < parseInt(llmTimeout);
             const provider = config.llmProvider || "openrouter";
-            const providerLabel = provider === "google" ? "🔵 Google" : "🟠 OpenRouter";
-            const providerKey = provider === "google" ? !!getGoogleApiKey(env) : !!env.OPENROUTER_API_KEY;
-            await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde API: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 LLM: ${providerLabel} ${providerKey ? "✅" : "❌"} (${config.llmEnabled ? "🟢 вкл" : "🔴 выкл"}${llmBlocked ? " ⏸ заблокирован" : ""}, ошибок: ${llmFails})`);
+            const orKey = !!getOpenRouterApiKey(env, config);
+            const ggKey = !!getGoogleApiKey(env, config);
+            const msKey = !!getMistralApiKey(env, config);
+            const providerKey = provider === "google" ? ggKey : provider === "mistral" ? msKey : orKey;
+            const allKeys = [];
+            if (orKey) allKeys.push("🟠 OR");
+            if (ggKey) allKeys.push("🔵 GG");
+            if (msKey) allKeys.push("🟣 MI");
+            const keysLine = allKeys.length ? ` | Ключи: ${allKeys.join(", ")}` : "";
+            const llmBlockStr = llmBlocked ? " ⏸ заблокирован" : "";
+            await tg.send(chatId, `🏓 <b>Pong!</b>\n📍 Chat: <code>${chatId}</code>\n💾 Redis: ${env.UPSTASH_REDIS_REST_URL ? "✅" : "❌"}\n🎨 Horde API: ${key === "0000000000" ? "🔴 anon" : "✅ ok"}\n🤖 LLM: ${getProviderLabel(provider)} ${providerKey ? "✅" : "❌"} (${config.llmEnabled ? "🟢 вкл" : "🔴 выкл"}${llmBlockStr}, ошибок: ${llmFails})${keysLine}`);
             break;
         }
 
@@ -1306,7 +1572,7 @@ async function handleCommand(msg, env) {
 
         case "/addprompt": {
             if (!params.length) return await tg.send(chatId, "❌ /addprompt &lt;текст&gt;");
-            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) :[];
+            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) : [];
             prompts.push(params.join(" "));
             config.generalPrompt = prompts.join(" ; ");
             await saveConfig(env, config);
@@ -1316,8 +1582,8 @@ async function handleCommand(msg, env) {
 
         case "/delprompt": {
             if (!params.length) return await tg.send(chatId, "❌ /delprompt &lt;номер&gt;");
-            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) :[];
-            const idx = parseInt(params[0]) - 1;
+            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) : [];
+            const idx = parseInt(params[0], 10) - 1;
             if (isNaN(idx) || idx < 0 || idx >= prompts.length) return await tg.send(chatId, `❌ Неверный номер (1–${prompts.length})`);
             prompts.splice(idx, 1);
             config.generalPrompt = prompts.join(" ; ");
@@ -1327,10 +1593,10 @@ async function handleCommand(msg, env) {
         }
 
         case "/promptlist": {
-            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) :[];
+            const prompts = config.generalPrompt ? config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean) : [];
             if (!prompts.length) return await tg.send(chatId, "📋 Список промптов пуст");
-            if (params.length && !isNaN(parseInt(params[0]))) {
-                const idx = parseInt(params[0]) - 1;
+            if (params.length && !isNaN(parseInt(params[0], 10))) {
+                const idx = parseInt(params[0], 10) - 1;
                 if (idx < 0 || idx >= prompts.length) return await tg.send(chatId, "❌ Промпт не найден");
                 return await tg.send(chatId, `📋 <b>Промпт #${idx + 1}:</b>\n\n<code>${escapeHtml(prompts[idx])}</code>`);
             }
@@ -1361,14 +1627,14 @@ async function handleCommand(msg, env) {
             break;
 
         case "/settokens": {
-            const t = parseInt(params[0]);
+            const t = parseInt(params[0], 10);
             if (t > 0 && t <= 8000) { config.maxTokens = t; await saveConfig(env, config); await tg.send(chatId, `✅ Лимит токенов: ${t}`); }
             else await tg.send(chatId, "❌ /settokens <1–8000>");
             break;
         }
 
         case "/setcaptionmode": {
-            const mode = parseInt(params[0]);
+            const mode = parseInt(params[0], 10);
             if (![0, 1, 2].includes(mode)) return await tg.send(chatId, "❌ /setcaptionmode &lt;0|1|2&gt;\n0 — без подписи\n1 — промпт\n2 — AI описание");
             config.captionMode = mode; await saveConfig(env, config);
             await tg.send(chatId, `✅ Режим подписи: ${mode}`);
@@ -1388,7 +1654,7 @@ async function handleCommand(msg, env) {
             try {
                 const fileReq = await tg.api("getFile", { file_id: doc.file_id });
                 if (!fileReq.ok) return await tg.send(chatId, `❌ Ошибка: ${fileReq.description}`);
-                const fileRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileReq.result.file_path}`);
+                const fileRes = await fetchWithTimeout(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileReq.result.file_path}`, {}, 30000);
                 config.watermarkData = bufferToBase64(await fileRes.arrayBuffer());
                 config.watermarkPosition = params[0] || "random";
                 await saveConfig(env, config);
@@ -1406,7 +1672,7 @@ async function handleCommand(msg, env) {
         case "/setenhancer": {
             if (!params.length) return await tg.send(chatId, "❌ /setenhancer <FaceFix|Upscale|AnimeUpscale|CodeFormers|clear>");
             if (params[0].toLowerCase() === "clear") {
-                config.postProcessors =[];
+                config.postProcessors = [];
                 await tg.send(chatId, "✅ Улучшайзеры сброшены");
             } else {
                 const map = { facefix: "GFPGAN", upscale: "RealESRGAN_x4plus", animeupscale: "RealESRGAN_x4plus_anime_6B", codeformers: "CodeFormers" };
@@ -1421,7 +1687,7 @@ async function handleCommand(msg, env) {
             if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;\n\n💡 <i>Несколько моделей через запятую — при каждой генерации будет выбираться случайная:</i>\n<code>/setmodel Model A, Model B, Model C</code>");
             config.model = params.join(" ");
             await saveConfig(env, config);
-            const modelArr = config.model.split(',').map(s => s.trim()).filter(Boolean);
+            const modelArr = config.model.split(",").map(s => s.trim()).filter(Boolean);
             if (modelArr.length > 1) {
                 const listStr = modelArr.map((m, i) => `${i + 1}. <code>${escapeHtml(m)}</code>`).join("\n");
                 await tg.send(chatId, `✅ Модели (случайная при каждой генерации, ${modelArr.length} шт.):\n${listStr}`);
@@ -1458,19 +1724,19 @@ async function handleCommand(msg, env) {
             if (!params.length) return await tg.send(chatId, "❌ /addlora &lt;ID&gt;[strength=1][clip=1] [global|manual]");
             const loraId = params[0], loraStr = parseFloat(params[1]) || 1, loraClip = parseFloat(params[2]) || 1;
             const isGlobal = (params[3] || "global").toLowerCase() !== "manual";
-            if (!config.loras) config.loras =[];
+            if (!config.loras) config.loras = [];
             if (config.loras.find(l => String(l.name) === String(loraId)))
                 return await tg.send(chatId, `⚠️ LoRA <code>${loraId}</code> уже в списке`);
             let compatMsg = "", loraTitle = loraId;
             try {
-                let civRes = await fetch(`https://civitai.com/api/v1/models/${loraId}`);
+                let civRes = await fetchWithTimeout(`https://civitai.com/api/v1/models/${loraId}`, {}, 15000);
                 let base = "";
                 if (civRes.ok) {
                     const cd = await civRes.json();
                     base = cd.modelVersions?.[0]?.baseModel || "";
                     loraTitle = cd.name || loraId;
                 } else if (/^\d+$/.test(loraId)) {
-                    civRes = await fetch(`https://civitai.com/api/v1/model-versions/${loraId}`);
+                    civRes = await fetchWithTimeout(`https://civitai.com/api/v1/model-versions/${loraId}`, {}, 15000);
                     if (civRes.ok) {
                         const cd = await civRes.json();
                         base = cd.baseModel || "";
@@ -1483,7 +1749,7 @@ async function handleCommand(msg, env) {
                     compatMsg = `\n📦 <b>${escapeHtml(loraTitle)}</b> [${base}]`;
                     compatMsg += isXL !== loraIsXL ? `\n⚠️ LoRA обучена на <b>${base}</b>. Скорее всего не применится!` : "\n✅ Совместима";
                 }
-            } catch (_) {}
+            } catch (_) { /* compat check is best-effort */ }
             config.loras.push({ name: loraId, title: loraTitle, strength: loraStr, clip: loraClip, global: isGlobal });
             await saveConfig(env, config);
             await tg.send(chatId, `✅ LoRA <code>${loraId}</code> добавлена\nСила: ${loraStr} | Clip: ${loraClip} | Режим: ${isGlobal ? "🌐 Глобальная" : "🎯 Ручная"}${compatMsg}`);
@@ -1503,13 +1769,13 @@ async function handleCommand(msg, env) {
             break;
 
         case "/clearloras":
-            config.loras =[]; await saveConfig(env, config);
+            config.loras = []; await saveConfig(env, config);
             await tg.send(chatId, "✅ Список LoRA очищен");
             break;
 
         case "/dellora": {
             if (!params.length) return await tg.send(chatId, "❌ /dellora <номер>");
-            const idx = parseInt(params[0]) - 1;
+            const idx = parseInt(params[0], 10) - 1;
             if (!config.loras || isNaN(idx) || idx < 0 || idx >= config.loras.length)
                 return await tg.send(chatId, "❌ Неверный номер. Посмотри: /listloras");
             const removed = config.loras.splice(idx, 1);
@@ -1532,7 +1798,7 @@ async function handleCommand(msg, env) {
 
         case "/setsteps":
             if (!params[0]) return await tg.send(chatId, "❌ /setsteps &lt;число&gt;");
-            config.steps = parseInt(params[0]); await saveConfig(env, config);
+            config.steps = parseInt(params[0], 10); await saveConfig(env, config);
             await tg.send(chatId, `✅ Steps: ${config.steps}`);
             break;
 
@@ -1548,6 +1814,8 @@ async function handleCommand(msg, env) {
             const provider = config.llmProvider || "openrouter";
             if (provider === "google") {
                 config.googleLlmModel = newModel;
+            } else if (provider === "mistral") {
+                config.mistralLlmModel = newModel;
             } else {
                 config.llmModel = newModel;
             }
@@ -1555,7 +1823,7 @@ async function handleCommand(msg, env) {
             await KV.put(env, "llm_fails", "0");
             await KV.del(env, "llm_timeout");
             const multiMsg = newModel.includes(",") ? "\n🔄 <i>Указано несколько моделей — они будут переключаться по очереди.</i>" : "";
-            await tg.send(chatId, `✅ LLM (${provider === "google" ? "🔵 Google" : "🟠 OpenRouter"}): <code>${escapeHtml(newModel)}</code>\n<i>Счётчик ошибок сброшен.</i>${multiMsg}`);
+            await tg.send(chatId, `✅ LLM (${getProviderLabel(provider)}): <code>${escapeHtml(newModel)}</code>\n<i>Счётчик ошибок сброшен.</i>${multiMsg}`);
             break;
         }
 
@@ -1564,9 +1832,10 @@ async function handleCommand(msg, env) {
             const provider = config.llmProvider || "openrouter";
             const currentRaw = provider === "google"
                 ? (config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel)
-                : (config.visionModel || vModels[0] || "");
-            const providerLabel = provider === "google" ? "🔵 Google AI Studio" : "🟠 OpenRouter";
-            let txt = `👁️ <b>Vision модели для /img2txt[${providerLabel}]:</b>\n\n`;
+                : provider === "mistral"
+                    ? (config.mistralVisionModel || DEFAULT_CONFIG.mistralVisionModel)
+                    : (config.visionModel || vModels[0] || "");
+            let txt = `👁️ <b>Vision модели для /img2txt [${getProviderLabel(provider)}]:</b>\n\n`;
             txt += `Текущая настройка: <code>${escapeHtml(currentRaw || "не задана")}</code>\n\n`;
             vModels.forEach((m, i) => { txt += `${m === currentRaw ? "✅" : "▫️"} ${i + 1}. <code>${escapeHtml(m)}</code>\n`; });
             txt += "\n💡 <i>/setvmodel &lt;номер&gt; или /setvmodel &lt;имена через запятую&gt;</i>\n<i>/setprovider для смены провайдера</i>";
@@ -1583,12 +1852,14 @@ async function handleCommand(msg, env) {
             const provider = config.llmProvider || "openrouter";
             if (provider === "google") {
                 config.googleVisionModel = selected;
+            } else if (provider === "mistral") {
+                config.mistralVisionModel = selected;
             } else {
                 config.visionModel = selected;
             }
             await saveConfig(env, config);
             const multiMsg = selected.includes(",") ? "\n🔄 <i>Указано несколько моделей — они будут переключаться по очереди.</i>" : "";
-            await tg.send(chatId, `✅ Vision модель (${provider === "google" ? "🔵 Google" : "🟠 OpenRouter"}): <code>${escapeHtml(selected)}</code>${multiMsg}`);
+            await tg.send(chatId, `✅ Vision модель (${getProviderLabel(provider)}): <code>${escapeHtml(selected)}</code>${multiMsg}`);
             break;
         }
 
@@ -1600,7 +1871,7 @@ async function handleCommand(msg, env) {
             break;
 
         case "/setinterval": {
-            const inv = parseInt(params[0]);
+            const inv = parseInt(params[0], 10);
             if (inv > 0) { config.interval = inv; await saveConfig(env, config); await tg.send(chatId, `✅ Интервал: ${inv} мин`); }
             else await tg.send(chatId, "❌ /setinterval &lt;минуты&gt;");
             break;
@@ -1611,7 +1882,7 @@ async function handleCommand(msg, env) {
             if (val.startsWith("random")) {
                 const match = val.match(/random\s+(\d+)\s*-\s*(\d+)/);
                 if (match) {
-                    const min = parseInt(match[1]), max = parseInt(match[2]);
+                    const min = parseInt(match[1], 10), max = parseInt(match[2], 10);
                     if (min > 0 && max <= 10 && min <= max) {
                         config.count = `random ${min}-${max}`; await saveConfig(env, config);
                         await tg.send(chatId, `✅ Батч: случайное от ${min} до ${max}`);
@@ -1619,14 +1890,14 @@ async function handleCommand(msg, env) {
                     }
                 }
             }
-            const cnt = parseInt(params[0]);
+            const cnt = parseInt(params[0], 10);
             if (cnt > 0 && cnt <= 10) { config.count = cnt.toString(); await saveConfig(env, config); await tg.send(chatId, `✅ Батч: ${cnt}`); }
             else await tg.send(chatId, "❌ /setcount <1-10> или random <min>-<max>");
             break;
         }
 
         case "/setsize": {
-            const w = parseInt(params[0]), h = parseInt(params[1]);
+            const w = parseInt(params[0], 10), h = parseInt(params[1], 10);
             if (w > 255 && h > 255) {
                 config.width = 64 * Math.round(w / 64);
                 config.height = 64 * Math.round(h / 64);
@@ -1651,9 +1922,9 @@ async function handleCommand(msg, env) {
         case "/generate": {
             if (!config.generalPrompt) return await tg.send(chatId, "❌ Сначала добавь промпт (/addprompt)");
             let targetPromptSegment = null;
-            if (params.length && !isNaN(parseInt(params[0]))) {
+            if (params.length && !isNaN(parseInt(params[0], 10))) {
                 const prompts = config.generalPrompt.split(";").map(p => p.trim()).filter(Boolean);
-                const idx = parseInt(params[0]) - 1;
+                const idx = parseInt(params[0], 10) - 1;
                 if (idx >= 0 && idx < prompts.length) targetPromptSegment = prompts[idx];
                 else return await tg.send(chatId, `❌ Неверный номер промпта. Всего: ${prompts.length}`);
             }
@@ -1662,7 +1933,7 @@ async function handleCommand(msg, env) {
             const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
             const batchId = Date.now() + "_" + Math.random().toString(36).substring(2, 7);
             const targets = [chatId];
-            await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready:[], targets, notify: chatId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
+            await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: chatId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
             for (let i = 0; i < actualCount; i++) {
                 try {
                     let segment = targetPromptSegment;
@@ -1701,30 +1972,34 @@ async function handleCommand(msg, env) {
             break;
         }
 
+
         case "/status": {
             let queueCount = 0;
-            try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch {}
+            try { queueCount = (await KV.list(env, "pending:")).keys.length; } catch { /* ignore */ }
             const pps = config.postProcessors?.length ? config.postProcessors.join(", ") : "нет";
-            const globalLoras = (config.loras ||[]).filter(l => l.global !== false);
-            const manualLoras = (config.loras ||[]).filter(l => l.global === false);
+            const globalLoras = (config.loras || []).filter(l => l.global !== false);
+            const manualLoras = (config.loras || []).filter(l => l.global === false);
             const promptsCount = config.generalPrompt ? config.generalPrompt.split(";").filter(Boolean).length : 0;
             const llmFails = await KV.get(env, "llm_fails") || "0";
             const llmTimeout = await KV.get(env, "llm_timeout");
             const llmBlocked = llmTimeout && Date.now() < parseInt(llmTimeout) ? " ⏸ заблокирован" : "";
             const provider = config.llmProvider || "openrouter";
-            const providerLabel = provider === "google" ? "🔵 Google AI Studio" : "🟠 OpenRouter";
 
             const currentLlmModelRaw = provider === "google"
                 ? (config.googleLlmModel || DEFAULT_CONFIG.googleLlmModel)
-                : (config.llmModel || DEFAULT_CONFIG.llmModel);
-            const llmArr = currentLlmModelRaw.split(',').map(s=>s.trim()).filter(Boolean);
-            const llmDisplay = llmArr.length > 1 ? `<code>${escapeHtml(llmArr[0])}</code> <i>+${llmArr.length-1} (по очереди)</i>` : `<code>${escapeHtml(currentLlmModelRaw)}</code>`;
+                : provider === "mistral"
+                    ? (config.mistralLlmModel || DEFAULT_CONFIG.mistralLlmModel)
+                    : (config.llmModel || DEFAULT_CONFIG.llmModel);
+            const llmArr = currentLlmModelRaw.split(',').map(s => s.trim()).filter(Boolean);
+            const llmDisplay = llmArr.length > 1 ? `<code>${escapeHtml(llmArr[0])}</code> <i>+${llmArr.length - 1} (по очереди)</i>` : `<code>${escapeHtml(currentLlmModelRaw)}</code>`;
 
             const currentVisionModelRaw = provider === "google"
                 ? (config.googleVisionModel || DEFAULT_CONFIG.googleVisionModel)
-                : (config.visionModel || getVisionModels(config)[0] || "не задана");
-            const vArr = currentVisionModelRaw.split(',').map(s=>s.trim()).filter(Boolean);
-            const vDisplay = vArr.length > 1 ? `<code>${escapeHtml(vArr[0])}</code> <i>+${vArr.length-1} (по очереди)</i>` : `<code>${escapeHtml(currentVisionModelRaw)}</code>`;
+                : provider === "mistral"
+                    ? (config.mistralVisionModel || DEFAULT_CONFIG.mistralVisionModel)
+                    : (config.visionModel || getVisionModels(config)[0] || "не задана");
+            const vArr = currentVisionModelRaw.split(',').map(s => s.trim()).filter(Boolean);
+            const vDisplay = vArr.length > 1 ? `<code>${escapeHtml(vArr[0])}</code> <i>+${vArr.length - 1} (по очереди)</i>` : `<code>${escapeHtml(currentVisionModelRaw)}</code>`;
 
             const modelArr = config.model.split(',').map(s => s.trim()).filter(Boolean);
             const modelDisplay = modelArr.length > 1
@@ -1743,7 +2018,18 @@ async function handleCommand(msg, env) {
                 }
             } catch (e) { keyExtra = `\n⚠️ Не удалось проверить ключ`; }
 
-            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Horde API Key:</b> ${keyDisplay}${keyExtra}\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${providerLabel}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> ${llmDisplay}\n<b>Vision:</b> ${vDisplay}\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> ${modelDisplay}\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
+            const orKey = !!getOpenRouterApiKey(env, config);
+            const ggKey = !!getGoogleApiKey(env, config);
+            const msKey = !!getMistralApiKey(env, config);
+            const llmKeyStatus = provider === "google" ? (ggKey ? "✅" : "❌")
+                : provider === "mistral" ? (msKey ? "✅" : "❌")
+                    : (orKey ? "✅" : "❌");
+            const allLlmKeys = [];
+            if (orKey) allLlmKeys.push("🟠 OR");
+            if (ggKey) allLlmKeys.push("🔵 GG");
+            if (msKey) allLlmKeys.push("🟣 MI");
+
+            await tg.send(chatId, `📊 <b>Статус</b>\n\n<b>Автопост:</b> ${config.enabled ? "🟢" : "🔴"}\n<b>Группа:</b> ${config.groupId || "❌"}\n<b>Канал:</b> ${config.channelId || "❌"}\n<b>Батч:</b> ${config.count} шт\n<b>Horde API Key:</b> ${keyDisplay}${keyExtra}\n<b>Вотермарка:</b> ${config.watermarkData ? "🟢" : "🔴"}\n<b>Улучшайзеры:</b> ${pps}\n<b>Режим подписи:</b> ${config.captionMode}\n<b>Спойлер:</b> ${config.useSpoiler ? "🟢" : "🔴"}\n\n<b>Промпты:</b> ${promptsCount} шт. <i>(/promptlist)</i>\n\n<b>LLM провайдер:</b> ${getProviderLabel(provider)}\n<b>LLM:</b> ${config.llmEnabled ? "🟢" : "🔴"} (ошибок: ${llmFails}${llmBlocked})\n<b>Модель LLM:</b> ${llmDisplay}\n<b>Vision:</b> ${vDisplay}\n<b>Контекст:</b> ${config.systemContext ? "задан" : "встроенный"}\n<b>Токены:</b> ${config.maxTokens}\n<b>LLM ключи:</b> ${allLlmKeys.length ? allLlmKeys.join(", ") : "❌ ни одного"}\n\n<b>Негативный промпт:</b>\n<code>${escapeHtml(config.negativePrompt)}</code>\n\n<b>Модель:</b> ${modelDisplay}\n<b>Самплер:</b> <code>${escapeHtml(config.sampler)}</code>\n<b>Размер:</b> ${config.width}x${config.height}\n<b>Steps:</b> ${config.steps} | <b>CFG:</b> ${config.cfgScale}\n<b>LoRA 🌐:</b> ${globalLoras.length} | <b>🎯:</b> ${manualLoras.length}\n<b>Очередь:</b> ${queueCount}`);
             break;
         }
 
@@ -1792,14 +2078,14 @@ async function handleCommand(msg, env) {
     }
 }
 
+
 // ─── Scheduled / polling loop ─────────────────────────────────────────────────
 
 async function processScheduled(env) {
     if (!env.UPSTASH_REDIS_REST_URL || !env.TELEGRAM_BOT_TOKEN) return;
     const tg = new Telegram(env.TELEGRAM_BOT_TOKEN);
     const config = await getConfig(env);
-    
-    // Получаем очищенный API-ключ для всех вызовов
+
     const apiKey = getApiKey(env, config);
 
     const pendingList = await KV.list(env, "pending:");
@@ -1814,7 +2100,7 @@ async function processScheduled(env) {
                 if (task.notify) await tg.send(task.notify, `⏰ Таймаут: <code>${id}</code>`);
                 if (task.batchId) {
                     const batch = await KV.get(env, `batch:${task.batchId}`, "json");
-                    if (batch) { batch.expected--; await KV.put(env, `batch:${batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
+                    if (batch) { batch.expected--; await KV.put(env, `batch:${task.batchId}`, batch, { expirationTtl: PENDING_TTL_SEC }); }
                 }
                 continue;
             }
@@ -1854,7 +2140,7 @@ async function processScheduled(env) {
                 continue;
             }
 
-            const gens = res.generations ||[];
+            const gens = res.generations || [];
             if (!gens.length) {
                 await KV.del(env, keyObj.name);
                 if (task.notify) await tg.send(task.notify, `⚠️ Пустой результат: <code>${id}</code>`);
@@ -1933,7 +2219,7 @@ async function processScheduled(env) {
                                     const sr = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
                                     if (!sr.sent) { delivered = false; break; }
                                 } else {
-                                    const bufs =[];
+                                    const bufs = [];
                                     for (const b64 of batch.ready) {
                                         const buf = isHttpUrl(b64) ? await downloadImage(b64) : base64ToBuffer(b64);
                                         if (buf) bufs.push(buf);
@@ -1970,7 +2256,7 @@ async function processScheduled(env) {
                     if (config.captionMode === 1) captionText = task.prompt ? `🎨 <i>${escapeHtml(task.prompt.substring(0, 900))}</i>` : "";
                     else if (config.captionMode === 2) captionText = await generateAiCaption(task.prompt, env, config);
                     let deliveredAll = true;
-                    for (const tId of (task.targets ||[])) {
+                    for (const tId of (task.targets || [])) {
                         const sr = await deliverImage(tg, tId, finalImageBase64, captionText, task.notify, config);
                         if (!sr.sent) deliveredAll = false;
                     }
@@ -2002,10 +2288,10 @@ async function processScheduled(env) {
             let delivered = true;
             for (const tId of batch.targets) {
                 if (batch.ready.length === 1) {
-                    const sr = await deliverImage(tg, tId, batch.ready[0], captionText, batch.notify, config);
+                    const sr = await deliverImage(tg, tId, batch.ready[0], captionText, null, config);
                     if (!sr.sent) { delivered = false; break; }
                 } else {
-                    const bufs =[];
+                    const bufs = [];
                     for (const b64 of batch.ready) {
                         const buf = isHttpUrl(b64) ? await downloadImage(b64) : base64ToBuffer(b64);
                         if (buf) bufs.push(buf);
@@ -2035,10 +2321,10 @@ async function processScheduled(env) {
     if (now - lastPost < config.interval * 60 * 1000) return;
 
     const bl = (await getWorkerBlacklist(env)).map(w => w.id).filter(Boolean);
-    const targets =[config.groupId, config.channelId].filter(Boolean);
+    const targets = [config.groupId, config.channelId].filter(Boolean);
     const batchId = Date.now() + "_" + Math.random().toString(36).substring(2, 7);
     const actualCount = getActualCount(config.count);
-    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready:[], targets, notify: config.adminId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
+    await KV.put(env, `batch:${batchId}`, { expected: actualCount, ready: [], targets, notify: config.adminId, prompt: "" }, { expirationTtl: PENDING_TTL_SEC });
     let queuedCount = 0;
 
     for (let i = 0; i < actualCount; i++) {
@@ -2073,7 +2359,7 @@ async function processScheduled(env) {
 export default {
     async fetch(req, env, ctx) {
         const url = new URL(req.url);
-        ctx.waitUntil(KV.put(env, "worker_origin", url.origin));
+        ctx.waitUntil(KV.put(env, "worker_origin", url.origin).catch(() => {}));
 
         if (url.pathname === "/watermark.png") {
             const config = await getConfig(env);
@@ -2104,11 +2390,11 @@ export default {
         if (url.pathname === "/setup") {
             if (!env.TELEGRAM_BOT_TOKEN) return new Response("No TELEGRAM_BOT_TOKEN!", { status: 500 });
             const webhookUrl = `${url.origin}/webhook`;
-            const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+            const res = await fetchWithTimeout(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ url: webhookUrl, allowed_updates:["message", "callback_query"], drop_pending_updates: true })
-            });
+                body: JSON.stringify({ url: webhookUrl, allowed_updates: ["message", "callback_query"], drop_pending_updates: true })
+            }, 30000);
             return new Response(`Webhook: ${webhookUrl}\n\n${JSON.stringify(await res.json(), null, 2)}`);
         }
 
