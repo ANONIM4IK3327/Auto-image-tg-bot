@@ -468,7 +468,18 @@ async function pickRandomCharacter(env) {
 function formatCharacterPrompt(character, mode = "tags") {
     if (!character) return "";
     const parts = [];
-    if (character.name && mode === "natural") parts.push(`character of ${character.name}`);
+    // Имя теперь ВСЕГДА первым, чтобы LLM точно знала "кто"
+    if (character.name) {
+        parts.push(mode === "tags" 
+            ? `original character ${character.name}, oc ${character.name}` 
+            : `character of ${character.name}`);
+    }
+    if (character.aliases) {
+        const aliases = character.aliases.split(",").map(a => a.trim()).filter(Boolean);
+        if (mode === "tags" && aliases.length) {
+            parts.push(`also known as ${aliases.join(", ")}`);
+        }
+    }
     if (character.description) parts.push(character.description);
     if (character.faceTraits) parts.push(character.faceTraits);
     if (character.hair) parts.push(character.hair);
@@ -769,7 +780,7 @@ async function debugArtifactPreview(tg, chatId, imageBase64, artifactResult, con
 }
 
 
-// ─── Telegram ────────────────────────────────────────────────────────────────
+// ─── Telegram ─────────────────────────────────────────────────────────────────
 
 class Telegram {
     constructor(token) {
@@ -1385,10 +1396,11 @@ async function generatePrompt(basePrompt, env, config, meta = {}) {
 
     // Integrate character if available
     let characterPrompt = "";
+    let character = null;
     if (config.autoApplyCharacter) {
-        const char = meta.character || await getActiveCharacter(env, config);
-        if (char) {
-            characterPrompt = formatCharacterPrompt(char, config.characterPromptMode || "tags");
+        character = meta.character || await getActiveCharacter(env, config);
+        if (character) {
+            characterPrompt = formatCharacterPrompt(character, config.characterPromptMode || "tags");
         }
     }
 
@@ -1396,22 +1408,34 @@ async function generatePrompt(basePrompt, env, config, meta = {}) {
     let sysPrompt, userPrompt;
     const match = basePrompt.match(/\[([\s\S]*?)\]/);
 
+    // Улучшенная проверка дублей: ищем имя/алиасы персонажа, а не случайные 30 символов
     let enhancedBase = basePrompt;
-    if (characterPrompt && !basePrompt.toLowerCase().includes(characterPrompt.toLowerCase().substring(0, 30))) {
-        enhancedBase = `${characterPrompt}, ${basePrompt}`;
+    if (character && character.name) {
+        const nameInPrompt = basePrompt.toLowerCase().includes(character.name.toLowerCase());
+        const aliasInPrompt = (character.aliases || "").split(",").some(a => 
+            basePrompt.toLowerCase().includes(a.trim().toLowerCase())
+        );
+        if (!nameInPrompt && !aliasInPrompt && characterPrompt) {
+            enhancedBase = `${characterPrompt}, ${basePrompt}`;
+        }
     }
 
     if (match) {
-        sysPrompt = `${baseContext}\n\nInclude all elements requested by the instruction. Output ONLY the final tag string.`;
-        userPrompt = `Base tags: ${enhancedBase.replace(match[0], "").trim()}\nInstruction: ${match[1]}`;
+        sysPrompt = `${baseContext}\n\nCRITICAL: The following character description is IMMUTABLE. You MUST preserve every physical trait, clothing item, and distinctive feature exactly as stated. Adapt ONLY the scene, action, background and lighting around this character. Do not change hair color, eye color, body type, or clothing unless explicitly instructed in the [].\n\nOutput ONLY the final tag string.`;
+        userPrompt = `Character (DO NOT ALTER): ${characterPrompt}\n\nBase scene tags: ${enhancedBase.replace(match[0], "").trim()}\nDynamic instruction (apply to scene only): ${match[1]}`;
     } else {
-        sysPrompt = `${baseContext}\n\nExpand the theme deeply into a full detailed tag string.`;
-        userPrompt = `Create a highly detailed Stable Diffusion prompt based on this theme: ${enhancedBase}`;
+        sysPrompt = `${baseContext}\n\nCRITICAL: The following character description is IMMUTABLE. You MUST preserve every physical trait, clothing item, and distinctive feature exactly as stated. Expand the scene, action, background and lighting around this character. Never alter core character traits.\n\nOutput ONLY the final tag string.`;
+        userPrompt = `Character (DO NOT ALTER): ${characterPrompt}\n\nTheme to expand into a full scene: ${enhancedBase}`;
     }
 
-    // If character is present, instruct LLM to preserve character consistency
     if (characterPrompt) {
-        sysPrompt += `\n\nIMPORTANT: Preserve the character's physical traits, clothing, and visual identity consistently throughout. Do not alter hair color, eye color, body type, or distinctive features.`;
+        sysPrompt += `\n\nCHARACTER INTEGRITY RULES:
+- Hair color, length, style must match exactly
+- Eye color must match exactly  
+- Clothing items must all be present and described accurately
+- Body type and age appearance must match exactly
+- Distinctive features (accessories, marks, etc.) must be preserved
+- Only add scene-specific details (lighting, background, pose variations, emotions)`;
     }
 
     const result = await callLLM(env, config, [
@@ -1419,7 +1443,14 @@ async function generatePrompt(basePrompt, env, config, meta = {}) {
         { role: "user", content: userPrompt }
     ], config.maxTokens || 800);
 
-    if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
+    if (result) {
+        let cleaned = result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
+        // Дополнительная защита: если LLM выкинул персонажа, форсим его в начало
+        if (character && character.name && !cleaned.toLowerCase().includes(character.name.toLowerCase())) {
+            cleaned = `${characterPrompt}, ${cleaned}`;
+        }
+        return cleaned;
+    }
 
     const num = Number.isInteger(meta.promptNumber) ? ` #${meta.promptNumber}` : "";
     throw new Error(`LLM (${config.llmProvider || "openrouter"}) не смог обработать prompt${num}. Проверь /status или сбрось ошибки (/clearllm).`);
@@ -2564,7 +2595,7 @@ async function handleCommand(msg, env) {
         }
 
         case "/setmodel": {
-            if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;\n\n💡 <i>Несколько моделей через запятую — при каждой генерации будет выбираться случайная:</i>\n<code>/setmodel Model A, Model B, Model C</code>");
+            if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;\n\n💡 <i>Несколько моделей через запятую — при каждой генерации будет выбираться случайная:</i>\n<code>/setmodel Model A, Model B, Model C</code>`);
             config.model = params.join(" ");
             await saveConfig(env, config);
             const modelArr = config.model.split(",").map(s => s.trim()).filter(Boolean);
@@ -3403,4 +3434,3 @@ export default {
         catch (e) { console.error("[CRON] CRASH:", e.message); }
     }
 };
-
