@@ -115,6 +115,61 @@ const DEFAULT_FETCH_TIMEOUT_MS = 30000;
 const LLM_COMPANION_MODES = ["chat", "prompt", "character", "analysis"];
 const ARTIFACT_LEVELS = ["minor", "serious", "max"];
 
+// ─── Character AI Prompts ───────────────────────────────────────────────────
+
+const CHARACTER_BUILDER_SYSTEM = `You are a Character Profile Parser for AI image generation. Your task: read the user's free-form character description and output a STRICT JSON object with these exact fields:
+
+- name: character name (extract or infer)
+- aliases: comma-separated alternative names/nicknames, or empty string
+- description: 2-4 sentences summarizing WHO this character is, their vibe, personality
+- style: art style tags (e.g., "anime, digital art, highly detailed")
+- tags: comma-separated booru-style tags for themes and motifs (e.g., "tomato motif, red theme, food themed")
+- faceTraits: detailed facial features (eye color, face shape, expression style)
+- bodyType: body description (height, build, figure, skin tone)
+- clothing: FULL outfit description, every garment with colors and details
+- poseTraits: typical posture, energy level, body language
+- behavior: personality traits, habits, how they act
+- mood: emotional atmosphere they radiate
+- hair: hair color, length, style, accessories with hair
+- eyes: eye color, shape, expression
+- ageAppearance: apparent age
+- distinctiveFeatures: unique visual markers that make them instantly recognizable
+- personalHashtag: suggested hashtag like #CharacterName
+
+RULES:
+1. Output ONLY valid JSON. No markdown, no explanations, no code blocks.
+2. If user describes something vaguely, infer concrete visual details suitable for SD prompts.
+3. ALWAYS specify concrete colors (not "colorful hair" but "vibrant red hair").
+4. Clothing must be complete — list every garment layer.
+5. distinctiveFeatures must contain 2-5 unique visual identifiers.
+6. Use English for all tag-like fields (style, tags, faceTraits, etc) even if input is Russian.
+7. description can be in the same language as user input.`;
+
+const CHARACTER_EDIT_SYSTEM = `You are a Character Profile Editor. You will receive:
+1. An existing character profile as JSON
+2. The user's edit request in natural language
+
+Your task: modify the profile according to the user's request and output the COMPLETE updated JSON with ALL fields preserved (modified or not). 
+
+Rules:
+- Output ONLY valid JSON. No explanations.
+- If user says "change hair to blue" — only change hair field, keep everything else.
+- If user says "add a scarf" — append to clothing, don't replace.
+- If user says "make her taller" — update bodyType and possibly ageAppearance.
+- Infer and expand: if user says "more elegant", update clothing, poseTraits, mood, and style accordingly.`;
+
+const CHARACTER_INTEGRATION_SYSTEM = `You are integrating a CHARACTER into a Stable Diffusion scene prompt. Follow these ABSOLUTE RULES:
+
+1. CHARACTER IDENTITY IS IMMUTABLE. The character's hair color, eye color, body type, clothing, and distinctive features MUST appear exactly as specified. NEVER change them to "fit" the scene.
+2. The character description forms the CORE subject of the image. Scene/background adds context but does NOT override character traits.
+3. Output format: comma-separated booru-style tags, character description first, scene second, quality/technical tags last.
+4. If the base prompt describes a different person/character, IGNORE that description and use the provided character profile instead.
+5. ALWAYS include: exact hair description, exact eye color, exact clothing items, exact distinctive features.
+6. Scene elements (background, pose, lighting, mood) should ADAPT to the character, not replace them.
+7. Keep total prompt under 2000 characters.
+
+OUTPUT: Only the final comma-separated prompt. No explanations.`;
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function cleanApiKey(raw) {
@@ -305,7 +360,7 @@ function checkAccess(role, cmd) {
         "/addlora", "/listloras", "/clearloras", "/dellora", "/setneg",
         "/generate", "/help", "/start", "/ping", "/setwatermark", "/delwatermark",
         "/img2txt", "/llmlist", "/setvmodel", "/listvmodel",
-        "/charadd", "/charedit", "/chardel", "/charlist", "/charselect",
+        "/charadd", "/charedit", "/chareditagent", "/chardel", "/charlist", "/charselect",
         "/charrandom", "/charclone", "/promptpreview", "/hashtagpreview",
         "/draftadd", "/draftlist", "/draftdel", "/draftpublish",
         "/draftedit", "/companion", "/companionmode", "/companionreset",
@@ -465,37 +520,96 @@ async function pickRandomCharacter(env) {
     return chars[Math.floor(Math.random() * chars.length)];
 }
 
+function buildCharacterBlock(character) {
+    // Structured character block that LLM processes unambiguously
+    if (!character) return "";
+    const lines = [];
+    lines.push(`=== CHARACTER PROFILE: ${character.name || "Unknown"} ===`);
+    if (character.aliases) lines.push(`Aliases: ${character.aliases}`);
+    if (character.hair) lines.push(`HAIR (MUST EXACTLY MATCH): ${character.hair}`);
+    if (character.eyes) lines.push(`EYES (MUST EXACTLY MATCH): ${character.eyes}`);
+    if (character.faceTraits) lines.push(`FACE: ${character.faceTraits}`);
+    if (character.bodyType) lines.push(`BODY: ${character.bodyType}`);
+    if (character.ageAppearance) lines.push(`AGE: ${character.ageAppearance}`);
+    if (character.clothing) lines.push(`CLOTHING (FULL OUTFIT): ${character.clothing}`);
+    if (character.distinctiveFeatures) lines.push(`UNIQUE MARKERS: ${character.distinctiveFeatures}`);
+    if (character.poseTraits) lines.push(`POSE/ENERGY: ${character.poseTraits}`);
+    if (character.mood) lines.push(`MOOD: ${character.mood}`);
+    if (character.behavior) lines.push(`PERSONALITY: ${character.behavior}`);
+    if (character.style) lines.push(`ART STYLE: ${character.style}`);
+    if (character.tags) lines.push(`THEME TAGS: ${character.tags}`);
+    if (character.description) lines.push(`ABOUT: ${character.description}`);
+    lines.push("=== END CHARACTER ===");
+    return lines.join("\n");
+}
+
 function formatCharacterPrompt(character, mode = "tags") {
+    // Legacy fallback: concise tagline for inline use
     if (!character) return "";
     const parts = [];
-    // Имя теперь ВСЕГДА первым, чтобы LLM точно знала "кто"
-    if (character.name) {
-        parts.push(mode === "tags" 
-            ? `original character ${character.name}, oc ${character.name}` 
-            : `character of ${character.name}`);
-    }
-    if (character.aliases) {
-        const aliases = character.aliases.split(",").map(a => a.trim()).filter(Boolean);
-        if (mode === "tags" && aliases.length) {
-            parts.push(`also known as ${aliases.join(", ")}`);
-        }
-    }
-    if (character.description) parts.push(character.description);
-    if (character.faceTraits) parts.push(character.faceTraits);
+    if (character.name && mode === "natural") parts.push(`character of ${character.name}`);
     if (character.hair) parts.push(character.hair);
     if (character.eyes) parts.push(character.eyes);
+    if (character.faceTraits) parts.push(character.faceTraits);
     if (character.bodyType) parts.push(character.bodyType);
-    if (character.ageAppearance) parts.push(character.ageAppearance);
     if (character.clothing) parts.push(character.clothing);
-    if (character.poseTraits) parts.push(character.poseTraits);
-    if (character.behavior) parts.push(character.behavior);
-    if (character.mood) parts.push(character.mood);
-    if (character.style) parts.push(character.style);
     if (character.distinctiveFeatures) parts.push(character.distinctiveFeatures);
+    if (character.mood) parts.push(character.mood);
+    if (character.poseTraits) parts.push(character.poseTraits);
+    if (character.style) parts.push(character.style);
     if (character.tags) parts.push(character.tags);
+    if (character.description) parts.push(character.description);
     if (!parts.length) return "";
     if (mode === "tags") return parts.join(", ");
     return parts.join(". ");
+}
+
+async function parseCharacterWithLLM(env, config, name, description) {
+    // Agent mode: free-form description → structured character JSON
+    if (!config.llmEnabled || !hasLlmProvider(env, config)) return null;
+    const result = await callLLM(env, config, [
+        { role: "system", content: CHARACTER_BUILDER_SYSTEM },
+        { role: "user", content: `Character name: ${name}\n\nUser description:\n${description}\n\nParse this into the JSON profile.` }
+    ], 1200);
+    if (!result) return null;
+    try {
+        const clean = result.replace(/^```json\s*|\s*```$/g, "").replace(/^```\s*|\s*```$/g, "").trim();
+        const parsed = JSON.parse(clean);
+        // Validate required fields exist
+        const required = ["name", "aliases", "description", "style", "tags", "faceTraits", "bodyType",
+                         "clothing", "poseTraits", "behavior", "mood", "hair", "eyes", "ageAppearance",
+                         "distinctiveFeatures", "personalHashtag"];
+        for (const field of required) {
+            if (parsed[field] === undefined) parsed[field] = "";
+        }
+        return parsed;
+    } catch (e) {
+        console.error("[CharacterParser] JSON parse failed:", e.message, "raw:", result.substring(0, 200));
+        return null;
+    }
+}
+
+async function applyCharacterEditWithLLM(env, config, existingChar, editRequest) {
+    // Agent mode: natural language edit → updated character JSON
+    if (!config.llmEnabled || !hasLlmProvider(env, config)) return null;
+    // Strip internal fields for LLM
+    const profileForLLM = { ...existingChar };
+    delete profileForLLM.id; delete profileForLLM.createdAt; delete profileForLLM.updatedAt;
+    delete profileForLLM.references;
+    const result = await callLLM(env, config, [
+        { role: "system", content: CHARACTER_EDIT_SYSTEM },
+        { role: "user", content: `Current profile:\n${JSON.stringify(profileForLLM, null, 2)}\n\nUser edit request: "${editRequest}"\n\nOutput the complete updated JSON.` }
+    ], 1200);
+    if (!result) return null;
+    try {
+        const clean = result.replace(/^```json\s*|\s*```$/g, "").replace(/^```\s*|\s*```$/g, "").trim();
+        const parsed = JSON.parse(clean);
+        // Merge: preserve id, createdAt, references, add updatedAt
+        return { ...existingChar, ...parsed, updatedAt: Date.now() };
+    } catch (e) {
+        console.error("[CharacterEdit] JSON parse failed:", e.message, "raw:", result.substring(0, 200));
+        return null;
+    }
 }
 
 function formatCharacterCaption(character, actionScene = "") {
@@ -780,7 +894,7 @@ async function debugArtifactPreview(tg, chatId, imageBase64, artifactResult, con
 }
 
 
-// ─── Telegram ─────────────────────────────────────────────────────────────────
+// ─── Telegram ────────────────────────────────────────────────────────────────
 
 class Telegram {
     constructor(token) {
@@ -1394,48 +1508,40 @@ async function determineResolution(prompt, env, config) {
 async function generatePrompt(basePrompt, env, config, meta = {}) {
     if (!config.llmEnabled || !hasLlmProvider(env, config)) return basePrompt;
 
-    // Integrate character if available
-    let characterPrompt = "";
-    let character = null;
-    if (config.autoApplyCharacter) {
-        character = meta.character || await getActiveCharacter(env, config);
-        if (character) {
-            characterPrompt = formatCharacterPrompt(character, config.characterPromptMode || "tags");
-        }
+    // Get character if available
+    let char = meta.character || null;
+    if (!char && config.autoApplyCharacter) {
+        char = await getActiveCharacter(env, config);
+    }
+    if (!char && (await getCharacters(env)).length > 0 && meta.allowRandomCharacter !== false) {
+        char = await pickRandomCharacter(env);
     }
 
     const baseContext = config.systemContext || DEFAULT_SYSTEM_CONTEXT;
-    let sysPrompt, userPrompt;
     const match = basePrompt.match(/\[([\s\S]*?)\]/);
+    const cleanBase = match ? basePrompt.replace(match[0], "").trim() : basePrompt;
+    const hasInstruction = !!match;
 
-    // Улучшенная проверка дублей: ищем имя/алиасы персонажа, а не случайные 30 символов
-    let enhancedBase = basePrompt;
-    if (character && character.name) {
-        const nameInPrompt = basePrompt.toLowerCase().includes(character.name.toLowerCase());
-        const aliasInPrompt = (character.aliases || "").split(",").some(a => 
-            basePrompt.toLowerCase().includes(a.trim().toLowerCase())
-        );
-        if (!nameInPrompt && !aliasInPrompt && characterPrompt) {
-            enhancedBase = `${characterPrompt}, ${basePrompt}`;
-        }
-    }
+    let sysPrompt, userPrompt;
 
-    if (match) {
-        sysPrompt = `${baseContext}\n\nCRITICAL: The following character description is IMMUTABLE. You MUST preserve every physical trait, clothing item, and distinctive feature exactly as stated. Adapt ONLY the scene, action, background and lighting around this character. Do not change hair color, eye color, body type, or clothing unless explicitly instructed in the [].\n\nOutput ONLY the final tag string.`;
-        userPrompt = `Character (DO NOT ALTER): ${characterPrompt}\n\nBase scene tags: ${enhancedBase.replace(match[0], "").trim()}\nDynamic instruction (apply to scene only): ${match[1]}`;
+    if (char) {
+        // === CHARACTER-FIRST PROMPT BUILDING ===
+        // Use dedicated integration system to prevent character traits being overwritten
+        const charBlock = buildCharacterBlock(char);
+        const sceneDesc = hasInstruction ? match[1] : cleanBase;
+
+        sysPrompt = CHARACTER_INTEGRATION_SYSTEM + (config.systemContext ? `\n\nAdditional style context: ${config.systemContext.substring(0, 500)}` : "");
+
+        userPrompt = `${charBlock}\n\n=== SCENE/CONTEXT ===\n${sceneDesc}\n\n=== TASK ===\nIntegrate this EXACT character into the scene. The character's appearance (hair, eyes, clothing, features) must remain IDENTICAL to the profile above. Only adapt pose, background, lighting, and camera angle to fit the scene. Output the final comma-separated SD prompt.`;
     } else {
-        sysPrompt = `${baseContext}\n\nCRITICAL: The following character description is IMMUTABLE. You MUST preserve every physical trait, clothing item, and distinctive feature exactly as stated. Expand the scene, action, background and lighting around this character. Never alter core character traits.\n\nOutput ONLY the final tag string.`;
-        userPrompt = `Character (DO NOT ALTER): ${characterPrompt}\n\nTheme to expand into a full scene: ${enhancedBase}`;
-    }
-
-    if (characterPrompt) {
-        sysPrompt += `\n\nCHARACTER INTEGRITY RULES:
-- Hair color, length, style must match exactly
-- Eye color must match exactly  
-- Clothing items must all be present and described accurately
-- Body type and age appearance must match exactly
-- Distinctive features (accessories, marks, etc.) must be preserved
-- Only add scene-specific details (lighting, background, pose variations, emotions)`;
+        // No character — standard prompt generation
+        if (hasInstruction) {
+            sysPrompt = `${baseContext}\n\nInclude all elements requested by the instruction. Output ONLY the final tag string.`;
+            userPrompt = `Base tags: ${cleanBase}\nInstruction: ${match[1]}`;
+        } else {
+            sysPrompt = `${baseContext}\n\nExpand the theme deeply into a full detailed tag string.`;
+            userPrompt = `Create a highly detailed Stable Diffusion prompt based on this theme: ${cleanBase}`;
+        }
     }
 
     const result = await callLLM(env, config, [
@@ -1443,14 +1549,7 @@ async function generatePrompt(basePrompt, env, config, meta = {}) {
         { role: "user", content: userPrompt }
     ], config.maxTokens || 800);
 
-    if (result) {
-        let cleaned = result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
-        // Дополнительная защита: если LLM выкинул персонажа, форсим его в начало
-        if (character && character.name && !cleaned.toLowerCase().includes(character.name.toLowerCase())) {
-            cleaned = `${characterPrompt}, ${cleaned}`;
-        }
-        return cleaned;
-    }
+    if (result) return result.replace(/^["'`*\n]+|["'`*\n]+$/g, "").trim();
 
     const num = Number.isInteger(meta.promptNumber) ? ` #${meta.promptNumber}` : "";
     throw new Error(`LLM (${config.llmProvider || "openrouter"}) не смог обработать prompt${num}. Проверь /status или сбрось ошибки (/clearllm).`);
@@ -1715,7 +1814,7 @@ async function handleCommand(msg, env) {
                 helpText += `<b>Постинг:</b>\n/setgroup | /setchannel &lt;@name&gt; | /ungroup | /unchannel\n/setinterval &lt;мин&gt; | /setcount &lt;1-10&gt; | /enable | /disable | /generate [номер] [имя_персонажа]\n\n`;
                 helpText += `<b>Промпты:</b>\n/addprompt &lt;текст&gt; | /delprompt &lt;номер&gt; | /promptlist [номер]\n/setneg &lt;текст&gt; | /setcontext &lt;контекст&gt; | /settokens &lt;лимит&gt;\n/promptsuggest &lt;текст&gt;\n\n`;
                 helpText += `<b>Синтаксис {} (LoRA и ИИ):</b>\n<code>{id:сила}</code> — лора для этого промпта\n<code>{model:Имя Модели}</code> — модель Horde для этого промпта\n<code>{-id}</code> — убрать глобальную лору\n<code>{-llm}</code> — отключить ИИ для промпта\n\n`;
-                helpText += `<b>Персонажи:</b>\n/charadd &lt;имя&gt; [поля=значение] — создать персонажа\n/charedit &lt;id&gt; &lt;поле=значение&gt; — редактировать\n/chardel &lt;id&gt; — удалить\n/charlist — список персонажей\n/charselect &lt;id|имя&gt; — выбрать активного\n/charrandom — случайный персонаж\n/charclone &lt;id&gt; — клонировать\n\n`;
+                helpText += `<b>Персонажи (агентный режим):</b>\n/charadd &lt;имя&gt; — свободное описание, ИИ сам структурирует\n/chareditagent &lt;id|имя&gt; &lt;описание изменений&gt; — ИИ применит правки\n/charedit &lt;id&gt; &lt;поле=значение&gt; — ручное редактирование\n/chardel &lt;id&gt; — удалить\n/charlist — список персонажей\n/charselect &lt;id|имя&gt; — выбрать активного\n/charrandom — случайный персонаж\n/charclone &lt;id&gt; — клонировать\n\n`;
                 helpText += `<b>LLM Компаньон (/companion):</b>\n/companion — вкл/выкл режим общения с LLM\n/companionmode &lt;chat|prompt|character|analysis&gt; — режим\n/companionreset — сбросить контекст\n\n`;
                 helpText += `<b>Драфты (черновики):</b>\n/draftadd &lt;промпт&gt; — создать черновик\n/draftlist — список\n/draftdel &lt;id&gt; — удалить\n/draftpublish &lt;id&gt; — опубликовать сейчас\n/draftedit &lt;id&gt; &lt;поле=значение&gt; — редактировать\n\n`;
                 helpText += `<b>Debug и артефакты:</b>\n/toggledebug — вкл/выкл debug\n/debugreport — отчёт\n/toggleartifactcheck — проверка артефактов\n/setartifactsens &lt;low|medium|high&gt; — чувствительность\n/setartifactlevel &lt;minor|serious|max&gt; — порог реакции\n/toggleautoreg — авто-регенерация артефактов\n\n`;
@@ -1735,23 +1834,76 @@ async function handleCommand(msg, env) {
 
         case "/charadd": {
             if (!params.length) {
-                return await tg.send(chatId, `❌ /charadd &lt;имя&gt; [поле=значение ...]\n\n<b>Доступные поля:</b> ${CHAR_FIELDS.join(", ")}\n\n<i>Пример:</i>\n<code>/charadd Luna hair=long silver hair, eyes=blue eyes, style=anime fantasy, clothing=black gothic dress, mood=mysterious</code>`);
+                return await tg.send(chatId, `🤖 <b>Агентный режим создания персонажа</b>\n\n<code>/charadd Имя — свободное описание персонажа текстом</code>\n\n<i>ИИ сам разберёт описание на структурированные поля:</i> внешность, одежду, черты лица, стиль, теги.\n\n<b>Примеры:</b>\n<code>/charadd Томапинка — Энергичная 18-летняя девушка-помидорка с длинными красными волосами, в оверсайз бомбере с томатными нашивками...</code>\n\n<code>/charadd Luna Девушка с серебристыми волосами до пояса, голубые глаза, готическое платье, мистический стиль</code>\n\n💡 <i>Если LLM недоступен — можно указать поля вручную:</i>\n<code>/charadd Имя hair=... eyes=... clothing=...</code>`);
             }
-            const char = makeDefaultCharacter();
-            char.name = params[0];
-            for (let i = 1; i < params.length; i++) {
-                const eqIdx = params[i].indexOf("=");
-                if (eqIdx === -1) continue;
-                const field = params[i].substring(0, eqIdx).trim();
-                const value = params[i].substring(eqIdx + 1).trim();
-                if (CHAR_FIELDS.includes(field)) char[field] = value;
-                else if (field.startsWith("ref_")) {
-                    const refType = field.replace("ref_", "");
-                    if (char.references) char.references[refType] = value;
+
+            const charName = params[0];
+            const restText = params.slice(1).join(" ");
+            const hasManualFields = restText.includes("=") && CHAR_FIELDS.some(f => restText.toLowerCase().includes(f.toLowerCase() + "="));
+            let char;
+
+            if (hasManualFields && !config.llmEnabled) {
+                // Fallback manual mode when LLM is off
+                char = makeDefaultCharacter();
+                char.name = charName;
+                for (let i = 1; i < params.length; i++) {
+                    const eqIdx = params[i].indexOf("=");
+                    if (eqIdx === -1) continue;
+                    const field = params[i].substring(0, eqIdx).trim();
+                    const value = params[i].substring(eqIdx + 1).trim();
+                    if (CHAR_FIELDS.includes(field)) char[field] = value;
+                    else if (field.startsWith("ref_") && char.references) char.references[field.replace("ref_", "")] = value;
                 }
+            } else if (hasManualFields) {
+                // Manual mode with LLM available
+                char = makeDefaultCharacter();
+                char.name = charName;
+                for (let i = 1; i < params.length; i++) {
+                    const eqIdx = params[i].indexOf("=");
+                    if (eqIdx === -1) continue;
+                    const field = params[i].substring(0, eqIdx).trim();
+                    const value = params[i].substring(eqIdx + 1).trim();
+                    if (CHAR_FIELDS.includes(field)) char[field] = value;
+                    else if (field.startsWith("ref_") && char.references) char.references[field.replace("ref_", "")] = value;
+                }
+            } else {
+                // === AGENT MODE: LLM parses free-form description ===
+                await tg.send(chatId, `🤖 Анализирую описание персонажа через LLM...`);
+                const llmResult = await parseCharacterWithLLM(env, config, charName, restText);
+                if (!llmResult) {
+                    return await tg.send(chatId, `❌ LLM не смог распарсить описание. Попробуй:\n1. /clearllm — сбросить ошибки\n2. Указать поля вручную: hair=... eyes=... clothing=...`);
+                }
+                char = makeDefaultCharacter();
+                for (const field of CHAR_FIELDS) {
+                    if (llmResult[field] !== undefined) char[field] = llmResult[field];
+                }
+                char.name = llmResult.name || charName;
             }
+
             await addOrUpdateCharacter(env, char);
-            await tg.send(chatId, `✅ Персонаж <b>${escapeHtml(char.name)}</b> создан!\nID: <code>${char.id}</code>\n\n${formatCharacterCard(char)}\n\n💡 <i>/charselect ${char.id} — выбрать активным</i>`);
+            await tg.send(chatId, `✅ Персонаж <b>${escapeHtml(char.name)}</b> создан!\nID: <code>${char.id}</code>\n\n${formatCharacterCard(char)}\n\n💡 <i>/charselect ${char.id} — выбрать активным</i>\n<i>/promptpreview — посмотреть как выглядит промпт</i>`);
+            break;
+        }
+
+        case "/chareditagent": {
+            if (params.length < 2) {
+                return await tg.send(chatId, `🤖 <b>Агентное редактирование персонажа</b>\n\n<code>/chareditagent &lt;id|имя&gt; &lt;описание изменений&gt;</code>\n\n<i>Примеры:</i>\n<code>/chareditagent Томапинка Сделай волосы короче, до плеч, и добавь красную ленту в причёску</code>\n<code>/chareditagent char_xxx Поменяй одежду на зимнюю — пальто, шарф, варежки</code>`);
+            }
+            const chars = await getCharacters(env);
+            const targetChar = chars.find(c => c.id === params[0] || c.name.toLowerCase() === params[0].toLowerCase());
+            if (!targetChar) return await tg.send(chatId, `❌ Персонаж не найден: <code>${escapeHtml(params[0])}</code>`);
+            const editRequest = params.slice(1).join(" ");
+            await tg.send(chatId, `🤖 Применяю изменения через LLM...`);
+            const updated = await applyCharacterEditWithLLM(env, config, targetChar, editRequest);
+            if (!updated) {
+                return await tg.send(chatId, `❌ LLM не смог применить изменения. Попробуй /charedit с ручными полями.`);
+            }
+            // Preserve id and references
+            updated.id = targetChar.id;
+            updated.createdAt = targetChar.createdAt;
+            if (targetChar.references) updated.references = { ...targetChar.references };
+            await saveCharacters(env, chars.map(c => c.id === targetChar.id ? updated : c));
+            await tg.send(chatId, `✅ Персонаж <b>${escapeHtml(updated.name)}</b> обновлён!\n\n${formatCharacterCard(updated)}`);
             break;
         }
 
@@ -2595,7 +2747,7 @@ async function handleCommand(msg, env) {
         }
 
         case "/setmodel": {
-            if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;\n\n💡 <i>Несколько моделей через запятую — при каждой генерации будет выбираться случайная:</i>\n<code>/setmodel Model A, Model B, Model C</code>`);
+            if (!params.length) return await tg.send(chatId, "❌ /setmodel &lt;имя&gt;\n\n💡 <i>Несколько моделей через запятую — при каждой генерации будет выбираться случайная:</i>\n<code>/setmodel Model A, Model B, Model C</code>");
             config.model = params.join(" ");
             await saveConfig(env, config);
             const modelArr = config.model.split(",").map(s => s.trim()).filter(Boolean);
